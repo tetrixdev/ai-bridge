@@ -1,0 +1,11 @@
+src/
+tests/
+tsconfig.json
+tsup.config.ts
+vitest.config.ts
+.github/
+.gitignore
+coverage/
+*.tgz
+.env
+.env.*
