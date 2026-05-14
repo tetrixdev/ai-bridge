@@ -101,7 +101,7 @@ program
     }
 
     // -----------------------------------------------------------------------
-    // Initialize adapters
+    // Initialize adapters and populate model lists
     // -----------------------------------------------------------------------
 
     const adapterInstances: ProviderAdapter[] = [
@@ -116,6 +116,18 @@ program
       const capability = providers.find((p) => p.name === adapter.providerName);
       if (capability?.available) {
         adapters.set(adapter.providerName, adapter);
+
+        // Populate models on the capability object for the hello message
+        try {
+          const models = await adapter.listModels();
+          capability.models = models;
+          log.info(`${adapter.providerName} models: ${models.map((m) => m.id).join(', ')}`);
+        } catch (err) {
+          log.warn(`Failed to list models for ${adapter.providerName}`, {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+
         log.debug('Registered adapter', { name: adapter.providerName });
       }
     }

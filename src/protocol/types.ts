@@ -11,6 +11,18 @@
 // Provider & Tool Definitions
 // ---------------------------------------------------------------------------
 
+/** Describes an available model for a provider. */
+export interface ModelInfo {
+  /** Model identifier (slug) used in CLI flags / API requests */
+  id: string;
+  /** Human-readable display name */
+  name: string;
+  /** Optional description of the model's strengths */
+  description?: string;
+  /** Whether this is the default model for the provider */
+  is_default?: boolean;
+}
+
 /** Describes a locally detected AI CLI provider and its capabilities. */
 export interface ProviderCapability {
   /** Provider name (e.g. "codex", "claude", "gemini") — used as the identifier */
@@ -27,6 +39,8 @@ export interface ProviderCapability {
   supports_thinking: boolean;
   /** Whether the provider supports resuming a prior session */
   supports_session_resume: boolean;
+  /** Available models for this provider (populated after detection) */
+  models?: ModelInfo[];
 }
 
 /** A tool definition following JSON Schema for parameters. */
@@ -141,6 +155,8 @@ export interface AiRequestMessage {
 export interface AiRequestOptions {
   max_tokens: number | null;
   temperature: number | null;
+  /** Model to use (provider-specific identifier, e.g. "sonnet", "gpt-5.4") */
+  model?: string | null;
 }
 
 /** Instructs the bridge to reset/clear a conversation session. */

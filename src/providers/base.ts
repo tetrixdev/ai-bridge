@@ -7,6 +7,7 @@
 
 import type {
   ProviderCapability,
+  ModelInfo,
   AiRequestMessage,
   ToolDefinition,
   StreamEventType,
@@ -65,4 +66,12 @@ export abstract class ProviderAdapter {
 
   /** Whether this provider supports resuming a previous CLI session. */
   abstract supportsSessionResume(): boolean;
+
+  /**
+   * List available models for this provider.
+   *
+   * Returns model info from local CLI config/cache where possible,
+   * or known model aliases as a fallback.
+   */
+  abstract listModels(): Promise<ModelInfo[]>;
 }

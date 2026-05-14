@@ -20,6 +20,7 @@ import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
 import type {
   ProviderCapability,
+  ModelInfo,
   BridgeToServerMessage,
   ServerToBridgeMessage,
   AiRequestMessage,

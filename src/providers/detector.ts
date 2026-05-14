@@ -53,7 +53,7 @@ const CLI_PROBES: CliProbe[] = [
     binary: 'gemini',
     versionArgs: ['--version'],
     parseVersion: (output) => extractVersion(output),
-    supports_streaming: false,
+    supports_streaming: true,
     supports_tools: true,
     supports_thinking: false,
     supports_session_resume: true,

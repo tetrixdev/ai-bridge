@@ -18,8 +18,11 @@
  */
 
 import { spawn } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
-import type { ProviderCapability } from '../protocol/types.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import type { ProviderCapability, ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -60,6 +63,9 @@ export class CodexAdapter extends ProviderAdapter {
     // Build CLI arguments
     let args: string[];
 
+    // Use the model from request options, or fall back to the default
+    const model = request.options?.model ?? DEFAULT_MODEL;
+
     if (cliSessionId) {
       // Resume an existing session
       args = [
@@ -75,7 +81,7 @@ export class CodexAdapter extends ProviderAdapter {
         '--json',
         '--skip-git-repo-check',
         '--ephemeral',
-        '-m', DEFAULT_MODEL,
+        '-m', model,
       ];
 
       // Add system prompt if provided (passed as first positional arg to exec)
@@ -300,5 +306,42 @@ export class CodexAdapter extends ProviderAdapter {
 
   supportsSessionResume(): boolean {
     return true;
+  }
+
+  async listModels(): Promise<ModelInfo[]> {
+    try {
+      const cachePath = join(homedir(), '.codex', 'models_cache.json');
+      const raw = await readFile(cachePath, 'utf-8');
+      const cache = JSON.parse(raw) as {
+        models?: Array<{
+          slug: string;
+          display_name: string;
+          description?: string;
+          visibility?: string;
+        }>;
+      };
+
+      if (!cache.models || !Array.isArray(cache.models)) {
+        log.warn('Codex models cache is empty or invalid');
+        return [];
+      }
+
+      return cache.models
+        .filter((m) => m.visibility !== 'hide') // Exclude hidden models like codex-auto-review
+        .map((m) => ({
+          id: m.slug,
+          name: m.display_name,
+          description: m.description,
+          is_default: m.slug === DEFAULT_MODEL,
+        }));
+    } catch (err) {
+      log.warn('Failed to read Codex models cache', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Fallback: return just the default model
+      return [
+        { id: DEFAULT_MODEL, name: DEFAULT_MODEL, is_default: true },
+      ];
+    }
   }
 }

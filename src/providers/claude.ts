@@ -16,9 +16,22 @@
 
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import type { ProviderCapability } from '../protocol/types.js';
+import type { ProviderCapability, ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { createLogger } from '../utils/logger.js';
+
+/**
+ * Known Claude CLI model aliases.
+ *
+ * Claude Code uses stable aliases (sonnet, opus, haiku) that resolve to the
+ * latest version within each model family. The CLI has no dynamic model listing
+ * command, so these aliases are the official user-facing interface.
+ */
+const CLAUDE_MODELS: ModelInfo[] = [
+  { id: 'sonnet', name: 'Sonnet', description: 'Best balance of speed and intelligence', is_default: true },
+  { id: 'opus', name: 'Opus', description: 'Highest intelligence, slower', is_default: false },
+  { id: 'haiku', name: 'Haiku', description: 'Fastest and most cost-efficient', is_default: false },
+];
 
 const log = createLogger('ClaudeAdapter');
 
@@ -61,6 +74,11 @@ export class ClaudeAdapter extends ProviderAdapter {
     // Add system prompt if provided (only on new sessions)
     if (request.system_prompt && !cliSessionId) {
       args.push('--system-prompt', request.system_prompt);
+    }
+
+    // Add model if specified in request options
+    if (request.options?.model) {
+      args.push('--model', request.options.model);
     }
 
     // Add max tokens if specified
@@ -274,5 +292,10 @@ export class ClaudeAdapter extends ProviderAdapter {
 
   supportsSessionResume(): boolean {
     return true;
+  }
+
+  async listModels(): Promise<ModelInfo[]> {
+    // Claude CLI has no dynamic model listing — return known aliases
+    return CLAUDE_MODELS;
   }
 }
