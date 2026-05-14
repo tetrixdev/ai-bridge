@@ -3,13 +3,19 @@
  *
  * Wraps the Anthropic Claude CLI to produce normalized stream events.
  *
- * CLI invocation per PROTOCOL.md:
- *   New session:    claude -p --output-format json "user message"
- *   Resume session: claude -p --session-id <UUID> --output-format json "user message"
- *   With tools:     claude -p --output-format json --allowedTools "bash" "user message"
+ * CLI invocation:
+ *   New session:    claude -p --output-format stream-json --verbose "user message"
+ *   Resume session: claude -p --session-id <UUID> --output-format stream-json --verbose "user message"
  *   System prompt:  Passed via --system-prompt flag on first message
+ *
+ * Output format (NDJSON):
+ *   {"type":"system","subtype":"init","session_id":"...","model":"..."}
+ *   {"type":"assistant","message":{"content":[{"type":"text","text":"..."}],...}}
+ *   {"type":"result","subtype":"success","session_id":"...","usage":{...},"total_cost_usd":...}
  */
 
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
 import type { ProviderCapability } from '../protocol/types.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { createLogger } from '../utils/logger.js';
@@ -20,6 +26,7 @@ export class ClaudeAdapter extends ProviderAdapter {
   readonly providerName = 'claude';
 
   async detect(): Promise<ProviderCapability> {
+    // Detection is handled by detector.ts — this is a fallback.
     return {
       name: this.providerName,
       version: null,
@@ -32,47 +39,237 @@ export class ClaudeAdapter extends ProviderAdapter {
   }
 
   async execute(context: ExecutionContext, onEvent: (event: AdapterStreamEvent) => void): Promise<string | null> {
-    log.info('Executing Claude request', { requestId: context.request.request_id });
+    const { request, signal, cliSessionId } = context;
+    const requestId = request.request_id;
+    const userMessage = request.message;
 
-    // TODO: Implement actual Claude CLI invocation.
-    //
-    // New session:
-    //   claude -p --output-format json "user message"
-    //   With system prompt: claude -p --output-format json --system-prompt "..." "user message"
-    //
-    // Resume session:
-    //   claude -p --session-id <UUID> --output-format json "user message"
-    //
-    // With tools (bash approach):
-    //   claude -p --output-format json --allowedTools "bash" "user message"
-    //
-    // The implementation will:
-    // 1. Build the claude CLI command
-    // 2. Spawn the child process
-    // 3. Parse streaming JSON events from stdout
-    // 4. Map Claude's native events to stream events:
-    //    - content_block_start -> block_start
-    //    - content_block_delta -> block_delta
-    //    - content_block_stop -> block_stop
-    //    - tool_use blocks -> tool call resolution
-    // 5. Capture the session ID from output for resume
-    // 6. Emit done event with usage stats
-    // 7. Return the session ID
+    log.info('Executing Claude request', { requestId });
 
-    onEvent({
-      event: 'error',
-      data: {
-        code: 'provider_error',
-        message: 'Claude CLI adapter is not yet implemented',
-      },
+    // Build CLI arguments
+    const args: string[] = [
+      '-p',                            // Print mode (non-interactive)
+      '--output-format', 'stream-json', // NDJSON streaming output
+      '--verbose',                       // Required for stream-json in print mode
+    ];
+
+    // Resume an existing session if we have a session ID
+    if (cliSessionId) {
+      args.push('--session-id', cliSessionId);
+      log.debug('Resuming session', { cliSessionId });
+    }
+
+    // Add system prompt if provided (only on new sessions)
+    if (request.system_prompt && !cliSessionId) {
+      args.push('--system-prompt', request.system_prompt);
+    }
+
+    // Add max tokens if specified
+    if (request.options?.max_tokens) {
+      args.push('--max-tokens', String(request.options.max_tokens));
+    }
+
+    // The user message is the final argument
+    args.push(userMessage);
+
+    log.debug('Spawning claude', { args: args.map((a) => a.length > 50 ? a.substring(0, 50) + '...' : a) });
+
+    return new Promise<string | null>((resolve, reject) => {
+      let sessionId: string | null = null;
+      let blockIndex = 0;
+      let settled = false;
+
+      // Build env without CLAUDECODE to allow nested invocation
+      // (Claude CLI refuses to run if CLAUDECODE is set, even to empty string)
+      const env = { ...process.env };
+      delete env['CLAUDECODE'];
+
+      const child = spawn('claude', args, {
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'], // stdin must be 'ignore' — Claude CLI hangs if stdin is a pipe
+      });
+
+      // Set up abort handling
+      const onAbort = () => {
+        log.info('Request aborted — killing claude process', { requestId });
+        child.kill('SIGTERM');
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      // Parse NDJSON from stdout line by line
+      const rl = createInterface({ input: child.stdout });
+
+      rl.on('line', (line) => {
+        if (!line.trim()) return;
+
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          log.debug('Skipping non-JSON line', { line: line.substring(0, 100) });
+          return;
+        }
+
+        const type = parsed['type'] as string;
+
+        if (type === 'system' && (parsed as Record<string, unknown>)['subtype'] === 'init') {
+          // Extract session ID from init event
+          sessionId = (parsed['session_id'] as string) ?? null;
+          log.debug('Session init', { sessionId, model: parsed['model'] });
+          return;
+        }
+
+        if (type === 'assistant') {
+          // The assistant message contains the content blocks
+          const message = parsed['message'] as Record<string, unknown> | undefined;
+          if (!message) return;
+
+          const content = message['content'] as Array<Record<string, unknown>> | undefined;
+          if (!content || !Array.isArray(content)) return;
+
+          for (const block of content) {
+            const blockType = block['type'] as string;
+
+            if (blockType === 'text') {
+              const text = block['text'] as string;
+              if (!text) continue;
+
+              // Emit block_start + block_delta + block_stop for text
+              onEvent({
+                event: 'block_start',
+                data: {
+                  block_index: blockIndex,
+                  block_type: 'text',
+                },
+              });
+
+              onEvent({
+                event: 'block_delta',
+                data: {
+                  block_index: blockIndex,
+                  content: text,
+                },
+              });
+
+              onEvent({
+                event: 'block_stop',
+                data: {
+                  block_index: blockIndex,
+                },
+              });
+
+              blockIndex++;
+            } else if (blockType === 'thinking') {
+              const thinking = block['thinking'] as string;
+              if (!thinking) continue;
+
+              // Emit thinking block
+              onEvent({
+                event: 'block_start',
+                data: {
+                  block_index: blockIndex,
+                  block_type: 'thinking',
+                },
+              });
+
+              onEvent({
+                event: 'block_delta',
+                data: {
+                  block_index: blockIndex,
+                  content: thinking,
+                },
+              });
+
+              onEvent({
+                event: 'block_stop',
+                data: {
+                  block_index: blockIndex,
+                },
+              });
+
+              blockIndex++;
+            }
+            // tool_use blocks will be handled later when tool support is added
+          }
+          return;
+        }
+
+        if (type === 'result') {
+          // Extract final session ID and usage from result
+          sessionId = (parsed['session_id'] as string) ?? sessionId;
+
+          const usage = parsed['usage'] as Record<string, unknown> | undefined;
+          const inputTokens = usage ? (usage['input_tokens'] as number) ?? null : null;
+          const outputTokens = usage ? (usage['output_tokens'] as number) ?? null : null;
+
+          onEvent({
+            event: 'done',
+            data: {
+              usage: {
+                input_tokens: inputTokens,
+                output_tokens: outputTokens,
+              },
+            },
+          });
+          return;
+        }
+
+        // Ignore rate_limit_event and other non-essential events
+        if (type !== 'rate_limit_event') {
+          log.debug('Unhandled Claude event type', { type });
+        }
+      });
+
+      // Capture stderr for error logging
+      let stderrBuffer = '';
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderrBuffer += chunk.toString();
+      });
+
+      child.on('error', (err) => {
+        log.error('Failed to spawn claude', { error: err.message });
+        signal.removeEventListener('abort', onAbort);
+
+        if (!settled) {
+          settled = true;
+          onEvent({
+            event: 'error',
+            data: {
+              code: 'provider_spawn_error',
+              message: `Failed to spawn claude: ${err.message}`,
+            },
+          });
+          onEvent({ event: 'done', data: {} });
+          resolve(null);
+        }
+      });
+
+      child.on('close', (code) => {
+        signal.removeEventListener('abort', onAbort);
+
+        if (settled) return;
+        settled = true;
+
+        if (code !== 0 && code !== null) {
+          log.warn('Claude exited with non-zero code', { code, stderr: stderrBuffer.substring(0, 500) });
+
+          // Only emit error if we haven't already sent a result
+          // (some non-zero exits happen after successful output)
+          if (blockIndex === 0) {
+            onEvent({
+              event: 'error',
+              data: {
+                code: 'provider_error',
+                message: stderrBuffer.trim() || `Claude exited with code ${code}`,
+              },
+            });
+            onEvent({ event: 'done', data: {} });
+          }
+        }
+
+        log.debug('Claude process closed', { code, sessionId });
+        resolve(sessionId);
+      });
     });
-
-    onEvent({
-      event: 'done',
-      data: {},
-    });
-
-    return null;
   }
 
   supportsSessionResume(): boolean {
