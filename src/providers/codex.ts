@@ -101,8 +101,14 @@ export class CodexAdapter extends ProviderAdapter {
       let blockIndex = 0;
       let settled = false;
 
+      // Build env with tool script directory on PATH
+      const env = { ...process.env };
+      if (context.toolScriptDir) {
+        env['PATH'] = `${context.toolScriptDir}:${env['PATH'] ?? ''}`;
+      }
+
       const child = spawn('codex', args, {
-        env: process.env,
+        env,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
@@ -285,17 +291,14 @@ export class CodexAdapter extends ProviderAdapter {
         if (code !== 0 && code !== null) {
           log.warn('Codex exited with non-zero code', { code, stderr: stderrBuffer.substring(0, 500) });
 
-          // Only emit error if we haven't already sent content
-          if (blockIndex === 0) {
-            onEvent({
-              event: 'error',
-              data: {
-                code: 'provider_error',
-                message: stderrBuffer.trim() || `Codex exited with code ${code}`,
-              },
-            });
-            onEvent({ event: 'done', data: {} });
-          }
+          onEvent({
+            event: 'error',
+            data: {
+              code: 'provider_error',
+              message: stderrBuffer.trim() || `Codex exited with code ${code}`,
+            },
+          });
+          onEvent({ event: 'done', data: {} });
         }
 
         log.debug('Codex process closed', { code, threadId });

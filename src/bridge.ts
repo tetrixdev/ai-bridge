@@ -24,6 +24,7 @@ import type {
   BridgeToServerMessage,
   ServerToBridgeMessage,
   AiRequestMessage,
+  AiRequestOptions,
   ToolDefinition,
   ServerConfig,
   StreamEventType,
@@ -114,6 +115,18 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.adapters = options.adapters;
     this.testMode = options.testMode ?? false;
     this.onTestRequest = options.onTestRequest;
+
+    // Wire up the callback server's send function so tool calls from
+    // HTTP-based tool scripts are forwarded over WebSocket (BL-002 fix)
+    this.callbackServer.setSendFn((reqId, tcId, tName, tArgs) => {
+      this.send({
+        type: 'tool_call',
+        request_id: reqId,
+        tool_call_id: tcId,
+        tool_name: tName,
+        arguments: tArgs,
+      });
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -243,6 +256,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.emit('disconnected', code, reasonStr);
 
     if (!this.isShuttingDown) {
+      // Check for authentication rejection — don't retry, exit immediately
+      if (code === 4001) {
+        log.error('Connection rejected: invalid or expired token. Generate a new token and restart the bridge.');
+        this.isShuttingDown = true;
+        this.emit('error', new Error('Connection rejected: invalid or expired token. Generate a new token and restart the bridge.'));
+        return;
+      }
+
       this.scheduleReconnect();
     }
   }
@@ -406,6 +427,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   ): Promise<void> {
     const { request_id, conversation_id } = request;
 
+    // Set the current request ID on the callback server so HTTP-based
+    // tool calls can be correlated to the active request
+    this.callbackServer.setCurrentRequestId(request_id);
+
     // Build execution context
     const context: ExecutionContext = {
       request,
@@ -441,6 +466,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (newCliSessionId && conversation_id) {
       this.sessionStore.set(conversation_id, newCliSessionId, adapter.providerName);
     }
+
+    // Clear the current request ID now that execution is complete
+    this.callbackServer.setCurrentRequestId(null);
   }
 
   private handleSessionReset(message: {
@@ -450,15 +478,52 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     provider: string;
     system_prompt: string | null;
     history: Array<{ role: string; content: string }>;
-    options: { max_tokens: number | null; temperature: number | null };
+    options: AiRequestOptions;
   }): void {
-    // Delete the old session
-    const deleted = this.sessionStore.delete(message.conversation_id);
-    log.info('Session reset', { conversationId: message.conversation_id, found: deleted });
+    const { request_id, conversation_id, provider, system_prompt, history, options } = message;
 
-    // Per PROTOCOL.md, a session_reset creates a new CLI session and replays history.
-    // We treat this like a new ai_request with the last user message from history.
-    // The adapter will get a null cliSessionId and start fresh.
+    // Delete the old session so the adapter starts fresh
+    const deleted = this.sessionStore.delete(conversation_id);
+    log.info('Session reset', { conversationId: conversation_id, found: deleted, historyLength: history.length });
+
+    // Extract the last user message from history
+    const lastUserMessage = [...history].reverse().find((h) => h.role === 'user');
+    if (!lastUserMessage) {
+      log.error('Session reset has no user message in history', { conversationId: conversation_id });
+      this.send({
+        type: 'error',
+        request_id,
+        code: 'session_reset_failed',
+        message: 'No user message found in conversation history',
+        recoverable: false,
+      });
+      return;
+    }
+
+    // Build conversation context from prior history (excluding the last user message)
+    const priorHistory = history.slice(0, history.lastIndexOf(lastUserMessage));
+    const historyContext = priorHistory
+      .map((h) => `${h.role}: ${h.content}`)
+      .join('\n\n');
+
+    // Prepend history to the system prompt so the CLI has context
+    const enhancedSystemPrompt = historyContext
+      ? `${system_prompt ?? ''}\n\n--- Previous conversation ---\n${historyContext}`.trim()
+      : system_prompt;
+
+    // Re-process as a new ai_request with a fresh CLI session
+    const syntheticRequest: AiRequestMessage = {
+      type: 'ai_request',
+      request_id,
+      conversation_id,
+      provider,
+      message: lastUserMessage.content,
+      system_prompt: enhancedSystemPrompt,
+      options,
+    };
+
+    log.info('Re-processing session_reset as new ai_request', { requestId: request_id, provider });
+    this.handleAiRequest(syntheticRequest);
   }
 
   private handleServerError(message: { type: 'error'; code: string; message: string; fatal: boolean }): void {

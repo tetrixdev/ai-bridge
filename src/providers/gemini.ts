@@ -62,9 +62,16 @@ export class GeminiAdapter extends ProviderAdapter {
 
     log.info('Executing Gemini request', { requestId });
 
+    // Build the prompt — prepend system prompt if provided (Gemini CLI
+    // has no dedicated --system-instruction flag, so we concatenate)
+    let prompt = userMessage;
+    if (request.system_prompt && !cliSessionId) {
+      prompt = `${request.system_prompt}\n\nUser request: ${userMessage}`;
+    }
+
     // Build CLI arguments
     const args: string[] = [
-      '--prompt', userMessage,          // Non-interactive mode with prompt
+      '--prompt', prompt,               // Non-interactive mode with prompt
       '--output-format', 'stream-json', // NDJSON streaming output
       '--skip-trust',                   // Required for headless/non-interactive mode
     ];
@@ -88,8 +95,14 @@ export class GeminiAdapter extends ProviderAdapter {
       let settled = false;
       let inTextBlock = false;
 
+      // Build env with tool script directory on PATH
+      const env = { ...process.env };
+      if (context.toolScriptDir) {
+        env['PATH'] = `${context.toolScriptDir}:${env['PATH'] ?? ''}`;
+      }
+
       const child = spawn('gemini', args, {
-        env: process.env,
+        env,
         stdio: ['ignore', 'pipe', 'pipe'], // stdin must be 'ignore' to prevent hanging
       });
 
@@ -344,17 +357,14 @@ export class GeminiAdapter extends ProviderAdapter {
         if (code !== 0 && code !== null) {
           log.warn('Gemini exited with non-zero code', { code, stderr: stderrBuffer.substring(0, 500) });
 
-          // Only emit error if we haven't already sent content
-          if (blockIndex === 0) {
-            onEvent({
-              event: 'error',
-              data: {
-                code: 'provider_error',
-                message: stderrBuffer.trim() || `Gemini exited with code ${code}`,
-              },
-            });
-            onEvent({ event: 'done', data: {} });
-          }
+          onEvent({
+            event: 'error',
+            data: {
+              code: 'provider_error',
+              message: stderrBuffer.trim() || `Gemini exited with code ${code}`,
+            },
+          });
+          onEvent({ event: 'done', data: {} });
         }
 
         log.debug('Gemini process closed', { code, sessionId });

@@ -19,7 +19,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { createLogger } from '../utils/logger.js';
-import type { ToolResolver } from './resolver.js';
+import type { ToolResolver, SendToolCallFn } from './resolver.js';
 
 const log = createLogger('ToolCallbackServer');
 
@@ -31,8 +31,19 @@ export class ToolCallbackServer {
   /** Current request_id for tool calls (set by the bridge during request execution). */
   private currentRequestId: string | null = null;
 
+  /** Function to send tool_call messages over WebSocket (set by the bridge). */
+  private sendFn: SendToolCallFn | null = null;
+
   constructor(toolResolver: ToolResolver) {
     this.toolResolver = toolResolver;
+  }
+
+  /**
+   * Set the function used to send tool_call messages over WebSocket.
+   * Must be called by the Bridge after construction to wire up the send path.
+   */
+  setSendFn(fn: SendToolCallFn): void {
+    this.sendFn = fn;
   }
 
   /**
@@ -141,15 +152,16 @@ export class ToolCallbackServer {
     log.debug('Tool call received via HTTP callback', { tool_name, toolCallId, requestId });
 
     try {
+      if (!this.sendFn) {
+        log.error('Cannot forward tool call — sendFn not configured. Call setSendFn() first.');
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Bridge send function not configured' }));
+        return;
+      }
+
       // Route through the ToolResolver which sends over WebSocket and waits
       const result = await this.toolResolver.call(
-        // The sendFn is a no-op here because the Bridge's actual send function
-        // is not directly available. Instead, we use the resolver's existing
-        // pending call mechanism, and the bridge wires up the actual WebSocket send.
-        // For the callback server, we emit an event that the bridge can listen to.
-        () => {
-          // This is handled by the bridge wiring
-        },
+        this.sendFn,
         requestId,
         toolCallId,
         tool_name,

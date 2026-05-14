@@ -101,6 +101,11 @@ export class ClaudeAdapter extends ProviderAdapter {
       const env = { ...process.env };
       delete env['CLAUDECODE'];
 
+      // Add tool script directory to PATH so CLI can find tool wrapper scripts
+      if (context.toolScriptDir) {
+        env['PATH'] = `${context.toolScriptDir}:${env['PATH'] ?? ''}`;
+      }
+
       const child = spawn('claude', args, {
         env,
         stdio: ['ignore', 'pipe', 'pipe'], // stdin must be 'ignore' — Claude CLI hangs if stdin is a pipe
@@ -205,8 +210,41 @@ export class ClaudeAdapter extends ProviderAdapter {
               });
 
               blockIndex++;
+            } else if (blockType === 'tool_use') {
+              // Claude emits tool_use blocks when the model wants to call a tool
+              const toolName = block['name'] as string;
+              const toolId = block['id'] as string;
+              const toolInput = block['input'] as Record<string, unknown> | undefined;
+
+              if (!toolName || !toolId) continue;
+
+              onEvent({
+                event: 'block_start',
+                data: {
+                  block_index: blockIndex,
+                  block_type: 'tool_call',
+                  tool_name: toolName,
+                  tool_call_id: toolId,
+                },
+              });
+
+              onEvent({
+                event: 'block_delta',
+                data: {
+                  block_index: blockIndex,
+                  content: JSON.stringify(toolInput ?? {}),
+                },
+              });
+
+              onEvent({
+                event: 'block_stop',
+                data: {
+                  block_index: blockIndex,
+                },
+              });
+
+              blockIndex++;
             }
-            // tool_use blocks will be handled later when tool support is added
           }
           return;
         }
@@ -270,18 +308,14 @@ export class ClaudeAdapter extends ProviderAdapter {
         if (code !== 0 && code !== null) {
           log.warn('Claude exited with non-zero code', { code, stderr: stderrBuffer.substring(0, 500) });
 
-          // Only emit error if we haven't already sent a result
-          // (some non-zero exits happen after successful output)
-          if (blockIndex === 0) {
-            onEvent({
-              event: 'error',
-              data: {
-                code: 'provider_error',
-                message: stderrBuffer.trim() || `Claude exited with code ${code}`,
-              },
-            });
-            onEvent({ event: 'done', data: {} });
-          }
+          onEvent({
+            event: 'error',
+            data: {
+              code: 'provider_error',
+              message: stderrBuffer.trim() || `Claude exited with code ${code}`,
+            },
+          });
+          onEvent({ event: 'done', data: {} });
         }
 
         log.debug('Claude process closed', { code, sessionId });

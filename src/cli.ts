@@ -164,6 +164,14 @@ program
 
     bridge.on('error', (err) => {
       log.error('Bridge error', { error: err.message });
+
+      // Exit on fatal errors that cannot be recovered from
+      if (
+        err.message.includes('Maximum reconnection attempts') ||
+        err.message.includes('invalid or expired token')
+      ) {
+        process.exit(1);
+      }
     });
 
     bridge.on('request_start', (requestId, provider) => {
