@@ -64,8 +64,9 @@ export class GeminiAdapter extends ProviderAdapter {
 
     // Build CLI arguments
     const args: string[] = [
-      '--prompt', userMessage,       // Non-interactive mode with prompt
+      '--prompt', userMessage,          // Non-interactive mode with prompt
       '--output-format', 'stream-json', // NDJSON streaming output
+      '--skip-trust',                   // Required for headless/non-interactive mode
     ];
 
     // Resume an existing session if we have a session ID
