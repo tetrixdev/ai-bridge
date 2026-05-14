@@ -1,26 +1,27 @@
 /**
  * Claude CLI Adapter
  *
- * Wraps the Anthropic Claude CLI (claude) to produce normalized
- * StreamEvent output. This is a stub implementation — the actual CLI
- * invocation logic will be implemented once the Claude CLI's streaming
- * JSON output format is integrated.
+ * Wraps the Anthropic Claude CLI to produce normalized stream events.
+ *
+ * CLI invocation per PROTOCOL.md:
+ *   New session:    claude -p --output-format json "user message"
+ *   Resume session: claude -p --session-id <UUID> --output-format json "user message"
+ *   With tools:     claude -p --output-format json --allowedTools "bash" "user message"
+ *   System prompt:  Passed via --system-prompt flag on first message
  */
 
-import type { ProviderCapability, StreamEvent } from '../protocol/types.js';
-import { ProviderAdapter, type ExecutionContext } from './base.js';
+import type { ProviderCapability } from '../protocol/types.js';
+import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('ClaudeAdapter');
 
 export class ClaudeAdapter extends ProviderAdapter {
-  readonly id = 'claude';
-  readonly name = 'Anthropic Claude CLI';
+  readonly providerName = 'claude';
 
   async detect(): Promise<ProviderCapability> {
     return {
-      id: this.id,
-      name: this.name,
+      name: this.providerName,
       version: null,
       available: false,
       supports_streaming: true,
@@ -30,41 +31,48 @@ export class ClaudeAdapter extends ProviderAdapter {
     };
   }
 
-  async execute(context: ExecutionContext, onEvent: (event: StreamEvent) => void): Promise<void> {
+  async execute(context: ExecutionContext, onEvent: (event: AdapterStreamEvent) => void): Promise<string | null> {
     log.info('Executing Claude request', { requestId: context.request.request_id });
 
     // TODO: Implement actual Claude CLI invocation.
     //
+    // New session:
+    //   claude -p --output-format json "user message"
+    //   With system prompt: claude -p --output-format json --system-prompt "..." "user message"
+    //
+    // Resume session:
+    //   claude -p --session-id <UUID> --output-format json "user message"
+    //
+    // With tools (bash approach):
+    //   claude -p --output-format json --allowedTools "bash" "user message"
+    //
     // The implementation will:
-    // 1. Build the claude CLI command:
-    //    `claude --print --output-format stream-json`
-    //    With optional: `--resume <session_id>` for session resumption
-    //    With optional: `--system-prompt "..."` for system prompts
-    // 2. Spawn the child process, piping the prompt via stdin
+    // 1. Build the claude CLI command
+    // 2. Spawn the child process
     // 3. Parse streaming JSON events from stdout
-    // 4. Map Claude's native events to Bridge StreamEvents:
-    //    - assistant.message_start -> block_start (text)
-    //    - assistant.content_block_delta -> block_delta
-    //    - assistant.content_block_stop -> block_stop
-    //    - tool_use blocks -> block_start (tool_use) + tool call resolution
-    // 5. Handle tool calls by:
-    //    a. Emitting a tool_call through context.onToolCall()
-    //    b. Waiting for the server's tool_resolve/tool_error
-    //    c. Feeding the result back to the CLI process
-    // 6. Capture the session ID from the CLI output for session resumption
-    // 7. Emit DoneEvent with session_id and usage stats
+    // 4. Map Claude's native events to stream events:
+    //    - content_block_start -> block_start
+    //    - content_block_delta -> block_delta
+    //    - content_block_stop -> block_stop
+    //    - tool_use blocks -> tool call resolution
+    // 5. Capture the session ID from output for resume
+    // 6. Emit done event with usage stats
+    // 7. Return the session ID
 
     onEvent({
       event: 'error',
-      code: 'NOT_IMPLEMENTED',
-      message: 'Claude CLI adapter is not yet implemented',
+      data: {
+        code: 'provider_error',
+        message: 'Claude CLI adapter is not yet implemented',
+      },
     });
 
     onEvent({
       event: 'done',
-      session_id: null,
-      usage: null,
+      data: {},
     });
+
+    return null;
   }
 
   supportsSessionResume(): boolean {

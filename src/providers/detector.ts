@@ -16,7 +16,6 @@ const execFileAsync = promisify(execFile);
 
 /** CLI probing configuration for each known provider. */
 interface CliProbe {
-  id: string;
   name: string;
   binary: string;
   versionArgs: string[];
@@ -30,19 +29,17 @@ interface CliProbe {
 
 const CLI_PROBES: CliProbe[] = [
   {
-    id: 'codex',
-    name: 'OpenAI Codex CLI',
+    name: 'codex',
     binary: 'codex',
     versionArgs: ['--version'],
     parseVersion: (output) => extractVersion(output),
     supports_streaming: true,
     supports_tools: true,
-    supports_thinking: false,
-    supports_session_resume: false,
+    supports_thinking: true,
+    supports_session_resume: true,
   },
   {
-    id: 'claude',
-    name: 'Anthropic Claude CLI',
+    name: 'claude',
     binary: 'claude',
     versionArgs: ['--version'],
     parseVersion: (output) => extractVersion(output),
@@ -52,15 +49,14 @@ const CLI_PROBES: CliProbe[] = [
     supports_session_resume: true,
   },
   {
-    id: 'gemini',
-    name: 'Google Gemini CLI',
+    name: 'gemini',
     binary: 'gemini',
     versionArgs: ['--version'],
     parseVersion: (output) => extractVersion(output),
-    supports_streaming: true,
+    supports_streaming: false,
     supports_tools: true,
-    supports_thinking: true,
-    supports_session_resume: false,
+    supports_thinking: false,
+    supports_session_resume: true,
   },
 ];
 
@@ -78,7 +74,6 @@ function extractVersion(output: string): string | null {
  */
 async function probeOne(probe: CliProbe): Promise<ProviderCapability> {
   const capability: ProviderCapability = {
-    id: probe.id,
     name: probe.name,
     version: null,
     available: false,

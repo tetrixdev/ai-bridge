@@ -6,6 +6,16 @@
  * across bridge restarts.
  *
  * Includes TTL-based pruning (default: 7 days).
+ *
+ * Stored format per PROTOCOL.md:
+ * {
+ *   "conv_xyz789": {
+ *     "provider": "claude",
+ *     "cli_session_id": "session_def456",
+ *     "created_at": "2026-05-14T10:30:00Z",
+ *     "last_used_at": "2026-05-14T11:45:00Z"
+ *   }
+ * }
  */
 
 import fs from 'node:fs';
@@ -18,15 +28,14 @@ const log = createLogger('SessionStore');
 /** A single session record stored on disk. */
 interface SessionRecord {
   cli_session_id: string;
-  provider_id: string;
-  created_at: number;   // epoch ms
-  last_used_at: number;  // epoch ms
+  provider: string;
+  created_at: string;   // ISO 8601
+  last_used_at: string;  // ISO 8601
 }
 
 /** The full shape of the sessions.json file. */
 interface SessionFile {
-  version: 1;
-  sessions: Record<string, SessionRecord>;
+  [conversationId: string]: SessionRecord;
 }
 
 const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -41,7 +50,7 @@ export class SessionStore {
     this.dir = path.join(os.homedir(), '.ai-bridge');
     this.filePath = path.join(this.dir, 'sessions.json');
     this.ttlMs = ttlMs;
-    this.data = { version: 1, sessions: {} };
+    this.data = {};
     this.load();
   }
 
@@ -54,17 +63,17 @@ export class SessionStore {
    * Returns null if not found or expired.
    */
   get(conversationId: string): string | null {
-    const record = this.data.sessions[conversationId];
+    const record = this.data[conversationId];
     if (!record) return null;
 
     if (this.isExpired(record)) {
-      delete this.data.sessions[conversationId];
+      delete this.data[conversationId];
       this.persist();
       return null;
     }
 
     // Touch last_used_at
-    record.last_used_at = Date.now();
+    record.last_used_at = new Date().toISOString();
     this.persist();
     return record.cli_session_id;
   }
@@ -72,24 +81,24 @@ export class SessionStore {
   /**
    * Store a mapping from conversation_id to cli_session_id.
    */
-  set(conversationId: string, cliSessionId: string, providerId: string): void {
-    const now = Date.now();
-    this.data.sessions[conversationId] = {
+  set(conversationId: string, cliSessionId: string, provider: string): void {
+    const now = new Date().toISOString();
+    this.data[conversationId] = {
       cli_session_id: cliSessionId,
-      provider_id: providerId,
+      provider,
       created_at: now,
       last_used_at: now,
     };
     this.persist();
-    log.debug('Session stored', { conversationId, cliSessionId, providerId });
+    log.debug('Session stored', { conversationId, cliSessionId, provider });
   }
 
   /**
    * Remove a specific conversation mapping.
    */
   delete(conversationId: string): boolean {
-    if (this.data.sessions[conversationId]) {
-      delete this.data.sessions[conversationId];
+    if (this.data[conversationId]) {
+      delete this.data[conversationId];
       this.persist();
       log.debug('Session deleted', { conversationId });
       return true;
@@ -103,9 +112,9 @@ export class SessionStore {
   prune(): number {
     const now = Date.now();
     let pruned = 0;
-    for (const [id, record] of Object.entries(this.data.sessions)) {
+    for (const [id, record] of Object.entries(this.data)) {
       if (this.isExpired(record, now)) {
-        delete this.data.sessions[id];
+        delete this.data[id];
         pruned++;
       }
     }
@@ -120,7 +129,7 @@ export class SessionStore {
    * Returns the number of active (non-expired) sessions.
    */
   size(): number {
-    return Object.keys(this.data.sessions).length;
+    return Object.keys(this.data).length;
   }
 
   // -------------------------------------------------------------------------
@@ -128,19 +137,39 @@ export class SessionStore {
   // -------------------------------------------------------------------------
 
   private isExpired(record: SessionRecord, now: number = Date.now()): boolean {
-    return now - record.last_used_at > this.ttlMs;
+    const lastUsed = new Date(record.last_used_at).getTime();
+    return now - lastUsed > this.ttlMs;
   }
 
   private load(): void {
     try {
       if (fs.existsSync(this.filePath)) {
         const raw = fs.readFileSync(this.filePath, 'utf-8');
-        const parsed = JSON.parse(raw) as SessionFile;
-        if (parsed.version === 1 && typeof parsed.sessions === 'object') {
-          this.data = parsed;
-          log.debug('Sessions loaded from disk', { count: Object.keys(this.data.sessions).length });
-        } else {
-          log.warn('Unrecognized session file version, starting fresh');
+        const parsed = JSON.parse(raw);
+        // Support both old versioned format and new flat format
+        if (parsed && typeof parsed === 'object') {
+          if ('version' in parsed && 'sessions' in parsed) {
+            // Migrate from old format
+            const oldSessions = parsed.sessions as Record<string, {
+              cli_session_id: string;
+              provider_id?: string;
+              provider?: string;
+              created_at: number | string;
+              last_used_at: number | string;
+            }>;
+            for (const [id, rec] of Object.entries(oldSessions)) {
+              this.data[id] = {
+                cli_session_id: rec.cli_session_id,
+                provider: rec.provider ?? rec.provider_id ?? 'unknown',
+                created_at: typeof rec.created_at === 'number' ? new Date(rec.created_at).toISOString() : rec.created_at,
+                last_used_at: typeof rec.last_used_at === 'number' ? new Date(rec.last_used_at).toISOString() : rec.last_used_at,
+              };
+            }
+            log.debug('Migrated sessions from old format', { count: Object.keys(this.data).length });
+          } else {
+            this.data = parsed as SessionFile;
+            log.debug('Sessions loaded from disk', { count: Object.keys(this.data).length });
+          }
         }
       }
     } catch (err) {

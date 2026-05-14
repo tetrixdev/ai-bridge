@@ -1,66 +1,77 @@
 /**
  * Codex CLI Adapter
  *
- * Wraps the OpenAI Codex CLI to produce normalized StreamEvent output.
- * This is a stub implementation — the actual CLI invocation logic will
- * be implemented once the Codex CLI's streaming output format is finalized.
+ * Wraps the OpenAI Codex CLI to produce normalized stream events.
+ *
+ * CLI invocation per PROTOCOL.md:
+ *   New session:    codex exec --json "system prompt" <<< "user message"
+ *   Resume session: codex exec resume <SESSION_ID> --json <<< "user message"
+ *   With MCP tools: codex exec --json --mcp-server "ai-bridge-tools" "system prompt" <<< "user message"
  */
 
-import type { ProviderCapability, StreamEvent } from '../protocol/types.js';
-import { ProviderAdapter, type ExecutionContext } from './base.js';
+import type { ProviderCapability } from '../protocol/types.js';
+import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
 
 export class CodexAdapter extends ProviderAdapter {
-  readonly id = 'codex';
-  readonly name = 'OpenAI Codex CLI';
+  readonly providerName = 'codex';
 
   async detect(): Promise<ProviderCapability> {
     // Detection is handled centrally by detector.ts.
-    // This method exists for the interface; in practice the
-    // detector results are used directly.
     return {
-      id: this.id,
-      name: this.name,
+      name: this.providerName,
       version: null,
       available: false,
       supports_streaming: true,
       supports_tools: true,
-      supports_thinking: false,
-      supports_session_resume: false,
+      supports_thinking: true,
+      supports_session_resume: true,
     };
   }
 
-  async execute(context: ExecutionContext, onEvent: (event: StreamEvent) => void): Promise<void> {
+  async execute(context: ExecutionContext, onEvent: (event: AdapterStreamEvent) => void): Promise<string | null> {
     log.info('Executing Codex request', { requestId: context.request.request_id });
 
     // TODO: Implement actual Codex CLI invocation.
     //
+    // New session:
+    //   codex exec --json "system prompt" <<< "user message"
+    //
+    // Resume session:
+    //   codex exec resume <SESSION_ID> --json <<< "user message"
+    //
+    // With MCP tools:
+    //   codex exec --json --mcp-server "ai-bridge-tools" "system prompt" <<< "user message"
+    //
     // The implementation will:
     // 1. Build the codex CLI command with appropriate flags
-    //    (e.g., `codex --prompt "..." --stream`)
-    // 2. Spawn the child process
+    // 2. Spawn the child process, pipe user message via stdin
     // 3. Parse the streaming JSON output line-by-line
-    // 4. Normalize each chunk into BlockStartEvent / BlockDeltaEvent / BlockStopEvent
-    // 5. Handle tool_use blocks by calling context.onToolCall()
+    // 4. Normalize each chunk into block_start / block_delta / block_stop
+    // 5. Handle tool_call blocks by calling context.onToolCall()
     //    and feeding results back to the CLI via stdin
-    // 6. Emit a DoneEvent when the process exits
+    // 6. Emit a done event when the process exits
+    // 7. Return the session ID for future resume
 
     onEvent({
       event: 'error',
-      code: 'NOT_IMPLEMENTED',
-      message: 'Codex CLI adapter is not yet implemented',
+      data: {
+        code: 'provider_error',
+        message: 'Codex CLI adapter is not yet implemented',
+      },
     });
 
     onEvent({
       event: 'done',
-      session_id: null,
-      usage: null,
+      data: {},
     });
+
+    return null;
   }
 
   supportsSessionResume(): boolean {
-    return false;
+    return true;
   }
 }

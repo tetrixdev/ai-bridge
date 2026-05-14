@@ -2,15 +2,22 @@
  * Abstract base class for AI CLI provider adapters.
  *
  * Each adapter wraps a specific CLI tool (Codex, Claude, Gemini) and
- * normalizes its output into the Bridge protocol's StreamEvent format.
+ * normalizes its output into the Bridge protocol's stream event format.
  */
 
 import type {
   ProviderCapability,
-  StreamEvent,
   AiRequestMessage,
   ToolDefinition,
+  StreamEventType,
+  StreamEventData,
 } from '../protocol/types.js';
+
+/** A stream event emitted by the adapter. */
+export interface AdapterStreamEvent {
+  event: StreamEventType;
+  data: StreamEventData;
+}
 
 /** Context passed to a provider when executing a request. */
 export interface ExecutionContext {
@@ -18,18 +25,19 @@ export interface ExecutionContext {
   request: AiRequestMessage;
   /** Tool definitions that should be made available to the CLI. */
   tools: ToolDefinition[];
+  /** Path to directory containing generated tool wrapper scripts. */
+  toolScriptDir: string | null;
   /** Callback to resolve a tool call through the server. */
   onToolCall: (toolCallId: string, toolName: string, args: Record<string, unknown>) => Promise<unknown>;
   /** Abort signal for cancellation. */
   signal: AbortSignal;
+  /** CLI session ID if resuming, or null for new session. */
+  cliSessionId: string | null;
 }
 
 export abstract class ProviderAdapter {
-  /** Unique provider identifier (e.g. "codex", "claude", "gemini"). */
-  abstract readonly id: string;
-
-  /** Human-readable display name. */
-  abstract readonly name: string;
+  /** Provider name / identifier (e.g. "codex", "claude", "gemini"). */
+  abstract readonly providerName: string;
 
   /**
    * Detect whether this CLI is installed and return its capabilities.
@@ -41,17 +49,19 @@ export abstract class ProviderAdapter {
    * Execute an AI request by invoking the local CLI.
    *
    * The adapter should call `onEvent` for each streaming chunk produced
-   * by the CLI, normalizing the output into StreamEvent format.
+   * by the CLI, normalizing the output into stream event format.
    *
    * Must send a final `done` event when the CLI exits.
+   * Returns the CLI session ID for future resumption (or null).
    *
    * @param context  Execution context with request, tools, and tool resolution callback.
    * @param onEvent  Callback for each normalized stream event.
+   * @returns The CLI session ID (for session resume) or null.
    */
   abstract execute(
     context: ExecutionContext,
-    onEvent: (event: StreamEvent) => void,
-  ): Promise<void>;
+    onEvent: (event: AdapterStreamEvent) => void,
+  ): Promise<string | null>;
 
   /** Whether this provider supports resuming a previous CLI session. */
   abstract supportsSessionResume(): boolean;

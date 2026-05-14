@@ -10,7 +10,9 @@
  *   - Protocol handshake (hello -> welcome)
  *   - AI request routing to providers
  *   - Tool call resolution round-trip
- *   - Heartbeat (ping/pong)
+ *   - Heartbeat (ping/pong) — interval in SECONDS from server
+ *   - Tool script generation on welcome
+ *   - Local HTTP callback server for tool scripts
  *   - Lifecycle event emission
  */
 
@@ -21,14 +23,16 @@ import type {
   BridgeToServerMessage,
   ServerToBridgeMessage,
   AiRequestMessage,
-  StreamEvent,
   ToolDefinition,
   ServerConfig,
+  StreamEventType,
+  StreamEventData,
 } from './protocol/types.js';
 import { PROTOCOL_VERSION, BRIDGE_VERSION } from './protocol/version.js';
-import { ProviderAdapter, type ExecutionContext } from './providers/base.js';
+import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './providers/base.js';
 import { ToolManager } from './tools/manager.js';
 import { ToolResolver } from './tools/resolver.js';
+import { ToolCallbackServer } from './tools/callback-server.js';
 import { SessionStore } from './session/store.js';
 import { createLogger } from './utils/logger.js';
 
@@ -39,21 +43,25 @@ const log = createLogger('Bridge');
 // ---------------------------------------------------------------------------
 
 export interface BridgeOptions {
-  /** WebSocket server URL (wss://...) */
+  /** WebSocket server URL (wss://...) — token is appended as ?token= */
   serverUrl: string;
-  /** Authentication token */
+  /** Authentication token (placed in URL query param, NOT in hello body) */
   token: string;
   /** Detected provider capabilities */
   providers: ProviderCapability[];
-  /** Provider adapter instances, keyed by provider id */
+  /** Provider adapter instances, keyed by provider name */
   adapters: Map<string, ProviderAdapter>;
+  /** Whether to run in test mode (mock responses) */
+  testMode?: boolean;
+  /** Mock response handler for test mode */
+  onTestRequest?: (request: AiRequestMessage, sendEvent: (event: StreamEventType, data: StreamEventData) => void) => Promise<void>;
 }
 
-const DEFAULT_HEARTBEAT_MS = 30_000;
-const DEFAULT_MAX_RECONNECT = 10;
-const DEFAULT_REQUEST_TIMEOUT_MS = 300_000; // 5 minutes
+const DEFAULT_HEARTBEAT_SECONDS = 30;
+const DEFAULT_REQUEST_TIMEOUT_SECONDS = 300;
+const MAX_RECONNECT_ATTEMPTS = 10;
 const BASE_RECONNECT_DELAY_MS = 1_000;
-const MAX_RECONNECT_DELAY_MS = 60_000;
+const MAX_RECONNECT_DELAY_MS = 15_000; // Cap at 15s per PROTOCOL.md
 
 // ---------------------------------------------------------------------------
 // Bridge Events
@@ -64,7 +72,7 @@ export interface BridgeEvents {
   disconnected: [code: number, reason: string];
   welcome: [sessionId: string];
   error: [error: Error];
-  request_start: [requestId: string, providerId: string];
+  request_start: [requestId: string, provider: string];
   request_end: [requestId: string];
 }
 
@@ -81,12 +89,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly toolManager = new ToolManager();
   private readonly toolResolver = new ToolResolver();
   private readonly sessionStore = new SessionStore();
+  private readonly callbackServer = new ToolCallbackServer(this.toolResolver);
+  private readonly testMode: boolean;
+  private readonly onTestRequest?: BridgeOptions['onTestRequest'];
 
   private sessionId: string | null = null;
   private serverConfig: ServerConfig = {
-    heartbeat_interval_ms: DEFAULT_HEARTBEAT_MS,
-    max_reconnect_attempts: DEFAULT_MAX_RECONNECT,
-    request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+    heartbeat_interval: DEFAULT_HEARTBEAT_SECONDS,
+    request_timeout: DEFAULT_REQUEST_TIMEOUT_SECONDS,
   };
 
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -101,6 +111,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.token = options.token;
     this.providers = options.providers;
     this.adapters = options.adapters;
+    this.testMode = options.testMode ?? false;
+    this.onTestRequest = options.onTestRequest;
   }
 
   // -------------------------------------------------------------------------
@@ -109,6 +121,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
   /**
    * Initiate the WebSocket connection to the server.
+   * Token is placed in the URL query parameter per PROTOCOL.md.
    */
   connect(): void {
     if (this.ws) {
@@ -116,9 +129,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return;
     }
 
+    // Append token as query parameter
+    const url = new URL(this.serverUrl);
+    url.searchParams.set('token', this.token);
+    const wsUrl = url.toString();
+
     log.info('Connecting to server', { url: this.serverUrl });
 
-    this.ws = new WebSocket(this.serverUrl, {
+    this.ws = new WebSocket(wsUrl, {
       headers: {
         'User-Agent': `ai-bridge/${BRIDGE_VERSION}`,
       },
@@ -139,6 +157,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.clearReconnectTimer();
     this.toolResolver.cancelAll();
     this.toolManager.cleanupScripts();
+    await this.callbackServer.stop();
 
     // Cancel active requests
     for (const [id, controller] of this.activeRequests) {
@@ -236,89 +255,141 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   // Protocol Handlers
   // -------------------------------------------------------------------------
 
+  /**
+   * Send hello message per PROTOCOL.md:
+   * { type: "hello", version, bridge_version, providers[] }
+   * NO token field — token is in the URL query param.
+   * NO id field on providers — just name.
+   */
   private sendHello(): void {
     const hello: BridgeToServerMessage = {
       type: 'hello',
-      protocol_version: PROTOCOL_VERSION,
+      version: PROTOCOL_VERSION,
       bridge_version: BRIDGE_VERSION,
-      token: this.token,
       providers: this.providers,
     };
     this.send(hello);
     log.info('Hello sent', {
       protocol: PROTOCOL_VERSION,
-      providers: this.providers.filter((p) => p.available).map((p) => p.id),
+      providers: this.providers.filter((p) => p.available).map((p) => p.name),
     });
   }
 
-  private handleWelcome(message: { type: 'welcome'; session_id: string; tools: ToolDefinition[]; config: ServerConfig }): void {
+  private async handleWelcome(message: {
+    type: 'welcome';
+    session_id: string;
+    tools: ToolDefinition[];
+    config: ServerConfig;
+  }): Promise<void> {
     this.sessionId = message.session_id;
     this.serverConfig = message.config;
 
     // Register tools from the server
     this.toolManager.register(message.tools);
 
-    // Start heartbeat with server-configured interval
-    this.startHeartbeat(message.config.heartbeat_interval_ms);
+    // Generate tool wrapper scripts and start the callback server
+    if (message.tools.length > 0) {
+      try {
+        await this.callbackServer.start();
+        const port = this.callbackServer.getPort();
+        if (port) {
+          this.toolManager.generateScripts(port);
+          log.info('Tool scripts generated', {
+            count: message.tools.length,
+            callbackPort: port,
+            scriptDir: this.toolManager.getScriptDir(),
+          });
+        }
+      } catch (err) {
+        log.error('Failed to set up tool callback server', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Start heartbeat — config.heartbeat_interval is in SECONDS
+    const intervalMs = message.config.heartbeat_interval * 1000;
+    this.startHeartbeat(intervalMs);
 
     log.info('Welcome received', {
       sessionId: this.sessionId,
       toolCount: message.tools.length,
-      heartbeatMs: message.config.heartbeat_interval_ms,
+      heartbeatSeconds: message.config.heartbeat_interval,
     });
 
     this.emit('welcome', this.sessionId);
   }
 
   private handleAiRequest(message: AiRequestMessage): void {
-    const { request_id, provider_id } = message;
+    const { request_id, provider, conversation_id } = message;
+
+    // Look up existing CLI session for this conversation
+    const existingCliSessionId = conversation_id
+      ? this.sessionStore.get(conversation_id)
+      : null;
+
+    // Send ai_request_ack with the CLI session ID
+    this.send({
+      type: 'ai_request_ack',
+      request_id,
+      cli_session_id: existingCliSessionId ?? 'new',
+    });
+
+    // Test mode: use mock handler
+    if (this.testMode && this.onTestRequest) {
+      this.emit('request_start', request_id, provider);
+      const sendEvent = (event: StreamEventType, data: StreamEventData) => {
+        this.sendStreamEvent(request_id, event, data);
+      };
+      this.onTestRequest(message, sendEvent)
+        .catch((err) => {
+          log.error('Test mode handler failed', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          this.sendStreamEvent(request_id, 'error', {
+            code: 'test_error',
+            message: err instanceof Error ? err.message : String(err),
+          });
+          this.sendStreamEvent(request_id, 'done', {});
+        })
+        .finally(() => {
+          this.emit('request_end', request_id);
+        });
+      return;
+    }
 
     // Find the adapter for the requested provider
-    const adapter = this.adapters.get(provider_id);
+    const adapter = this.adapters.get(provider);
     if (!adapter) {
-      log.error('No adapter for requested provider', { provider_id });
-      this.sendStreamEvent(request_id, {
-        event: 'error',
-        code: 'PROVIDER_NOT_AVAILABLE',
-        message: `Provider "${provider_id}" is not available on this bridge`,
-      });
-      this.sendStreamEvent(request_id, {
-        event: 'done',
-        session_id: null,
-        usage: null,
+      log.error('No adapter for requested provider', { provider });
+      // Send non-streaming error
+      this.send({
+        type: 'error',
+        request_id,
+        code: 'provider_unavailable',
+        message: `Provider "${provider}" is not available on this bridge`,
+        recoverable: false,
       });
       return;
     }
 
-    // ACK the request
-    this.send({
-      type: 'ai_request_ack',
-      request_id,
-      provider_id,
-    });
-
-    this.emit('request_start', request_id, provider_id);
+    this.emit('request_start', request_id, provider);
 
     // Execute asynchronously
     const controller = new AbortController();
     this.activeRequests.set(request_id, controller);
 
-    this.executeRequest(adapter, message, controller.signal)
+    this.executeRequest(adapter, message, existingCliSessionId, controller.signal)
       .catch((err) => {
         log.error('Request execution failed', {
           requestId: request_id,
           error: err instanceof Error ? err.message : String(err),
         });
-        this.sendStreamEvent(request_id, {
-          event: 'error',
-          code: 'EXECUTION_ERROR',
+        this.sendStreamEvent(request_id, 'error', {
+          code: 'provider_error',
           message: err instanceof Error ? err.message : String(err),
         });
-        this.sendStreamEvent(request_id, {
-          event: 'done',
-          session_id: null,
-          usage: null,
-        });
+        this.sendStreamEvent(request_id, 'done', {});
       })
       .finally(() => {
         this.activeRequests.delete(request_id);
@@ -329,6 +400,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private async executeRequest(
     adapter: ProviderAdapter,
     request: AiRequestMessage,
+    cliSessionId: string | null,
     signal: AbortSignal,
   ): Promise<void> {
     const { request_id, conversation_id } = request;
@@ -337,6 +409,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     const context: ExecutionContext = {
       request,
       tools: this.toolManager.getAll(),
+      toolScriptDir: this.toolManager.getScriptDir(),
       onToolCall: async (toolCallId, toolName, args) => {
         return this.toolResolver.call(
           (reqId, tcId, tName, tArgs) => {
@@ -355,32 +428,36 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         );
       },
       signal,
+      cliSessionId,
     };
 
-    // If the provider supports session resume and we have a stored session,
-    // inject it into the request options.
-    if (conversation_id && adapter.supportsSessionResume()) {
-      const cliSessionId = this.sessionStore.get(conversation_id);
-      if (cliSessionId) {
-        request.options.session_resume_id = cliSessionId;
-        log.debug('Resuming CLI session', { conversationId: conversation_id, cliSessionId });
-      }
-    }
-
-    // Run the adapter
-    await adapter.execute(context, (event: StreamEvent) => {
-      this.sendStreamEvent(request_id, event);
-
-      // If the provider reported a session ID, store it for later resumption
-      if (event.event === 'done' && event.session_id && conversation_id) {
-        this.sessionStore.set(conversation_id, event.session_id, adapter.id);
-      }
+    // Run the adapter — it returns the new CLI session ID
+    const newCliSessionId = await adapter.execute(context, (event: AdapterStreamEvent) => {
+      this.sendStreamEvent(request_id, event.event, event.data);
     });
+
+    // Store the session mapping for future resume
+    if (newCliSessionId && conversation_id) {
+      this.sessionStore.set(conversation_id, newCliSessionId, adapter.providerName);
+    }
   }
 
-  private handleSessionReset(message: { type: 'session_reset'; conversation_id: string }): void {
+  private handleSessionReset(message: {
+    type: 'session_reset';
+    request_id: string;
+    conversation_id: string;
+    provider: string;
+    system_prompt: string | null;
+    history: Array<{ role: string; content: string }>;
+    options: { max_tokens: number | null; temperature: number | null };
+  }): void {
+    // Delete the old session
     const deleted = this.sessionStore.delete(message.conversation_id);
     log.info('Session reset', { conversationId: message.conversation_id, found: deleted });
+
+    // Per PROTOCOL.md, a session_reset creates a new CLI session and replays history.
+    // We treat this like a new ai_request with the last user message from history.
+    // The adapter will get a null cliSessionId and start fresh.
   }
 
   private handleServerError(message: { type: 'error'; code: string; message: string; fatal: boolean }): void {
@@ -419,33 +496,31 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   // -------------------------------------------------------------------------
 
   private scheduleReconnect(): void {
-    if (this.reconnectAttempts >= this.serverConfig.max_reconnect_attempts) {
+    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
       log.error('Maximum reconnection attempts reached — giving up', {
         attempts: this.reconnectAttempts,
-        max: this.serverConfig.max_reconnect_attempts,
+        max: MAX_RECONNECT_ATTEMPTS,
       });
       this.emit('error', new Error('Maximum reconnection attempts reached'));
       return;
     }
 
+    // Per PROTOCOL.md: 1s, 2s, 4s, 8s, 15s cap
     const delay = Math.min(
       BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts),
       MAX_RECONNECT_DELAY_MS,
     );
-    // Add jitter: +/- 25%
-    const jitter = delay * (0.75 + Math.random() * 0.5);
-    const delayWithJitter = Math.round(jitter);
 
     this.reconnectAttempts++;
     log.info('Scheduling reconnect', {
       attempt: this.reconnectAttempts,
-      delayMs: delayWithJitter,
+      delayMs: delay,
     });
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
-    }, delayWithJitter);
+    }, delay);
   }
 
   private clearReconnectTimer(): void {
@@ -470,11 +545,16 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     log.debug('Message sent', { type: message.type, bytes: payload.length });
   }
 
-  private sendStreamEvent(requestId: string, event: StreamEvent): void {
+  /**
+   * Send a stream event using the correct envelope format per PROTOCOL.md:
+   * { type: "stream", request_id, event: "<event_type>", data: {...} }
+   */
+  private sendStreamEvent(requestId: string, event: StreamEventType, data: StreamEventData): void {
     this.send({
-      type: 'stream_event',
+      type: 'stream',
       request_id: requestId,
       event,
+      data,
     });
   }
 }

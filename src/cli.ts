@@ -5,8 +5,9 @@
  * creates a Bridge instance, and connects to the server.
  *
  * Usage:
- *   npx @tetrixdev/ai-bridge --token <token> --server wss://example.com/bridge
+ *   npx @tetrixdev/ai-bridge --server wss://example.com/api/ai-bridge/ws --token <token>
  *   AI_BRIDGE_TOKEN=xxx AI_BRIDGE_SERVER=wss://... npx @tetrixdev/ai-bridge
+ *   npx @tetrixdev/ai-bridge --server wss://... --token <token> --test
  */
 
 import { Command } from 'commander';
@@ -16,6 +17,7 @@ import { CodexAdapter } from './providers/codex.js';
 import { ClaudeAdapter } from './providers/claude.js';
 import { GeminiAdapter } from './providers/gemini.js';
 import type { ProviderAdapter } from './providers/base.js';
+import { handleTestRequest } from './test-mode.js';
 import { setDebug, createLogger } from './utils/logger.js';
 import { BRIDGE_VERSION, PROTOCOL_VERSION } from './protocol/version.js';
 
@@ -46,13 +48,22 @@ program
     'Enable verbose debug logging',
     false,
   )
-  .action(async (opts: { token?: string; server?: string; debug: boolean }) => {
+  .option(
+    '--test',
+    'Test mode — respond to AI requests with mock streaming data',
+    false,
+  )
+  .action(async (opts: { token?: string; server?: string; debug: boolean; test: boolean }) => {
     // Enable debug logging if requested
     if (opts.debug) {
       setDebug(true);
     }
 
     log.info(`AI Bridge v${BRIDGE_VERSION} (protocol v${PROTOCOL_VERSION})`);
+
+    if (opts.test) {
+      log.info('Running in TEST MODE — AI requests will receive mock responses');
+    }
 
     // Validate required options
     const token = opts.token;
@@ -81,11 +92,12 @@ program
     const providers = await detectProviders();
     const availableProviders = providers.filter((p) => p.available);
 
-    if (availableProviders.length === 0) {
+    if (availableProviders.length === 0 && !opts.test) {
       log.warn('No AI CLI tools detected. The bridge will connect but cannot execute requests.');
       log.warn('Install one of: codex, claude, gemini');
-    } else {
-      log.info(`Available providers: ${availableProviders.map((p) => `${p.id} (${p.version ?? 'unknown version'})`).join(', ')}`);
+      log.warn('Or use --test flag to run in test mode with mock responses.');
+    } else if (availableProviders.length > 0) {
+      log.info(`Available providers: ${availableProviders.map((p) => `${p.name} (${p.version ?? 'unknown version'})`).join(', ')}`);
     }
 
     // -----------------------------------------------------------------------
@@ -101,15 +113,16 @@ program
     const adapters = new Map<string, ProviderAdapter>();
     for (const adapter of adapterInstances) {
       // Only register adapters for providers that are actually available
-      const capability = providers.find((p) => p.id === adapter.id);
+      const capability = providers.find((p) => p.name === adapter.providerName);
       if (capability?.available) {
-        adapters.set(adapter.id, adapter);
-        log.debug('Registered adapter', { id: adapter.id });
+        adapters.set(adapter.providerName, adapter);
+        log.debug('Registered adapter', { name: adapter.providerName });
       }
     }
 
     // -----------------------------------------------------------------------
     // Create and connect bridge
+    // Token goes in the URL query param (?token=...), NOT in the hello body
     // -----------------------------------------------------------------------
 
     const bridge = new Bridge({
@@ -117,6 +130,8 @@ program
       token,
       providers,
       adapters,
+      testMode: opts.test,
+      onTestRequest: opts.test ? handleTestRequest : undefined,
     });
 
     // Lifecycle logging
@@ -126,6 +141,9 @@ program
 
     bridge.on('welcome', (sessionId) => {
       log.info(`Session established: ${sessionId}`);
+      if (opts.test) {
+        log.info('Test mode active — waiting for ai_request messages...');
+      }
     });
 
     bridge.on('disconnected', (code, reason) => {
@@ -136,8 +154,8 @@ program
       log.error('Bridge error', { error: err.message });
     });
 
-    bridge.on('request_start', (requestId, providerId) => {
-      log.info(`Processing request ${requestId} with ${providerId}`);
+    bridge.on('request_start', (requestId, provider) => {
+      log.info(`Processing request ${requestId} with ${provider}${opts.test ? ' (test mode)' : ''}`);
     });
 
     bridge.on('request_end', (requestId) => {

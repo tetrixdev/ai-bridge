@@ -3,6 +3,8 @@
  *
  * Defines all message types exchanged between the bridge (client)
  * and the server over WebSocket.
+ *
+ * Source of truth: PROTOCOL.md
  */
 
 // ---------------------------------------------------------------------------
@@ -11,9 +13,7 @@
 
 /** Describes a locally detected AI CLI provider and its capabilities. */
 export interface ProviderCapability {
-  /** Unique identifier for the provider (e.g. "codex", "claude", "gemini") */
-  id: string;
-  /** Human-readable name (e.g. "OpenAI Codex CLI") */
+  /** Provider name (e.g. "codex", "claude", "gemini") — used as the identifier */
   name: string;
   /** Detected version string, or null if unknown */
   version: string | null;
@@ -31,7 +31,7 @@ export interface ProviderCapability {
 
 /** A tool definition following JSON Schema for parameters. */
 export interface ToolDefinition {
-  /** Unique tool name (e.g. "read_file", "web_search") */
+  /** Unique tool name (e.g. "roll_dice", "web_search") */
   name: string;
   /** Human-readable description of what the tool does */
   description: string;
@@ -43,12 +43,14 @@ export interface ToolDefinition {
 // Bridge -> Server Messages
 // ---------------------------------------------------------------------------
 
-/** Sent immediately after WebSocket connection is established. */
+/**
+ * Sent immediately after WebSocket connection is established.
+ * Token is NOT included — it goes in the URL query param.
+ */
 export interface HelloMessage {
   type: 'hello';
-  protocol_version: string;
+  version: string;
   bridge_version: string;
-  token: string;
   providers: ProviderCapability[];
 }
 
@@ -56,14 +58,19 @@ export interface HelloMessage {
 export interface AiRequestAckMessage {
   type: 'ai_request_ack';
   request_id: string;
-  provider_id: string;
+  cli_session_id: string;
 }
 
-/** A streaming event pushed to the server as the CLI produces output. */
-export interface StreamEventMessage {
-  type: 'stream_event';
+/**
+ * A streaming event pushed to the server as the CLI produces output.
+ *
+ * Uses the envelope format: { type: "stream", request_id, event, data }
+ */
+export interface StreamMessage {
+  type: 'stream';
   request_id: string;
-  event: StreamEvent;
+  event: StreamEventType;
+  data: StreamEventData;
 }
 
 /** Sent periodically to keep the connection alive. */
@@ -81,13 +88,23 @@ export interface ToolCallMessage {
   arguments: Record<string, unknown>;
 }
 
+/** Non-streaming error response. */
+export interface BridgeErrorMessage {
+  type: 'error';
+  request_id: string;
+  code: string;
+  message: string;
+  recoverable: boolean;
+}
+
 /** Union of all messages the bridge sends to the server. */
 export type BridgeToServerMessage =
   | HelloMessage
   | AiRequestAckMessage
-  | StreamEventMessage
+  | StreamMessage
   | PingMessage
-  | ToolCallMessage;
+  | ToolCallMessage
+  | BridgeErrorMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Bridge Messages
@@ -103,20 +120,20 @@ export interface WelcomeMessage {
 
 /** Server-provided configuration values. */
 export interface ServerConfig {
-  heartbeat_interval_ms: number;
-  max_reconnect_attempts: number;
-  request_timeout_ms: number;
+  /** Heartbeat interval in SECONDS (not milliseconds). */
+  heartbeat_interval: number;
+  /** Maximum seconds for a single AI request. */
+  request_timeout: number;
 }
 
 /** A request from the server to run an AI prompt through a local CLI. */
 export interface AiRequestMessage {
   type: 'ai_request';
   request_id: string;
-  provider_id: string;
-  prompt: string;
-  conversation_id: string | null;
+  conversation_id: string;
+  provider: string;
+  message: string;
   system_prompt: string | null;
-  tools: ToolDefinition[];
   options: AiRequestOptions;
 }
 
@@ -124,19 +141,23 @@ export interface AiRequestMessage {
 export interface AiRequestOptions {
   max_tokens: number | null;
   temperature: number | null;
-  thinking: boolean;
-  session_resume_id: string | null;
 }
 
 /** Instructs the bridge to reset/clear a conversation session. */
 export interface SessionResetMessage {
   type: 'session_reset';
+  request_id: string;
   conversation_id: string;
+  provider: string;
+  system_prompt: string | null;
+  history: Array<{ role: string; content: string }>;
+  options: AiRequestOptions;
 }
 
 /** Server responds with the result of a tool call. */
 export interface ToolResolveMessage {
   type: 'tool_resolve';
+  request_id: string;
   tool_call_id: string;
   result: unknown;
 }
@@ -144,6 +165,7 @@ export interface ToolResolveMessage {
 /** Server responds with an error for a tool call. */
 export interface ToolErrorMessage {
   type: 'tool_error';
+  request_id: string;
   tool_call_id: string;
   error: string;
 }
@@ -173,51 +195,55 @@ export type ServerToBridgeMessage =
   | ErrorMessage;
 
 // ---------------------------------------------------------------------------
-// Stream Events (discriminated union on `event` field)
+// Stream Event Types and Data
 // ---------------------------------------------------------------------------
 
-/** Signals the start of a new content block. */
-export interface BlockStartEvent {
-  event: 'block_start';
-  block_id: string;
-  block_type: 'text' | 'thinking' | 'tool_use';
-  /** For tool_use blocks, the tool name. */
+/** The event type names used inside stream envelopes. */
+export type StreamEventType =
+  | 'block_start'
+  | 'block_delta'
+  | 'block_stop'
+  | 'tool_result'
+  | 'done'
+  | 'error';
+
+/** Block types in the protocol. */
+export type BlockType = 'text' | 'thinking' | 'tool_call';
+
+/** Data payload for block_start events. */
+export interface BlockStartData {
+  block_index: number;
+  block_type: BlockType;
+  /** For tool_call blocks only. */
   tool_name?: string;
+  /** For tool_call blocks only. */
+  tool_call_id?: string;
 }
 
-/** A delta (chunk) of content within a block. */
-export interface BlockDeltaEvent {
-  event: 'block_delta';
-  block_id: string;
-  delta: string;
+/** Data payload for block_delta events. */
+export interface BlockDeltaData {
+  block_index: number;
+  content: string;
 }
 
-/** Signals that a content block is complete. */
-export interface BlockStopEvent {
-  event: 'block_stop';
-  block_id: string;
+/** Data payload for block_stop events. */
+export interface BlockStopData {
+  block_index: number;
 }
 
-/** The result of a tool invocation, fed back into the model. */
-export interface ToolResultEvent {
-  event: 'tool_result';
+/** Data payload for tool_result events. */
+export interface ToolResultData {
   tool_call_id: string;
-  tool_name: string;
-  result: unknown;
-  is_error: boolean;
+  result: string;
 }
 
-/** The entire response is complete. */
-export interface DoneEvent {
-  event: 'done';
-  /** CLI session ID that can be used to resume later. */
-  session_id: string | null;
-  usage: TokenUsage | null;
+/** Data payload for done events. */
+export interface DoneData {
+  usage?: TokenUsage;
 }
 
-/** An error occurred during streaming. */
-export interface StreamErrorEvent {
-  event: 'error';
+/** Data payload for error events. */
+export interface StreamErrorData {
   code: string;
   message: string;
 }
@@ -228,11 +254,11 @@ export interface TokenUsage {
   output_tokens: number | null;
 }
 
-/** Discriminated union of all stream event types. */
-export type StreamEvent =
-  | BlockStartEvent
-  | BlockDeltaEvent
-  | BlockStopEvent
-  | ToolResultEvent
-  | DoneEvent
-  | StreamErrorEvent;
+/** Union of all stream event data payloads. */
+export type StreamEventData =
+  | BlockStartData
+  | BlockDeltaData
+  | BlockStopData
+  | ToolResultData
+  | DoneData
+  | StreamErrorData;

@@ -1,61 +1,73 @@
 /**
  * Gemini CLI Adapter
  *
- * Wraps the Google Gemini CLI to produce normalized StreamEvent output.
- * This is a stub implementation — the actual CLI invocation logic will
- * be implemented once the Gemini CLI's output format is integrated.
+ * Wraps the Google Gemini CLI to produce normalized stream events.
+ *
+ * CLI invocation per PROTOCOL.md:
+ *   New session:    gemini -p "user message"
+ *   Resume session: gemini -p --resume <UUID> "user message"
+ *
+ * Gemini outputs plain text — the bridge wraps it in a single text block.
  */
 
-import type { ProviderCapability, StreamEvent } from '../protocol/types.js';
-import { ProviderAdapter, type ExecutionContext } from './base.js';
+import type { ProviderCapability } from '../protocol/types.js';
+import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('GeminiAdapter');
 
 export class GeminiAdapter extends ProviderAdapter {
-  readonly id = 'gemini';
-  readonly name = 'Google Gemini CLI';
+  readonly providerName = 'gemini';
 
   async detect(): Promise<ProviderCapability> {
     return {
-      id: this.id,
-      name: this.name,
+      name: this.providerName,
       version: null,
       available: false,
-      supports_streaming: true,
+      supports_streaming: false,
       supports_tools: true,
-      supports_thinking: true,
-      supports_session_resume: false,
+      supports_thinking: false,
+      supports_session_resume: true,
     };
   }
 
-  async execute(context: ExecutionContext, onEvent: (event: StreamEvent) => void): Promise<void> {
+  async execute(context: ExecutionContext, onEvent: (event: AdapterStreamEvent) => void): Promise<string | null> {
     log.info('Executing Gemini request', { requestId: context.request.request_id });
 
     // TODO: Implement actual Gemini CLI invocation.
     //
+    // New session:
+    //   gemini -p "user message"
+    //
+    // Resume session:
+    //   gemini -p --resume <UUID> "user message"
+    //
     // The implementation will:
     // 1. Build the gemini CLI command with appropriate flags
     // 2. Spawn the child process
-    // 3. Parse the streaming output
-    // 4. Normalize each chunk into Bridge StreamEvents
-    // 5. Handle tool calls via context.onToolCall()
-    // 6. Emit DoneEvent when complete
+    // 3. Parse text streaming output
+    // 4. Wrap in a single text block (block_start, block_delta chunks, block_stop)
+    // 5. Handle tool calls via bash scripts if needed
+    // 6. Emit done event when complete
+    // 7. Return the session ID
 
     onEvent({
       event: 'error',
-      code: 'NOT_IMPLEMENTED',
-      message: 'Gemini CLI adapter is not yet implemented',
+      data: {
+        code: 'provider_error',
+        message: 'Gemini CLI adapter is not yet implemented',
+      },
     });
 
     onEvent({
       event: 'done',
-      session_id: null,
-      usage: null,
+      data: {},
     });
+
+    return null;
   }
 
   supportsSessionResume(): boolean {
-    return false;
+    return true;
   }
 }
