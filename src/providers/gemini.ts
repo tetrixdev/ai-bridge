@@ -19,9 +19,9 @@
 
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import type { ProviderCapability, ModelInfo } from '../protocol/types.js';
+import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv, buildCombinedPrompt } from './env.js';
+import { buildSpawnEnv, buildCombinedPrompt, appendStderr } from './env.js';
 import { createLogger } from '../utils/logger.js';
 
 /**
@@ -42,19 +42,6 @@ const log = createLogger('GeminiAdapter');
 
 export class GeminiAdapter extends ProviderAdapter {
   readonly providerName = 'gemini';
-
-  async detect(): Promise<ProviderCapability> {
-    // Detection is handled by detector.ts — this is a fallback.
-    return {
-      name: this.providerName,
-      version: null,
-      available: false,
-      supports_streaming: true,
-      supports_tools: true,
-      supports_thinking: false,
-      supports_session_resume: true,
-    };
-  }
 
   async execute(context: ExecutionContext, onEvent: (event: AdapterStreamEvent) => void): Promise<string | null> {
     const { request, signal, cliSessionId } = context;
@@ -88,6 +75,13 @@ export class GeminiAdapter extends ProviderAdapter {
       args.push('--model', request.options.model);
     }
 
+    // ARCH-009: Gemini CLI does not support max_tokens directly
+    if (request.options?.max_tokens) {
+      log.warn('max_tokens option specified but Gemini CLI does not support it directly — ignoring', {
+        max_tokens: request.options.max_tokens,
+      });
+    }
+
     log.debug('Spawning gemini', { args: args.map((a) => a.length > 50 ? a.substring(0, 50) + '...' : a) });
 
     return new Promise<string | null>((resolve) => {
@@ -110,6 +104,58 @@ export class GeminiAdapter extends ProviderAdapter {
         child.kill('SIGTERM');
       };
       signal.addEventListener('abort', onAbort, { once: true });
+
+      // Track when both readline and the child process have finished to avoid
+      // a race condition where child.on('close') fires before readline has
+      // processed all buffered NDJSON lines (including the final 'result' line
+      // that carries the 'done' event).
+      let rlClosed = false;
+      let childExitCode: number | null = null;
+      let childExited = false;
+
+      const tryFinalize = () => {
+        if (!rlClosed || !childExited) return;  // Wait for both
+        signal.removeEventListener('abort', onAbort);
+
+        if (settled) {
+          log.debug('Gemini process closed', { code: childExitCode, sessionId });
+          resolve(sessionId);
+          return;
+        }
+        settled = true;
+
+        // Close any open text block
+        if (inTextBlock) {
+          onEvent({
+            event: 'block_stop',
+            data: { block_index: blockIndex },
+          });
+          blockIndex++;
+          inTextBlock = false;
+        }
+
+        // If readline finished without a 'result' event and the process exited
+        // with an error code, report the error.
+        if (childExitCode !== 0 && childExitCode !== null) {
+          log.warn('Gemini exited with non-zero code', { code: childExitCode, stderr: stderrBuffer.substring(0, 500) });
+
+          onEvent({
+            event: 'error',
+            data: {
+              code: 'provider_error',
+              message: stderrBuffer.trim().substring(0, 500) || `Gemini exited with code ${childExitCode}`,
+            },
+          });
+          onEvent({ event: 'done', data: {} });
+        } else {
+          // Process exited cleanly but no 'result' event was seen — still send done
+          log.warn('Gemini exited without result event', { code: childExitCode });
+          onEvent({ event: 'done', data: {} });
+        }
+
+        log.debug('Gemini process closed', { code: childExitCode, sessionId });
+        resolve(sessionId);
+      };
 
       // Parse NDJSON from stdout line by line
       const rl = createInterface({ input: child.stdout });
@@ -271,6 +317,9 @@ export class GeminiAdapter extends ProviderAdapter {
                 message: message ?? 'Unknown Gemini error',
               },
             });
+            // BL-002: Fatal errors terminate the response — emit done and mark settled.
+            onEvent({ event: 'done', data: {} });
+            settled = true;
           }
           return;
         }
@@ -324,14 +373,24 @@ export class GeminiAdapter extends ProviderAdapter {
         log.debug('Unhandled Gemini event type', { type });
       });
 
-      // Capture stderr for error logging
-      let stderrBuffer = '';
-      child.stderr.on('data', (chunk: Buffer) => {
-        stderrBuffer += chunk.toString();
+      // When readline finishes processing all buffered lines
+      rl.on('close', () => {
+        rlClosed = true;
+        tryFinalize();
       });
 
-      child.on('error', (err) => {
+      // Capture stderr for error logging (SEC-005: capped at 10KB)
+      let stderrBuffer = '';
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderrBuffer = appendStderr(stderrBuffer, chunk.toString());
+      });
+
+      child.on('error', (err: NodeJS.ErrnoException) => {
         log.error('Failed to spawn gemini', { error: err.message });
+        // UX-002: Provide user-friendly message for ENOENT
+        const errorMessage = err.code === 'ENOENT'
+          ? 'gemini CLI not found. Install it or ensure it is on your PATH.'
+          : `Failed to spawn gemini: ${err.message}`;
         signal.removeEventListener('abort', onAbort);
 
         if (!settled) {
@@ -340,7 +399,7 @@ export class GeminiAdapter extends ProviderAdapter {
             event: 'error',
             data: {
               code: 'provider_spawn_error',
-              message: `Failed to spawn gemini: ${err.message}`,
+              message: errorMessage,
             },
           });
           onEvent({ event: 'done', data: {} });
@@ -349,42 +408,11 @@ export class GeminiAdapter extends ProviderAdapter {
       });
 
       child.on('close', (code) => {
-        signal.removeEventListener('abort', onAbort);
-
-        if (settled) return;
-        settled = true;
-
-        // Close any open text block
-        if (inTextBlock) {
-          onEvent({
-            event: 'block_stop',
-            data: { block_index: blockIndex },
-          });
-          blockIndex++;
-          inTextBlock = false;
-        }
-
-        if (code !== 0 && code !== null) {
-          log.warn('Gemini exited with non-zero code', { code, stderr: stderrBuffer.substring(0, 500) });
-
-          onEvent({
-            event: 'error',
-            data: {
-              code: 'provider_error',
-              message: stderrBuffer.trim().substring(0, 500) || `Gemini exited with code ${code}`,
-            },
-          });
-          onEvent({ event: 'done', data: {} });
-        }
-
-        log.debug('Gemini process closed', { code, sessionId });
-        resolve(sessionId);
+        childExitCode = code;
+        childExited = true;
+        tryFinalize();
       });
     });
-  }
-
-  supportsSessionResume(): boolean {
-    return true;
   }
 
   async listModels(): Promise<ModelInfo[]> {

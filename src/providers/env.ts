@@ -1,9 +1,13 @@
 /**
  * Shared utilities for provider adapters.
  *
- * Centralizes environment variable construction and prompt building that
- * would otherwise be duplicated across all three adapter implementations.
+ * Centralizes environment variable construction, prompt building, and
+ * stderr buffering that would otherwise be duplicated across all three
+ * adapter implementations.
  */
+
+/** SEC-005: Maximum stderr buffer size (10 KB). */
+const MAX_STDERR_BYTES = 10 * 1024;
 
 /**
  * Build the environment variables for spawning a CLI subprocess.
@@ -39,4 +43,20 @@ export function buildSpawnEnv(toolScriptDir: string | null, requestId?: string):
  */
 export function buildCombinedPrompt(systemPrompt: string, userMessage: string): string {
   return `${systemPrompt}\n\nUser request:\n${userMessage}`;
+}
+
+/**
+ * SEC-005: Append a chunk to a stderr buffer, capping at MAX_STDERR_BYTES (10 KB).
+ * When the limit is exceeded, only the last 10 KB is kept.
+ *
+ * @param buffer  Current buffer contents.
+ * @param chunk   New data to append.
+ * @returns The updated (possibly truncated) buffer.
+ */
+export function appendStderr(buffer: string, chunk: string): string {
+  buffer += chunk;
+  if (buffer.length > MAX_STDERR_BYTES) {
+    buffer = buffer.slice(buffer.length - MAX_STDERR_BYTES);
+  }
+  return buffer;
 }

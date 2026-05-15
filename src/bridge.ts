@@ -17,6 +17,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import crypto from 'node:crypto';
 import WebSocket from 'ws';
 import type {
   ProviderCapability,
@@ -24,6 +25,7 @@ import type {
   ServerToBridgeMessage,
   AiRequestMessage,
   SessionResetMessage,
+  WelcomeMessage,
   ToolDefinition,
   ServerConfig,
   StreamEventType,
@@ -111,6 +113,17 @@ function buildSessionResetRequest(
 ): AiRequestMessage | null {
   const { request_id, conversation_id, provider, history, options } = originalMsg;
 
+  // BL-017: Validate history roles — warn if unexpected values encountered
+  const validRoles = new Set(['user', 'assistant', 'system']);
+  const unexpectedRoles = history
+    .map((h) => h.role)
+    .filter((role) => !validRoles.has(role));
+  if (unexpectedRoles.length > 0) {
+    log.warn('Session reset history contains unexpected role values', {
+      unexpectedRoles: [...new Set(unexpectedRoles)],
+    });
+  }
+
   // EFF-010: Use findLastIndex instead of two-step find-then-lastIndexOf
   const lastUserIdx = history.findLastIndex((h) => h.role === 'user');
   if (lastUserIdx === -1) {
@@ -175,10 +188,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   };
 
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private pongTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  private awaitingPong = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private isShuttingDown = false;
   private activeRequests = new Map<string, AbortController>();
+  /** SEC-002: Random secret for authenticating tool callback HTTP requests. */
+  private readonly callbackSecret: string;
 
   constructor(options: BridgeOptions) {
     super();
@@ -188,6 +205,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.adapters = options.adapters;
     this.testMode = options.testMode ?? false;
     this.onTestRequest = options.onTestRequest;
+
+    // SEC-002: Generate a random secret for callback server authentication
+    this.callbackSecret = crypto.randomBytes(32).toString('hex');
 
     // ARCH-001: Pass sendFn directly to the callback server constructor
     // so HTTP-based tool calls from scripts are forwarded over WebSocket.
@@ -205,6 +225,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       this.toolResolver,
       sendFn,
       new Set(this.toolManager.getAll().map((t) => t.name)),
+      this.callbackSecret,
     );
   }
 
@@ -233,6 +254,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       headers: {
         'User-Agent': `ai-bridge/${BRIDGE_VERSION}`,
       },
+      // SEC-004: Limit incoming message size to 10MB to prevent memory exhaustion
+      maxPayload: 10 * 1024 * 1024,
     });
 
     this.ws.on('open', this.onOpen.bind(this));
@@ -318,6 +341,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         break;
       case 'pong':
         log.debug('Pong received', { timestamp: message.timestamp });
+        // BL-004: Mark pong received and clear the timeout
+        this.awaitingPong = false;
+        if (this.pongTimeoutTimer) {
+          clearTimeout(this.pongTimeoutTimer);
+          this.pongTimeoutTimer = null;
+        }
         break;
       case 'error':
         this.handleServerError(message);
@@ -394,17 +423,33 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     });
   }
 
-  private async handleWelcome(message: {
-    type: 'welcome';
-    session_id: string;
-    tools: ToolDefinition[];
-    config: ServerConfig;
-  }): Promise<void> {
+  private async handleWelcome(message: WelcomeMessage): Promise<void> {
     this.sessionId = message.session_id;
     this.serverConfig = message.config;
 
+    // BL-033: Check protocol version compatibility if the server provides one
+    if (message.protocol_version) {
+      const serverMajor = message.protocol_version.split('.')[0];
+      const bridgeMajor = PROTOCOL_VERSION.split('.')[0];
+      if (serverMajor !== bridgeMajor) {
+        log.warn('Protocol version mismatch — major versions differ', {
+          server: message.protocol_version,
+          bridge: PROTOCOL_VERSION,
+        });
+      }
+    }
+
+    // BL-005: Update tool resolver timeout from server's request_timeout config
+    if (message.config.request_timeout) {
+      this.toolResolver.setTimeoutMs(message.config.request_timeout * 1000);
+    }
+
     // Register tools from the server
     this.toolManager.register(message.tools);
+
+    // BL-001: Update the callback server's validation set so it accepts
+    // tool calls for the tools we just registered.
+    this.callbackServer.setRegisteredToolNames(this.toolManager.getRegisteredNames());
 
     // Generate tool wrapper scripts and start the callback server
     if (message.tools.length > 0) {
@@ -412,7 +457,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         await this.callbackServer.start();
         const port = this.callbackServer.getPort();
         if (port) {
-          this.toolManager.generateScripts(port);
+          this.toolManager.generateScripts(port, this.callbackSecret);
           log.info('Tool scripts generated', {
             count: message.tools.length,
             callbackPort: port,
@@ -450,6 +495,22 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     const existingCliSessionId = conversation_id
       ? this.sessionStore.get(conversation_id)
       : null;
+
+    // BL-003: If a conversation_id was provided but no session was found,
+    // warn and emit a non-fatal error so the server is informed. We still
+    // proceed with a new session to avoid breaking functionality.
+    if (conversation_id && !existingCliSessionId && !message.system_prompt) {
+      log.warn('Session not found for conversation — starting fresh', {
+        conversationId: conversation_id,
+      });
+      this.send({
+        type: 'error',
+        request_id,
+        code: 'session_expired',
+        message: `No local session found for conversation ${conversation_id}`,
+        fatal: false,
+      });
+    }
 
     // Send ai_request_ack with the CLI session ID
     this.send({
@@ -507,7 +568,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         request_id,
         code: 'provider_unavailable',
         message: `Provider "${provider}" is not available on this bridge`,
-        recoverable: false,
+        fatal: true,
       });
       return;
     }
@@ -612,7 +673,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         request_id,
         code: 'session_reset_failed',
         message: 'No user message found in conversation history',
-        recoverable: false,
+        fatal: true,
       });
       return;
     }
@@ -641,6 +702,19 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       if (this.isConnected()) {
         this.send({ type: 'ping', timestamp: Date.now() });
         log.debug('Ping sent');
+
+        // BL-004: Set a 10-second timeout for the pong response.
+        // If no pong arrives, treat the connection as dead.
+        this.awaitingPong = true;
+        if (this.pongTimeoutTimer) {
+          clearTimeout(this.pongTimeoutTimer);
+        }
+        this.pongTimeoutTimer = setTimeout(() => {
+          if (this.awaitingPong && this.isConnected()) {
+            log.warn('Pong not received within 10s — connection presumed dead');
+            this.ws?.close(4000, 'Pong timeout');
+          }
+        }, 10_000);
       }
     }, intervalMs);
     log.debug('Heartbeat started', { intervalMs });
@@ -651,6 +725,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+    if (this.pongTimeoutTimer) {
+      clearTimeout(this.pongTimeoutTimer);
+      this.pongTimeoutTimer = null;
+    }
+    this.awaitingPong = false;
   }
 
   // -------------------------------------------------------------------------

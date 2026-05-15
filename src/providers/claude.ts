@@ -16,9 +16,9 @@
 
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import type { ProviderCapability, ModelInfo } from '../protocol/types.js';
+import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv } from './env.js';
+import { buildSpawnEnv, appendStderr } from './env.js';
 import { createLogger } from '../utils/logger.js';
 
 /**
@@ -38,19 +38,6 @@ const log = createLogger('ClaudeAdapter');
 
 export class ClaudeAdapter extends ProviderAdapter {
   readonly providerName = 'claude';
-
-  async detect(): Promise<ProviderCapability> {
-    // Detection is handled by detector.ts — this is a fallback.
-    return {
-      name: this.providerName,
-      version: null,
-      available: false,
-      supports_streaming: true,
-      supports_tools: true,
-      supports_thinking: true,
-      supports_session_resume: true,
-    };
-  }
 
   async execute(context: ExecutionContext, onEvent: (event: AdapterStreamEvent) => void): Promise<string | null> {
     const { request, signal, cliSessionId } = context;
@@ -87,6 +74,15 @@ export class ClaudeAdapter extends ProviderAdapter {
       args.push('--max-tokens', String(request.options.max_tokens));
     }
 
+    // UX-003: Enable Bash tool access when server-defined tools are available.
+    // The wrapper scripts are invoked via bash, so Claude needs --allowedTools bash.
+    // IMPORTANT: Use --allowedTools=bash (equals sign syntax) because --allowedTools
+    // is a variadic CLI option (<tools...>) that would otherwise consume ALL remaining
+    // positional arguments — including the user's prompt message.
+    if (context.tools.length > 0 && context.toolScriptDir) {
+      args.push('--allowedTools=bash');
+    }
+
     // The user message is the final argument
     args.push(userMessage);
 
@@ -113,6 +109,48 @@ export class ClaudeAdapter extends ProviderAdapter {
         child.kill('SIGTERM');
       };
       signal.addEventListener('abort', onAbort, { once: true });
+
+      // Track when both readline and the child process have finished to avoid
+      // a race condition where child.on('close') fires before readline has
+      // processed all buffered NDJSON lines (including the final 'result' line
+      // that carries the 'done' event).
+      let rlClosed = false;
+      let childExitCode: number | null = null;
+      let childExited = false;
+
+      const tryFinalize = () => {
+        if (!rlClosed || !childExited) return;  // Wait for both
+        signal.removeEventListener('abort', onAbort);
+
+        if (settled) {
+          log.debug('Claude process closed', { code: childExitCode, sessionId });
+          resolve(sessionId);
+          return;
+        }
+        settled = true;
+
+        // If readline finished without a 'result' event and the process exited
+        // with an error code, report the error.
+        if (childExitCode !== 0 && childExitCode !== null) {
+          log.warn('Claude exited with non-zero code', { code: childExitCode, stderr: stderrBuffer.substring(0, 500) });
+
+          onEvent({
+            event: 'error',
+            data: {
+              code: 'provider_error',
+              message: stderrBuffer.trim().substring(0, 500) || `Claude exited with code ${childExitCode}`,
+            },
+          });
+          onEvent({ event: 'done', data: {} });
+        } else {
+          // Process exited cleanly but no 'result' event was seen — still send done
+          log.warn('Claude exited without result event', { code: childExitCode });
+          onEvent({ event: 'done', data: {} });
+        }
+
+        log.debug('Claude process closed', { code: childExitCode, sessionId });
+        resolve(sessionId);
+      };
 
       // Parse NDJSON from stdout line by line
       const rl = createInterface({ input: child.stdout });
@@ -272,14 +310,24 @@ export class ClaudeAdapter extends ProviderAdapter {
         }
       });
 
-      // Capture stderr for error logging
-      let stderrBuffer = '';
-      child.stderr.on('data', (chunk: Buffer) => {
-        stderrBuffer += chunk.toString();
+      // When readline finishes processing all buffered lines
+      rl.on('close', () => {
+        rlClosed = true;
+        tryFinalize();
       });
 
-      child.on('error', (err) => {
+      // Capture stderr for error logging (SEC-005: capped at 10KB)
+      let stderrBuffer = '';
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderrBuffer = appendStderr(stderrBuffer, chunk.toString());
+      });
+
+      child.on('error', (err: NodeJS.ErrnoException) => {
         log.error('Failed to spawn claude', { error: err.message });
+        // UX-002: Provide user-friendly message for ENOENT
+        const errorMessage = err.code === 'ENOENT'
+          ? 'claude CLI not found. Install it or ensure it is on your PATH.'
+          : `Failed to spawn claude: ${err.message}`;
         signal.removeEventListener('abort', onAbort);
 
         if (!settled) {
@@ -288,7 +336,7 @@ export class ClaudeAdapter extends ProviderAdapter {
             event: 'error',
             data: {
               code: 'provider_spawn_error',
-              message: `Failed to spawn claude: ${err.message}`,
+              message: errorMessage,
             },
           });
           onEvent({ event: 'done', data: {} });
@@ -297,32 +345,11 @@ export class ClaudeAdapter extends ProviderAdapter {
       });
 
       child.on('close', (code) => {
-        signal.removeEventListener('abort', onAbort);
-
-        if (settled) return;
-        settled = true;
-
-        if (code !== 0 && code !== null) {
-          log.warn('Claude exited with non-zero code', { code, stderr: stderrBuffer.substring(0, 500) });
-
-          onEvent({
-            event: 'error',
-            data: {
-              code: 'provider_error',
-              message: stderrBuffer.trim().substring(0, 500) || `Claude exited with code ${code}`,
-            },
-          });
-          onEvent({ event: 'done', data: {} });
-        }
-
-        log.debug('Claude process closed', { code, sessionId });
-        resolve(sessionId);
+        childExitCode = code;
+        childExited = true;
+        tryFinalize();
       });
     });
-  }
-
-  supportsSessionResume(): boolean {
-    return true;
   }
 
   async listModels(): Promise<ModelInfo[]> {

@@ -85,6 +85,11 @@ program
       process.exit(1);
     }
 
+    // BL-013: Warn about unencrypted connections
+    if (serverUrl.startsWith('ws://')) {
+      log.warn('WARNING: Connecting over unencrypted ws://. Use wss:// in production.');
+    }
+
     // SEC-006: Reject URLs that contain username/password components to prevent
     // URL authority confusion (e.g. wss://legit.com@attacker.com/ws)
     try {
@@ -168,6 +173,10 @@ program
       log.info(`Session established: ${sessionId}`);
       if (opts.test) {
         log.info('Test mode active — waiting for ai_request messages...');
+      }
+      // UX-007: Remind the user if no providers are available
+      if (availableProviders.length === 0 && !opts.test) {
+        log.warn('Session established (no providers available — requests will fail)');
       }
     });
 

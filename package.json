@@ -15,7 +15,8 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "commander": "^13.1.0",

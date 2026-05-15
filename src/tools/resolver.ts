@@ -35,10 +35,18 @@ export type SendToolCallFn = (
 
 export class ToolResolver {
   private pending = new Map<string, PendingToolCall>();
-  private readonly timeoutMs: number;
+  private timeoutMs: number;
 
   constructor(timeoutMs: number = 300_000) {
     this.timeoutMs = timeoutMs;
+  }
+
+  /**
+   * BL-005: Update the timeout duration (e.g., from server's request_timeout config).
+   */
+  setTimeoutMs(ms: number): void {
+    this.timeoutMs = ms;
+    log.debug('Tool resolver timeout updated', { timeoutMs: ms });
   }
 
   /**

@@ -4,6 +4,8 @@ A local CLI bridge that connects your AI command-line tools (Codex, Claude, Gemi
 
 ## Quick Start
 
+The **connection token** is generated from the web application that uses the AI Bridge server package (for example, `php artisan ai-bridge:token` for Laravel apps). The **server URL** is the WebSocket server address provided by that application (typically `wss://your-app.com/api/ai-bridge/ws`).
+
 ```bash
 npx @tetrixdev/ai-bridge --server=wss://your-app.com/api/ai-bridge/ws --token=YOUR_CONNECTION_TOKEN
 ```

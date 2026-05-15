@@ -68,13 +68,13 @@ export class SessionStore {
 
     if (this.isExpired(record)) {
       delete this.data[conversationId];
+      // ARCH-005: Persist only on mutations that matter (expiry deletion)
       this.persist();
       return null;
     }
 
-    // Touch last_used_at
+    // ARCH-005: Touch last_used_at in memory only — persist on set/delete/shutdown
     record.last_used_at = new Date().toISOString();
-    this.persist();
     return record.cli_session_id;
   }
 
@@ -127,9 +127,11 @@ export class SessionStore {
 
   /**
    * Returns the number of active (non-expired) sessions.
+   * CONS-005: Filters out expired sessions before counting.
    */
   size(): number {
-    return Object.keys(this.data).length;
+    const now = Date.now();
+    return Object.values(this.data).filter((record) => !this.isExpired(record, now)).length;
   }
 
   // -------------------------------------------------------------------------
@@ -185,9 +187,11 @@ export class SessionStore {
   private persist(): void {
     try {
       if (!fs.existsSync(this.dir)) {
-        fs.mkdirSync(this.dir, { recursive: true });
+        // SEC-006: Create directory with restricted permissions (owner-only)
+        fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
       }
-      fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf-8');
+      // SEC-006: Write sessions file with restricted permissions (owner read/write only)
+      fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), { encoding: 'utf-8', mode: 0o600 });
     } catch (err) {
       log.error('Failed to persist sessions file', {
         error: err instanceof Error ? err.message : String(err),

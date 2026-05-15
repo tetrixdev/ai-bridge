@@ -6,7 +6,6 @@
  */
 
 import type {
-  ProviderCapability,
   ModelInfo,
   AiRequestMessage,
   ToolDefinition,
@@ -24,7 +23,7 @@ export interface AdapterStreamEvent {
 export interface ExecutionContext {
   /** The full AI request from the server. */
   request: AiRequestMessage;
-  /** The request ID for correlation with tool calls and stream events. */
+  /** The request ID for correlation with tool calls, stream events, and concurrent-request correlation (set by bridge). */
   requestId: string;
   /** Tool definitions that should be made available to the CLI. */
   tools: ToolDefinition[];
@@ -36,19 +35,11 @@ export interface ExecutionContext {
   signal: AbortSignal;
   /** CLI session ID if resuming, or null for new session. */
   cliSessionId: string | null;
-  /** Unique request ID for concurrent-request correlation (set by bridge). */
-  requestId?: string;
 }
 
 export abstract class ProviderAdapter {
   /** Provider name / identifier (e.g. "codex", "claude", "gemini"). */
   abstract readonly providerName: string;
-
-  /**
-   * Detect whether this CLI is installed and return its capabilities.
-   * Must not throw — returns `available: false` if not found.
-   */
-  abstract detect(): Promise<ProviderCapability>;
 
   /**
    * Execute an AI request by invoking the local CLI.
@@ -67,9 +58,6 @@ export abstract class ProviderAdapter {
     context: ExecutionContext,
     onEvent: (event: AdapterStreamEvent) => void,
   ): Promise<string | null>;
-
-  /** Whether this provider supports resuming a previous CLI session. */
-  abstract supportsSessionResume(): boolean;
 
   /**
    * List available models for this provider.

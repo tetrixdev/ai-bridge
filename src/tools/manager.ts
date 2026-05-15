@@ -25,12 +25,16 @@ const log = createLogger('ToolManager');
 /** Strict pattern for safe tool names: must start with a letter, alphanumeric/underscore/hyphen only. */
 const SAFE_TOOL_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
 
-/** SEC-005: Denylist of system binary names that must not be used as tool names. */
+/** SEC-003: Expanded denylist of system binary names that must not be used as tool names. */
 const RESERVED_TOOL_NAMES = new Set([
   'curl', 'wget', 'node', 'npm', 'npx', 'bash', 'sh', 'zsh',
   'python', 'python3', 'ruby', 'perl', 'git', 'ssh', 'scp',
   'cat', 'ls', 'rm', 'cp', 'mv', 'chmod', 'chown', 'mkdir',
   'kill', 'ps', 'env', 'sudo', 'su', 'tar', 'gzip', 'gunzip',
+  'openssl', 'nc', 'ncat', 'netcat', 'socat', 'find', 'grep',
+  'awk', 'sed', 'echo', 'printf', 'head', 'tail', 'wc', 'tee',
+  'test', 'true', 'false', 'xargs', 'sort', 'uniq', 'cut', 'tr',
+  'make',
 ]);
 
 export class ToolManager {
@@ -121,9 +125,10 @@ export class ToolManager {
    *
    * @param callbackPort The local HTTP port the bridge is listening on
    *                     for tool call callbacks from spawned scripts.
+   * @param secret       Optional bearer token for callback server authentication (SEC-002).
    * @returns The path to the temporary directory containing the scripts.
    */
-  generateScripts(callbackPort: number): string {
+  generateScripts(callbackPort: number, secret?: string): string {
     // Clean up any previous script directory
     this.cleanupScripts();
 
@@ -132,7 +137,7 @@ export class ToolManager {
 
     for (const tool of this.tools.values()) {
       const scriptPath = path.join(this.scriptDir, tool.name);
-      const scriptContent = this.buildScript(tool, callbackPort);
+      const scriptContent = this.buildScript(tool, callbackPort, secret);
       fs.writeFileSync(scriptPath, scriptContent, { mode: 0o755 });
       log.debug('Generated tool script', { tool: tool.name, path: scriptPath });
     }
@@ -169,62 +174,72 @@ export class ToolManager {
   /**
    * Build the Bash script content for a single tool.
    *
-   * The script reads tool arguments as JSON from stdin (the standard way
-   * AI CLIs pass arguments to tools), forwards them to the bridge's HTTP
-   * callback server, and returns the result.
+   * EFF-006: Uses a single Node.js invocation that handles input parsing,
+   * payload building, HTTP call, and output extraction.
    *
-   * Uses Node.js (guaranteed present) instead of python3 for JSON handling.
+   * SEC-002: Embeds bearer token for callback server authentication.
+   *
    * Tool names are pre-validated by register() so they are safe to embed.
-   * Tool descriptions are NOT included in the script to prevent injection (SEC-002).
+   * Tool descriptions are NOT included in the script to prevent injection.
    */
-  private buildScript(tool: ToolDefinition, callbackPort: number): string {
+  private buildScript(tool: ToolDefinition, callbackPort: number, secret?: string): string {
+    const secretArg = secret ?? '';
     return `#!/usr/bin/env bash
 # Auto-generated tool wrapper: ${tool.name}
 # DO NOT EDIT — regenerated on each bridge session.
 
 set -euo pipefail
 
-TOOL_NAME="${tool.name}"
-TOOL_CALL_ID="tc_$\{RANDOM}$\{RANDOM}"
-CALLBACK_URL="http://127.0.0.1:${callbackPort}/tool-call"
-
-# Read arguments from stdin as JSON (the standard way AI CLIs pass tool args).
-# Falls back to empty object if no stdin or invalid JSON.
-# EFF-009: Single Node.js invocation for both validation and wrapping.
-ARGS_JSON="{}"
+# Read arguments from stdin (the standard way AI CLIs pass tool args).
+STDIN_DATA=""
 if [ ! -t 0 ]; then
   STDIN_DATA=$(cat)
-  if [ -n "$STDIN_DATA" ]; then
-    ARGS_JSON=$(node -e "
-const d = process.argv[1];
-try { JSON.parse(d); process.stdout.write(d); }
-catch(e) { process.stdout.write(JSON.stringify({input: d})); }
-" "$STDIN_DATA")
-  fi
 fi
 
-# Build the request payload using node for safe JSON construction
-# ARCH-001: Include request_id from environment variable in POST body
-PAYLOAD=$(node -e "process.stdout.write(JSON.stringify({
-  tool_name: process.argv[1],
-  tool_call_id: process.argv[2],
-  arguments: JSON.parse(process.argv[3]),
-  request_id: process.argv[4]
-}))" "$TOOL_NAME" "$TOOL_CALL_ID" "$ARGS_JSON" "\${AI_BRIDGE_REQUEST_ID:-}")
+# EFF-006: Single Node.js invocation for input parsing, payload building,
+# HTTP call, and output extraction.
+node -e '
+const http = require("http");
+const stdinData = process.argv[1];
+const toolName = process.argv[2];
+const toolCallId = process.argv[3];
+const requestId = process.argv[4];
+const secret = process.argv[5];
 
-# Send the tool call to the bridge and get the result
-RESPONSE=$(curl -s -X POST "$CALLBACK_URL" \\
-  -H "Content-Type: application/json" \\
-  -d "$PAYLOAD" \\
-  --max-time 300)
+// Parse stdin as JSON, fall back to wrapping as {input: ...}
+let args = {};
+if (stdinData) {
+  try { args = JSON.parse(stdinData); } catch { args = { input: stdinData }; }
+}
 
-# Parse the response: extract result or error using node
-# UX-009: Wrapped in try/catch for graceful error on invalid JSON
-# UX-019: Use != null check instead of || to avoid coercing 0/false
-node -e "
-  try { const r = JSON.parse(process.argv[1]); if (r.error) { process.stderr.write(r.error + '\\n'); process.exit(1); } process.stdout.write(r.result != null ? String(r.result) : ''); }
-  catch(e) { process.stderr.write('Tool call failed: invalid response from bridge\\n'); process.exit(1); }
-" "$RESPONSE"
+const payload = JSON.stringify({
+  tool_name: toolName,
+  tool_call_id: toolCallId,
+  arguments: args,
+  request_id: requestId
+});
+
+const headers = { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) };
+if (secret) headers["Authorization"] = "Bearer " + secret;
+
+const req = http.request({ hostname: "127.0.0.1", port: ${callbackPort}, path: "/tool-call", method: "POST", headers, timeout: 300000 }, (res) => {
+  let body = "";
+  res.on("data", (c) => { body += c; });
+  res.on("end", () => {
+    try {
+      const r = JSON.parse(body);
+      if (r.error) { process.stderr.write(r.error + "\\n"); process.exit(1); }
+      process.stdout.write(r.result != null ? String(r.result) : "");
+    } catch {
+      process.stderr.write("Tool call failed: invalid response from bridge\\n");
+      process.exit(1);
+    }
+  });
+});
+req.on("error", (e) => { process.stderr.write("Tool call failed: " + e.message + "\\n"); process.exit(1); });
+req.write(payload);
+req.end();
+' "$STDIN_DATA" "${tool.name}" "tc_\${RANDOM}\${RANDOM}" "\${AI_BRIDGE_REQUEST_ID:-}" "${secretArg}"
 `;
   }
 }

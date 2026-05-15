@@ -22,9 +22,9 @@ import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { ProviderCapability, ModelInfo } from '../protocol/types.js';
+import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv, buildCombinedPrompt } from './env.js';
+import { buildSpawnEnv, buildCombinedPrompt, appendStderr } from './env.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
@@ -40,19 +40,6 @@ const DEFAULT_MODEL = 'gpt-5.3-codex';
 
 export class CodexAdapter extends ProviderAdapter {
   readonly providerName = 'codex';
-
-  async detect(): Promise<ProviderCapability> {
-    // Detection is handled centrally by detector.ts.
-    return {
-      name: this.providerName,
-      version: null,
-      available: false,
-      supports_streaming: true,
-      supports_tools: true,
-      supports_thinking: true,
-      supports_session_resume: true,
-    };
-  }
 
   async execute(context: ExecutionContext, onEvent: (event: AdapterStreamEvent) => void): Promise<string | null> {
     const { request, signal, cliSessionId } = context;
@@ -72,8 +59,12 @@ export class CodexAdapter extends ProviderAdapter {
       args = [
         'exec', 'resume', cliSessionId,
         '--json',
-        userMessage,
       ];
+      // BL-012: Pass model flag on resume if specified in request options
+      if (request.options?.model) {
+        args.push('-m', request.options.model);
+      }
+      args.push(userMessage);
       log.debug('Resuming session', { cliSessionId });
     } else {
       // New session
@@ -93,6 +84,13 @@ export class CodexAdapter extends ProviderAdapter {
       } else {
         args.push(userMessage);
       }
+    }
+
+    // ARCH-009: Codex CLI does not support max_tokens directly
+    if (request.options?.max_tokens) {
+      log.warn('max_tokens option specified but Codex CLI does not support it directly — ignoring', {
+        max_tokens: request.options.max_tokens,
+      });
     }
 
     log.debug('Spawning codex', { args: args.map((a) => a.length > 60 ? a.substring(0, 60) + '...' : a) });
@@ -117,6 +115,48 @@ export class CodexAdapter extends ProviderAdapter {
         child.kill('SIGTERM');
       };
       signal.addEventListener('abort', onAbort, { once: true });
+
+      // Track when both readline and the child process have finished to avoid
+      // a race condition where child.on('close') fires before readline has
+      // processed all buffered NDJSON lines (including the final 'turn.completed'
+      // line that carries the 'done' event).
+      let rlClosed = false;
+      let childExitCode: number | null = null;
+      let childExited = false;
+
+      const tryFinalize = () => {
+        if (!rlClosed || !childExited) return;  // Wait for both
+        signal.removeEventListener('abort', onAbort);
+
+        if (settled) {
+          log.debug('Codex process closed', { code: childExitCode, threadId });
+          resolve(threadId);
+          return;
+        }
+        settled = true;
+
+        // If readline finished without a 'turn.completed' event and the process
+        // exited with an error code, report the error.
+        if (childExitCode !== 0 && childExitCode !== null) {
+          log.warn('Codex exited with non-zero code', { code: childExitCode, stderr: stderrBuffer.substring(0, 500) });
+
+          onEvent({
+            event: 'error',
+            data: {
+              code: 'provider_error',
+              message: stderrBuffer.trim().substring(0, 500) || `Codex exited with code ${childExitCode}`,
+            },
+          });
+          onEvent({ event: 'done', data: {} });
+        } else {
+          // Process exited cleanly but no 'turn.completed' event was seen — still send done
+          log.warn('Codex exited without turn.completed event', { code: childExitCode });
+          onEvent({ event: 'done', data: {} });
+        }
+
+        log.debug('Codex process closed', { code: childExitCode, threadId });
+        resolve(threadId);
+      };
 
       // Parse NDJSON from stdout line by line
       const rl = createInterface({ input: child.stdout });
@@ -205,6 +245,9 @@ export class CodexAdapter extends ProviderAdapter {
               event: 'error',
               data: { code: 'provider_error', message },
             });
+            // CONS-003: Emit done event after error so the server always gets a terminal event.
+            onEvent({ event: 'done', data: {} });
+            settled = true;
           }
           // function_call and function_call_output items are produced by
           // Codex's own tool execution — we don't need to relay them as
@@ -267,14 +310,24 @@ export class CodexAdapter extends ProviderAdapter {
         log.debug('Unhandled Codex event type', { type });
       });
 
-      // Capture stderr for error logging
-      let stderrBuffer = '';
-      child.stderr.on('data', (chunk: Buffer) => {
-        stderrBuffer += chunk.toString();
+      // When readline finishes processing all buffered lines
+      rl.on('close', () => {
+        rlClosed = true;
+        tryFinalize();
       });
 
-      child.on('error', (err) => {
+      // Capture stderr for error logging (SEC-005: capped at 10KB)
+      let stderrBuffer = '';
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderrBuffer = appendStderr(stderrBuffer, chunk.toString());
+      });
+
+      child.on('error', (err: NodeJS.ErrnoException) => {
         log.error('Failed to spawn codex', { error: err.message });
+        // UX-002: Provide user-friendly message for ENOENT
+        const errorMessage = err.code === 'ENOENT'
+          ? 'codex CLI not found. Install it or ensure it is on your PATH.'
+          : `Failed to spawn codex: ${err.message}`;
         signal.removeEventListener('abort', onAbort);
 
         if (!settled) {
@@ -283,7 +336,7 @@ export class CodexAdapter extends ProviderAdapter {
             event: 'error',
             data: {
               code: 'provider_spawn_error',
-              message: `Failed to spawn codex: ${err.message}`,
+              message: errorMessage,
             },
           });
           onEvent({ event: 'done', data: {} });
@@ -292,32 +345,11 @@ export class CodexAdapter extends ProviderAdapter {
       });
 
       child.on('close', (code) => {
-        signal.removeEventListener('abort', onAbort);
-
-        if (settled) return;
-        settled = true;
-
-        if (code !== 0 && code !== null) {
-          log.warn('Codex exited with non-zero code', { code, stderr: stderrBuffer.substring(0, 500) });
-
-          onEvent({
-            event: 'error',
-            data: {
-              code: 'provider_error',
-              message: stderrBuffer.trim().substring(0, 500) || `Codex exited with code ${code}`,
-            },
-          });
-          onEvent({ event: 'done', data: {} });
-        }
-
-        log.debug('Codex process closed', { code, threadId });
-        resolve(threadId);
+        childExitCode = code;
+        childExited = true;
+        tryFinalize();
       });
     });
-  }
-
-  supportsSessionResume(): boolean {
-    return true;
   }
 
   async listModels(): Promise<ModelInfo[]> {
@@ -347,7 +379,8 @@ export class CodexAdapter extends ProviderAdapter {
           is_default: m.slug === DEFAULT_MODEL,
         }));
     } catch (err) {
-      log.warn('Failed to read Codex models cache', {
+      // UX-009: Include guidance about populating the models cache
+      log.warn('Failed to read Codex models cache. Run codex once to populate models cache. Showing default model only.', {
         error: err instanceof Error ? err.message : String(err),
       });
       // Fallback: return just the default model

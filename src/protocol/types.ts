@@ -108,7 +108,8 @@ export interface BridgeErrorMessage {
   request_id: string;
   code: string;
   message: string;
-  recoverable: boolean;
+  /** CONS-007: Standardized on `fatal` (same polarity as server ErrorMessage). */
+  fatal: boolean;
 }
 
 /** Union of all messages the bridge sends to the server. */
@@ -130,6 +131,8 @@ export interface WelcomeMessage {
   session_id: string;
   tools: ToolDefinition[];
   config: ServerConfig;
+  /** Optional protocol version from the server for compatibility checking. */
+  protocol_version?: string;
 }
 
 /** Server-provided configuration values. */

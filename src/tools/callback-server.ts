@@ -33,14 +33,19 @@ export class ToolCallbackServer {
   /** Set of registered tool names for validation (SEC-001). */
   private registeredToolNames: Set<string> | null = null;
 
+  /** SEC-002: Shared secret for authenticating callback requests. */
+  private readonly secret: string | null;
+
   constructor(
     private readonly toolResolver: ToolResolver,
     private readonly sendFn: SendToolCallFn,
     registeredToolNames?: Set<string>,
+    secret?: string,
   ) {
     if (registeredToolNames) {
       this.registeredToolNames = registeredToolNames;
     }
+    this.secret = secret ?? null;
   }
 
   /**
@@ -114,6 +119,16 @@ export class ToolCallbackServer {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Not found' }));
       return;
+    }
+
+    // SEC-002: Verify bearer token if a secret is configured
+    if (this.secret) {
+      const authHeader = req.headers['authorization'];
+      if (!authHeader || authHeader !== `Bearer ${this.secret}`) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
     }
 
     // BL-030: Enforce body size limit

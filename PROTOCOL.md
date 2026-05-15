@@ -136,6 +136,19 @@ After WebSocket connection is established, the bridge sends a `hello` message an
 }
 ```
 
+Each provider entry may include a `models` array listing available models (populated from local CLI cache or known aliases):
+
+```json
+{
+  "name": "claude",
+  "available": true,
+  "models": [
+    {"id": "sonnet", "name": "Sonnet", "is_default": true},
+    {"id": "opus", "name": "Opus", "is_default": false}
+  ]
+}
+```
+
 **Provider detection**: On startup, the bridge probes for each CLI:
 - `codex --version` → Codex availability
 - `claude --version` → Claude availability
@@ -677,45 +690,45 @@ How the bridge invokes each provider:
 
 ```bash
 # New session
-codex exec --json "system prompt here" <<< "user message"
+codex exec --json --skip-git-repo-check --ephemeral -m <model> -- "user message"
 
 # Resume session
-codex exec resume <SESSION_ID> --json <<< "user message"
+codex exec resume <SESSION_ID> --json -m <model> "user message"
 
 # With MCP tools
 codex exec --json --mcp-server "ai-bridge-tools" "system prompt" <<< "user message"
 ```
 
-Output: JSON streaming to stdout. Bridge parses and normalizes to protocol events.
+Output: JSON streaming (NDJSON) to stdout. Bridge parses and normalizes to protocol events.
 
 #### Claude
 
 ```bash
 # New session
-claude -p --output-format json "user message"
+claude -p --output-format stream-json --verbose "user message"
 
 # Resume session
-claude -p --session-id <UUID> --output-format json "user message"
+claude -p --session-id <UUID> --output-format stream-json --verbose "user message"
 
 # With tools (bash approach)
-claude -p --output-format json --allowedTools "bash" "user message"
+claude -p --output-format stream-json --verbose --allowedTools "bash" "user message"
 ```
 
 Output: JSON lines to stdout. Bridge parses and normalizes.
 
-System prompt: Passed via `--system-prompt` flag or environment variable on first message. Retained in session on resume.
+System prompt: Passed via `--system-prompt` flag on first message. Retained in session on resume.
 
 #### Gemini
 
 ```bash
 # New session
-gemini -p "user message"
+gemini --prompt "user message" --output-format stream-json --skip-trust
 
 # Resume session
-gemini -p --resume <UUID> "user message"
+gemini --prompt "user message" --resume <UUID> --output-format stream-json --skip-trust
 ```
 
-Output: Text streaming to stdout. Bridge buffers and normalizes.
+Output: NDJSON streaming to stdout. Bridge parses and normalizes.
 
 ### Feature Matrix
 
@@ -772,6 +785,7 @@ The bridge maps all of these to the unified `block_start` / `block_delta` / `blo
 | `stream` (tool_result) | Acknowledging tool result received |
 | `stream` (done) | Response complete |
 | `stream` (error) | Error during streaming |
+| `tool_call` | CLI invoked a server-side tool (via callback) |
 | `error` | Request-level error (non-streaming) |
 
 ### Server → Bridge
