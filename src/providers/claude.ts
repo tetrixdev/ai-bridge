@@ -18,6 +18,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import type { ProviderCapability, ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
+import { buildSpawnEnv } from './env.js';
 import { createLogger } from '../utils/logger.js';
 
 /**
@@ -96,15 +97,10 @@ export class ClaudeAdapter extends ProviderAdapter {
       let blockIndex = 0;
       let settled = false;
 
-      // Build env without CLAUDECODE to allow nested invocation
-      // (Claude CLI refuses to run if CLAUDECODE is set, even to empty string)
-      const env = { ...process.env };
+      // Build env with tool scripts on PATH and request ID for correlation
+      const env = buildSpawnEnv(context.toolScriptDir, context.requestId);
+      // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
       delete env['CLAUDECODE'];
-
-      // Add tool script directory to PATH so CLI can find tool wrapper scripts
-      if (context.toolScriptDir) {
-        env['PATH'] = `${context.toolScriptDir}:${env['PATH'] ?? ''}`;
-      }
 
       const child = spawn('claude', args, {
         env,
@@ -266,6 +262,7 @@ export class ClaudeAdapter extends ProviderAdapter {
               },
             },
           });
+          settled = true;
           return;
         }
 
@@ -312,7 +309,7 @@ export class ClaudeAdapter extends ProviderAdapter {
             event: 'error',
             data: {
               code: 'provider_error',
-              message: stderrBuffer.trim() || `Claude exited with code ${code}`,
+              message: stderrBuffer.trim().substring(0, 500) || `Claude exited with code ${code}`,
             },
           });
           onEvent({ event: 'done', data: {} });

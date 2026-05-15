@@ -24,6 +24,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { ProviderCapability, ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
+import { buildSpawnEnv, buildCombinedPrompt } from './env.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
@@ -88,7 +89,7 @@ export class CodexAdapter extends ProviderAdapter {
       // codex exec --json "system prompt" reads user message from the prompt arg
       // When system_prompt is set, we prepend it as instructions
       if (request.system_prompt) {
-        args.push('--', `${request.system_prompt}\n\nUser request: ${userMessage}`);
+        args.push('--', buildCombinedPrompt(request.system_prompt, userMessage));
       } else {
         args.push(userMessage);
       }
@@ -101,11 +102,9 @@ export class CodexAdapter extends ProviderAdapter {
       let blockIndex = 0;
       let settled = false;
 
-      // Build env with tool script directory on PATH
-      const env = { ...process.env };
-      if (context.toolScriptDir) {
-        env['PATH'] = `${context.toolScriptDir}:${env['PATH'] ?? ''}`;
-      }
+      // Codex handles tools internally via its own function-calling mechanism,
+      // so we pass null for toolScriptDir to skip PATH injection.
+      const env = buildSpawnEnv(null, context.requestId);
 
       const child = spawn('codex', args, {
         env,
@@ -228,6 +227,7 @@ export class CodexAdapter extends ProviderAdapter {
               },
             },
           });
+          settled = true;
           return;
         }
 
@@ -243,6 +243,7 @@ export class CodexAdapter extends ProviderAdapter {
           });
 
           onEvent({ event: 'done', data: {} });
+          settled = true;
           return;
         }
 
@@ -250,7 +251,15 @@ export class CodexAdapter extends ProviderAdapter {
         if (type === 'error') {
           const message = (parsed['message'] as string) ?? 'Unknown Codex error';
           log.warn('Codex error event', { message: message.substring(0, 200) });
-          // Don't emit yet — a turn.failed usually follows
+
+          // Emit error + done so the server is always informed, even if
+          // Codex exits with code 0 after this and no turn.failed follows.
+          onEvent({
+            event: 'error',
+            data: { code: 'provider_error', message },
+          });
+          onEvent({ event: 'done', data: {} });
+          settled = true;
           return;
         }
 
@@ -295,7 +304,7 @@ export class CodexAdapter extends ProviderAdapter {
             event: 'error',
             data: {
               code: 'provider_error',
-              message: stderrBuffer.trim() || `Codex exited with code ${code}`,
+              message: stderrBuffer.trim().substring(0, 500) || `Codex exited with code ${code}`,
             },
           });
           onEvent({ event: 'done', data: {} });

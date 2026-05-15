@@ -34,6 +34,8 @@ export interface ExecutionContext {
   signal: AbortSignal;
   /** CLI session ID if resuming, or null for new session. */
   cliSessionId: string | null;
+  /** Unique request ID for concurrent-request correlation (set by bridge). */
+  requestId?: string;
 }
 
 export abstract class ProviderAdapter {

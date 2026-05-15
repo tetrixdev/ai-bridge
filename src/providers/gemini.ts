@@ -21,6 +21,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import type { ProviderCapability, ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
+import { buildSpawnEnv, buildCombinedPrompt } from './env.js';
 import { createLogger } from '../utils/logger.js';
 
 /**
@@ -66,7 +67,7 @@ export class GeminiAdapter extends ProviderAdapter {
     // has no dedicated --system-instruction flag, so we concatenate)
     let prompt = userMessage;
     if (request.system_prompt && !cliSessionId) {
-      prompt = `${request.system_prompt}\n\nUser request: ${userMessage}`;
+      prompt = buildCombinedPrompt(request.system_prompt, userMessage);
     }
 
     // Build CLI arguments
@@ -95,11 +96,8 @@ export class GeminiAdapter extends ProviderAdapter {
       let settled = false;
       let inTextBlock = false;
 
-      // Build env with tool script directory on PATH
-      const env = { ...process.env };
-      if (context.toolScriptDir) {
-        env['PATH'] = `${context.toolScriptDir}:${env['PATH'] ?? ''}`;
-      }
+      // Build env with tool scripts on PATH and request ID for correlation
+      const env = buildSpawnEnv(context.toolScriptDir, context.requestId);
 
       const child = spawn('gemini', args, {
         env,
@@ -257,12 +255,23 @@ export class GeminiAdapter extends ProviderAdapter {
           return;
         }
 
-        // ── error (non-fatal) ────────────────────────────────
+        // ── error (non-fatal or fatal) ──────────────────────
         if (type === 'error') {
           const severity = parsed['severity'] as string;
           const message = parsed['message'] as string;
-          log.warn('Gemini non-fatal error', { severity, message: message?.substring(0, 200) });
-          // Don't emit stream error for warnings — Gemini continues after these
+          log.warn('Gemini error event', { severity, message: message?.substring(0, 200) });
+
+          // For severity='error', inform the server via a stream error event.
+          // Warnings are non-fatal — Gemini continues after those.
+          if (severity === 'error') {
+            onEvent({
+              event: 'error',
+              data: {
+                code: 'provider_error',
+                message: message ?? 'Unknown Gemini error',
+              },
+            });
+          }
           return;
         }
 
@@ -308,6 +317,7 @@ export class GeminiAdapter extends ProviderAdapter {
               },
             },
           });
+          settled = true;
           return;
         }
 
@@ -361,7 +371,7 @@ export class GeminiAdapter extends ProviderAdapter {
             event: 'error',
             data: {
               code: 'provider_error',
-              message: stderrBuffer.trim() || `Gemini exited with code ${code}`,
+              message: stderrBuffer.trim().substring(0, 500) || `Gemini exited with code ${code}`,
             },
           });
           onEvent({ event: 'done', data: {} });
