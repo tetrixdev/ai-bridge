@@ -22,8 +22,16 @@ import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('ToolManager');
 
-/** Strict pattern for safe tool names: alphanumeric, underscores, hyphens only. */
-const SAFE_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+/** Strict pattern for safe tool names: must start with a letter, alphanumeric/underscore/hyphen only. */
+const SAFE_TOOL_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
+
+/** SEC-005: Denylist of system binary names that must not be used as tool names. */
+const RESERVED_TOOL_NAMES = new Set([
+  'curl', 'wget', 'node', 'npm', 'npx', 'bash', 'sh', 'zsh',
+  'python', 'python3', 'ruby', 'perl', 'git', 'ssh', 'scp',
+  'cat', 'ls', 'rm', 'cp', 'mv', 'chmod', 'chown', 'mkdir',
+  'kill', 'ps', 'env', 'sudo', 'su', 'tar', 'gzip', 'gunzip',
+]);
 
 export class ToolManager {
   private tools = new Map<string, ToolDefinition>();
@@ -32,22 +40,45 @@ export class ToolManager {
   /**
    * Register tool definitions received from the server.
    * Replaces any previously registered tools.
-   * Tool names are validated against a safe pattern to prevent path traversal.
+   * Tool names are validated against a safe pattern and denylist.
    */
   register(tools: ToolDefinition[]): void {
     this.tools.clear();
+    const rejectedTools: string[] = [];
+
     for (const tool of tools) {
-      // SEC-001: Validate tool names to prevent path traversal and filesystem abuse
+      // Validate tool name against regex pattern
       if (!SAFE_TOOL_NAME_PATTERN.test(tool.name)) {
         log.error('Rejected tool with unsafe name', {
           name: tool.name.substring(0, 100),
-          reason: 'Tool names must be 1-64 chars, alphanumeric/underscore/hyphen only',
+          reason: 'Tool names must start with a letter and be 1-64 chars of alphanumeric/underscore/hyphen',
         });
+        rejectedTools.push(tool.name.substring(0, 100));
         continue;
       }
+
+      // SEC-005: Check against denylist of system binary names
+      if (RESERVED_TOOL_NAMES.has(tool.name)) {
+        log.error('Rejected tool with reserved name', {
+          name: tool.name,
+          reason: 'Tool name conflicts with a system binary',
+        });
+        rejectedTools.push(tool.name);
+        continue;
+      }
+
       this.tools.set(tool.name, tool);
     }
-    log.info('Registered tools', { count: this.tools.size, names: Array.from(this.tools.keys()) });
+
+    // BL-032: Log rejected tools count and names
+    if (rejectedTools.length > 0) {
+      log.warn('Tools rejected by name validation', {
+        count: rejectedTools.length,
+        names: rejectedTools,
+      });
+    }
+
+    log.info('Registered tools', { accepted: this.tools.size, total: tools.length, names: Array.from(this.tools.keys()) });
   }
 
   /**
@@ -69,6 +100,14 @@ export class ToolManager {
    */
   count(): number {
     return this.tools.size;
+  }
+
+  /**
+   * Returns the set of registered tool names.
+   * Useful for passing to ToolCallbackServer for validation.
+   */
+  getRegisteredNames(): Set<string> {
+    return new Set(this.tools.keys());
   }
 
   /**
@@ -146,26 +185,32 @@ export class ToolManager {
 set -euo pipefail
 
 TOOL_NAME="${tool.name}"
+TOOL_CALL_ID="tc_$\{RANDOM}$\{RANDOM}"
 CALLBACK_URL="http://127.0.0.1:${callbackPort}/tool-call"
 
 # Read arguments from stdin as JSON (the standard way AI CLIs pass tool args).
 # Falls back to empty object if no stdin or invalid JSON.
+# EFF-009: Single Node.js invocation for both validation and wrapping.
 ARGS_JSON="{}"
 if [ ! -t 0 ]; then
   STDIN_DATA=$(cat)
   if [ -n "$STDIN_DATA" ]; then
-    # Validate it's valid JSON, fall back to wrapping as string
-    if node -e "JSON.parse(process.argv[1])" "$STDIN_DATA" 2>/dev/null; then
-      ARGS_JSON="$STDIN_DATA"
-    else
-      # Wrap raw text as {"input": "..."} using node for safe JSON encoding
-      ARGS_JSON=$(node -e "process.stdout.write(JSON.stringify({input: process.argv[1]}))" "$STDIN_DATA")
-    fi
+    ARGS_JSON=$(node -e "
+const d = process.argv[1];
+try { JSON.parse(d); process.stdout.write(d); }
+catch(e) { process.stdout.write(JSON.stringify({input: d})); }
+" "$STDIN_DATA")
   fi
 fi
 
 # Build the request payload using node for safe JSON construction
-PAYLOAD=$(node -e "process.stdout.write(JSON.stringify({tool_name: process.argv[1], arguments: JSON.parse(process.argv[2])}))" "$TOOL_NAME" "$ARGS_JSON")
+# ARCH-001: Include request_id from environment variable in POST body
+PAYLOAD=$(node -e "process.stdout.write(JSON.stringify({
+  tool_name: process.argv[1],
+  tool_call_id: process.argv[2],
+  arguments: JSON.parse(process.argv[3]),
+  request_id: process.argv[4]
+}))" "$TOOL_NAME" "$TOOL_CALL_ID" "$ARGS_JSON" "\${AI_BRIDGE_REQUEST_ID:-}")
 
 # Send the tool call to the bridge and get the result
 RESPONSE=$(curl -s -X POST "$CALLBACK_URL" \\
@@ -174,10 +219,11 @@ RESPONSE=$(curl -s -X POST "$CALLBACK_URL" \\
   --max-time 300)
 
 # Parse the response: extract result or error using node
+# UX-009: Wrapped in try/catch for graceful error on invalid JSON
+# UX-019: Use != null check instead of || to avoid coercing 0/false
 node -e "
-  const r = JSON.parse(process.argv[1]);
-  if (r.error) { process.stderr.write(r.error + '\\n'); process.exit(1); }
-  process.stdout.write(r.result || '');
+  try { const r = JSON.parse(process.argv[1]); if (r.error) { process.stderr.write(r.error + '\\n'); process.exit(1); } process.stdout.write(r.result != null ? String(r.result) : ''); }
+  catch(e) { process.stderr.write('Tool call failed: invalid response from bridge\\n'); process.exit(1); }
 " "$RESPONSE"
 `;
   }

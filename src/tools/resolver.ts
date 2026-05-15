@@ -37,7 +37,7 @@ export class ToolResolver {
   private pending = new Map<string, PendingToolCall>();
   private readonly timeoutMs: number;
 
-  constructor(timeoutMs: number = 30_000) {
+  constructor(timeoutMs: number = 300_000) {
     this.timeoutMs = timeoutMs;
   }
 

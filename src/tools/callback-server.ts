@@ -23,27 +23,32 @@ import type { ToolResolver, SendToolCallFn } from './resolver.js';
 
 const log = createLogger('ToolCallbackServer');
 
+/** Maximum request body size: 1 MB. */
+const MAX_BODY_SIZE = 1048576;
+
 export class ToolCallbackServer {
   private server: http.Server | null = null;
   private port: number | null = null;
-  private readonly toolResolver: ToolResolver;
 
-  /** Current request_id for tool calls (set by the bridge during request execution). */
-  private currentRequestId: string | null = null;
+  /** Set of registered tool names for validation (SEC-001). */
+  private registeredToolNames: Set<string> | null = null;
 
-  /** Function to send tool_call messages over WebSocket (set by the bridge). */
-  private sendFn: SendToolCallFn | null = null;
-
-  constructor(toolResolver: ToolResolver) {
-    this.toolResolver = toolResolver;
+  constructor(
+    private readonly toolResolver: ToolResolver,
+    private readonly sendFn: SendToolCallFn,
+    registeredToolNames?: Set<string>,
+  ) {
+    if (registeredToolNames) {
+      this.registeredToolNames = registeredToolNames;
+    }
   }
 
   /**
-   * Set the function used to send tool_call messages over WebSocket.
-   * Must be called by the Bridge after construction to wire up the send path.
+   * Set the registered tool names for validation.
+   * Tool calls with names not in this set will be rejected.
    */
-  setSendFn(fn: SendToolCallFn): void {
-    this.sendFn = fn;
+  setRegisteredToolNames(names: Set<string>): void {
+    this.registeredToolNames = names;
   }
 
   /**
@@ -102,13 +107,6 @@ export class ToolCallbackServer {
   }
 
   /**
-   * Set the current request ID that tool calls will be associated with.
-   */
-  setCurrentRequestId(requestId: string | null): void {
-    this.currentRequestId = requestId;
-  }
-
-  /**
    * Handle incoming HTTP requests from tool wrapper scripts.
    */
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
@@ -118,12 +116,25 @@ export class ToolCallbackServer {
       return;
     }
 
+    // BL-030: Enforce body size limit
     let body = '';
+    let bodyLength = 0;
+
     req.on('data', (chunk: Buffer) => {
+      bodyLength += chunk.length;
+      if (bodyLength > MAX_BODY_SIZE) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Request body too large' }));
+        req.destroy();
+        return;
+      }
       body += chunk.toString();
     });
 
     req.on('end', () => {
+      // If the request was already destroyed due to size limit, skip processing
+      if (bodyLength > MAX_BODY_SIZE) return;
+
       this.processToolCall(body, res).catch((err) => {
         log.error('Failed to process tool call', {
           error: err instanceof Error ? err.message : String(err),
@@ -135,7 +146,7 @@ export class ToolCallbackServer {
   }
 
   private async processToolCall(body: string, res: http.ServerResponse): Promise<void> {
-    let parsed: { tool_name: string; arguments: Record<string, unknown>; request_id?: string };
+    let parsed: { tool_name: string; tool_call_id?: string; arguments: Record<string, unknown>; request_id?: string };
 
     try {
       parsed = JSON.parse(body);
@@ -146,19 +157,27 @@ export class ToolCallbackServer {
     }
 
     const { tool_name, arguments: args } = parsed;
-    const requestId = parsed.request_id ?? this.currentRequestId ?? 'unknown';
+
+    // ARCH-001 / UX-006 / EFF-008: request_id comes exclusively from POST body
+    const requestId = parsed.request_id;
+    if (!requestId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing request_id \u2014 tool call cannot be routed' }));
+      return;
+    }
+
+    // SEC-001: Validate tool_name against registered set
+    if (this.registeredToolNames && !this.registeredToolNames.has(tool_name)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Unknown tool: ${tool_name}` }));
+      return;
+    }
+
     const toolCallId = `tc_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
 
     log.debug('Tool call received via HTTP callback', { tool_name, toolCallId, requestId });
 
     try {
-      if (!this.sendFn) {
-        log.error('Cannot forward tool call — sendFn not configured. Call setSendFn() first.');
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Bridge send function not configured' }));
-        return;
-      }
-
       // Route through the ToolResolver which sends over WebSocket and waits
       const result = await this.toolResolver.call(
         this.sendFn,
