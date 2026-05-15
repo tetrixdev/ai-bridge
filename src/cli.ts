@@ -11,7 +11,7 @@
  */
 
 import { Command } from 'commander';
-import { Bridge } from './bridge.js';
+import { Bridge, FatalBridgeError } from './bridge.js';
 import { detectProviders } from './providers/detector.js';
 import { CodexAdapter } from './providers/codex.js';
 import { ClaudeAdapter } from './providers/claude.js';
@@ -82,6 +82,19 @@ program
     // Validate server URL format
     if (!serverUrl.startsWith('ws://') && !serverUrl.startsWith('wss://')) {
       log.error('Server URL must start with ws:// or wss://');
+      process.exit(1);
+    }
+
+    // SEC-006: Reject URLs that contain username/password components to prevent
+    // URL authority confusion (e.g. wss://legit.com@attacker.com/ws)
+    try {
+      const parsedUrl = new URL(serverUrl);
+      if (parsedUrl.username || parsedUrl.password) {
+        log.error('Server URL must not contain username or password components');
+        process.exit(1);
+      }
+    } catch {
+      log.error('Server URL is not a valid URL');
       process.exit(1);
     }
 
@@ -165,11 +178,8 @@ program
     bridge.on('error', (err) => {
       log.error('Bridge error', { error: err.message });
 
-      // Exit on fatal errors that cannot be recovered from
-      if (
-        err.message.includes('Maximum reconnection attempts') ||
-        err.message.includes('invalid or expired token')
-      ) {
+      // UX-001: Use typed error instead of string matching to detect fatal errors
+      if (err instanceof FatalBridgeError) {
         process.exit(1);
       }
     });

@@ -24,6 +24,8 @@ export interface AdapterStreamEvent {
 export interface ExecutionContext {
   /** The full AI request from the server. */
   request: AiRequestMessage;
+  /** The request ID for correlation with tool calls and stream events. */
+  requestId: string;
   /** Tool definitions that should be made available to the CLI. */
   tools: ToolDefinition[];
   /** Path to directory containing generated tool wrapper scripts. */

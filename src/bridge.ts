@@ -20,11 +20,10 @@ import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
 import type {
   ProviderCapability,
-  ModelInfo,
   BridgeToServerMessage,
   ServerToBridgeMessage,
   AiRequestMessage,
-  AiRequestOptions,
+  SessionResetMessage,
   ToolDefinition,
   ServerConfig,
   StreamEventType,
@@ -37,6 +36,9 @@ import { ToolResolver } from './tools/resolver.js';
 import { ToolCallbackServer } from './tools/callback-server.js';
 import { SessionStore } from './session/store.js';
 import { createLogger } from './utils/logger.js';
+import { FatalBridgeError } from './errors.js';
+
+export { FatalBridgeError } from './errors.js';
 
 const log = createLogger('Bridge');
 
@@ -61,6 +63,12 @@ export interface BridgeOptions {
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS = 300;
+
+// BL-017: Reconnect limits rationale
+// MAX_RECONNECT_ATTEMPTS=10 with exponential backoff (1s, 2s, 4s, 8s, then
+// capped at 15s) gives ~90s of retry window. This balances quick recovery
+// from transient network issues against not hammering a downed server
+// indefinitely. The 15s cap comes from PROTOCOL.md.
 const MAX_RECONNECT_ATTEMPTS = 10;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 15_000; // Cap at 15s per PROTOCOL.md
@@ -79,6 +87,71 @@ export interface BridgeEvents {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: Escape XML characters in message content (SEC-003)
+// ---------------------------------------------------------------------------
+
+function escapeXml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Build a synthetic AiRequestMessage from a session reset (ARCH-010)
+// ---------------------------------------------------------------------------
+
+/**
+ * Construct an AiRequestMessage from a SessionResetMessage by extracting
+ * the last user message and folding prior history into the system prompt
+ * using XML-tagged structure to prevent prompt injection (SEC-003).
+ *
+ * Returns null if no user message is found in history.
+ */
+function buildSessionResetRequest(
+  originalMsg: SessionResetMessage,
+  currentSystemPrompt: string | null,
+): AiRequestMessage | null {
+  const { request_id, conversation_id, provider, history, options } = originalMsg;
+
+  // EFF-010: Use findLastIndex instead of two-step find-then-lastIndexOf
+  const lastUserIdx = history.findLastIndex((h) => h.role === 'user');
+  if (lastUserIdx === -1) {
+    return null;
+  }
+
+  const lastUserMessage = history[lastUserIdx];
+
+  // Build conversation context from prior history (excluding the last user message)
+  const priorHistory = history.slice(0, lastUserIdx);
+
+  // SEC-003: Wrap history in XML tags to prevent prompt injection.
+  // Escape < and > in message content to prevent tag injection.
+  let enhancedSystemPrompt: string | null;
+  if (priorHistory.length > 0) {
+    const historyXml = priorHistory
+      .map((h) => `<message role="${escapeXml(h.role)}">${escapeXml(h.content)}</message>`)
+      .join('\n');
+
+    const historyBlock = `<conversation_history>\n${historyXml}\n</conversation_history>`;
+
+    // BL-013: If system_prompt is null/empty, use only the history context
+    enhancedSystemPrompt = currentSystemPrompt
+      ? `${currentSystemPrompt}\n\n${historyBlock}`
+      : historyBlock;
+  } else {
+    enhancedSystemPrompt = currentSystemPrompt;
+  }
+
+  return {
+    type: 'ai_request',
+    request_id,
+    conversation_id,
+    provider,
+    message: lastUserMessage.content,
+    system_prompt: enhancedSystemPrompt,
+    options,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Bridge Class
 // ---------------------------------------------------------------------------
 
@@ -91,7 +164,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly toolManager = new ToolManager();
   private readonly toolResolver = new ToolResolver();
   private readonly sessionStore = new SessionStore();
-  private readonly callbackServer = new ToolCallbackServer(this.toolResolver);
+  private readonly callbackServer: ToolCallbackServer;
   private readonly testMode: boolean;
   private readonly onTestRequest?: BridgeOptions['onTestRequest'];
 
@@ -116,9 +189,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.testMode = options.testMode ?? false;
     this.onTestRequest = options.onTestRequest;
 
-    // Wire up the callback server's send function so tool calls from
-    // HTTP-based tool scripts are forwarded over WebSocket (BL-002 fix)
-    this.callbackServer.setSendFn((reqId, tcId, tName, tArgs) => {
+    // ARCH-001: Pass sendFn directly to the callback server constructor
+    // so HTTP-based tool calls from scripts are forwarded over WebSocket.
+    const sendFn = (reqId: string, tcId: string, tName: string, tArgs: Record<string, unknown>) => {
       this.send({
         type: 'tool_call',
         request_id: reqId,
@@ -126,7 +199,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         tool_name: tName,
         arguments: tArgs,
       });
-    });
+    };
+
+    this.callbackServer = new ToolCallbackServer(
+      this.toolResolver,
+      sendFn,
+      new Set(this.toolManager.getAll().map((t) => t.name)),
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -253,14 +332,32 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     log.info('WebSocket closed', { code, reason: reasonStr });
     this.stopHeartbeat();
     this.ws = null;
+
+    // BL-006: Cancel all pending tool resolvers immediately on WebSocket close
+    // to fail in-flight tool calls instead of letting them stall for 30s.
+    this.toolResolver.cancelAll();
+
     this.emit('disconnected', code, reasonStr);
 
     if (!this.isShuttingDown) {
       // Check for authentication rejection — don't retry, exit immediately
       if (code === 4001) {
-        log.error('Connection rejected: invalid or expired token. Generate a new token and restart the bridge.');
+        // ARCH-003: Clean up tool scripts and callback server before emitting fatal error
+        this.toolManager.cleanupScripts();
+        this.callbackServer.stop().catch(() => {
+          // Best-effort cleanup; ignore errors during shutdown
+        });
+
         this.isShuttingDown = true;
-        this.emit('error', new Error('Connection rejected: invalid or expired token. Generate a new token and restart the bridge.'));
+        // UX-002: Removed duplicate log.error here — the emitted error event
+        // (handled by cli.ts) is sufficient.
+        // UX-020: Include token source guidance in the error message.
+        this.emit(
+          'error',
+          new FatalBridgeError(
+            'Connection rejected: invalid or expired token. Generate a new token from your application\'s dashboard and restart the bridge.',
+          ),
+        );
         return;
       }
 
@@ -342,6 +439,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.emit('welcome', this.sessionId);
   }
 
+  /**
+   * Handle an incoming ai_request: send ack, then execute.
+   * BL-004: The ack is sent here; executeAiRequestInternal does the actual work.
+   */
   private handleAiRequest(message: AiRequestMessage): void {
     const { request_id, provider, conversation_id } = message;
 
@@ -356,6 +457,22 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       request_id,
       cli_session_id: existingCliSessionId ?? 'new',
     });
+
+    // Delegate to the internal handler (shared with session reset)
+    this.executeAiRequestInternal(message, existingCliSessionId);
+  }
+
+  /**
+   * Internal request execution logic shared by handleAiRequest and handleSessionReset.
+   * BL-004: Does NOT send ai_request_ack — the caller is responsible for that.
+   */
+  private executeAiRequestInternal(
+    message: AiRequestMessage,
+    existingCliSessionId?: string | null,
+  ): void {
+    const { request_id, provider } = message;
+
+    const cliSessionId = existingCliSessionId ?? null;
 
     // Test mode: use mock handler
     if (this.testMode && this.onTestRequest) {
@@ -401,7 +518,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     const controller = new AbortController();
     this.activeRequests.set(request_id, controller);
 
-    this.executeRequest(adapter, message, existingCliSessionId, controller.signal)
+    this.executeRequest(adapter, message, cliSessionId, controller.signal)
       .catch((err) => {
         log.error('Request execution failed', {
           requestId: request_id,
@@ -427,13 +544,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   ): Promise<void> {
     const { request_id, conversation_id } = request;
 
-    // Set the current request ID on the callback server so HTTP-based
-    // tool calls can be correlated to the active request
-    this.callbackServer.setCurrentRequestId(request_id);
-
+    // ARCH-001: requestId is now part of ExecutionContext instead of being
+    // set on the callback server via setCurrentRequestId().
     // Build execution context
     const context: ExecutionContext = {
       request,
+      requestId: request_id,
       tools: this.toolManager.getAll(),
       toolScriptDir: this.toolManager.getScriptDir(),
       onToolCall: async (toolCallId, toolName, args) => {
@@ -457,38 +573,39 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       cliSessionId,
     };
 
-    // Run the adapter — it returns the new CLI session ID
-    const newCliSessionId = await adapter.execute(context, (event: AdapterStreamEvent) => {
-      this.sendStreamEvent(request_id, event.event, event.data);
-    });
-
-    // Store the session mapping for future resume
-    if (newCliSessionId && conversation_id) {
-      this.sessionStore.set(conversation_id, newCliSessionId, adapter.providerName);
+    // BL-011: Wrap in try/finally to ensure session mapping is persisted
+    // even if the adapter throws after producing a session ID.
+    let newCliSessionId: string | null = null;
+    try {
+      // Run the adapter — it returns the new CLI session ID
+      newCliSessionId = await adapter.execute(context, (event: AdapterStreamEvent) => {
+        this.sendStreamEvent(request_id, event.event, event.data);
+      });
+    } finally {
+      // Store the session mapping for future resume
+      if (newCliSessionId && conversation_id) {
+        this.sessionStore.set(conversation_id, newCliSessionId, adapter.providerName);
+      }
     }
-
-    // Clear the current request ID now that execution is complete
-    this.callbackServer.setCurrentRequestId(null);
   }
 
-  private handleSessionReset(message: {
-    type: 'session_reset';
-    request_id: string;
-    conversation_id: string;
-    provider: string;
-    system_prompt: string | null;
-    history: Array<{ role: string; content: string }>;
-    options: AiRequestOptions;
-  }): void {
-    const { request_id, conversation_id, provider, system_prompt, history, options } = message;
+  /**
+   * Handle a session_reset message by constructing a synthetic ai_request
+   * from the conversation history and executing it without sending an ack.
+   * BL-004: Calls executeAiRequestInternal directly (no ack for session_reset).
+   * ARCH-010: Uses the buildSessionResetRequest pure function.
+   */
+  private handleSessionReset(message: SessionResetMessage): void {
+    const { request_id, conversation_id } = message;
 
     // Delete the old session so the adapter starts fresh
     const deleted = this.sessionStore.delete(conversation_id);
-    log.info('Session reset', { conversationId: conversation_id, found: deleted, historyLength: history.length });
+    log.info('Session reset', { conversationId: conversation_id, found: deleted, historyLength: message.history.length });
 
-    // Extract the last user message from history
-    const lastUserMessage = [...history].reverse().find((h) => h.role === 'user');
-    if (!lastUserMessage) {
+    // ARCH-010: Extract history reconstruction into a pure function
+    const syntheticRequest = buildSessionResetRequest(message, message.system_prompt);
+
+    if (!syntheticRequest) {
       log.error('Session reset has no user message in history', { conversationId: conversation_id });
       this.send({
         type: 'error',
@@ -500,30 +617,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return;
     }
 
-    // Build conversation context from prior history (excluding the last user message)
-    const priorHistory = history.slice(0, history.lastIndexOf(lastUserMessage));
-    const historyContext = priorHistory
-      .map((h) => `${h.role}: ${h.content}`)
-      .join('\n\n');
-
-    // Prepend history to the system prompt so the CLI has context
-    const enhancedSystemPrompt = historyContext
-      ? `${system_prompt ?? ''}\n\n--- Previous conversation ---\n${historyContext}`.trim()
-      : system_prompt;
-
-    // Re-process as a new ai_request with a fresh CLI session
-    const syntheticRequest: AiRequestMessage = {
-      type: 'ai_request',
-      request_id,
-      conversation_id,
-      provider,
-      message: lastUserMessage.content,
-      system_prompt: enhancedSystemPrompt,
-      options,
-    };
-
-    log.info('Re-processing session_reset as new ai_request', { requestId: request_id, provider });
-    this.handleAiRequest(syntheticRequest);
+    log.info('Re-processing session_reset as new ai_request', { requestId: request_id, provider: message.provider });
+    // BL-004: Call internal handler directly — no ack for session_reset
+    this.executeAiRequestInternal(syntheticRequest);
   }
 
   private handleServerError(message: { type: 'error'; code: string; message: string; fatal: boolean }): void {
@@ -567,7 +663,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         attempts: this.reconnectAttempts,
         max: MAX_RECONNECT_ATTEMPTS,
       });
-      this.emit('error', new Error('Maximum reconnection attempts reached'));
+      // UX-010: Include recovery guidance in the exhaustion message
+      this.emit(
+        'error',
+        new FatalBridgeError(
+          'Maximum reconnection attempts reached. Check that the server URL is correct and the server is reachable, then restart the bridge.',
+        ),
+      );
       return;
     }
 
