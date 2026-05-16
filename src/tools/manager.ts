@@ -204,26 +204,29 @@ export class ToolManager {
 
 set -euo pipefail
 
-# Read arguments from stdin (the standard way AI CLIs pass tool args).
-STDIN_DATA=""
-if [ ! -t 0 ]; then
-  STDIN_DATA=$(cat)
+# Read the JSON payload from the first CLI argument when present; otherwise
+# fall back to stdin (some AI CLIs pass tool args one way, some the other).
+PAYLOAD_DATA=""
+if [ "$#" -ge 1 ] && [ -n "\${1:-}" ]; then
+  PAYLOAD_DATA="$1"
+elif [ ! -t 0 ]; then
+  PAYLOAD_DATA=$(cat)
 fi
 
 # Single Node.js invocation for input parsing, payload building, HTTP call,
 # and output extraction.
 node -e '
 const http = require("http");
-const stdinData = process.argv[1];
+const payloadData = process.argv[1];
 const toolName = process.argv[2];
 const toolCallId = process.argv[3];
 const requestId = process.argv[4];
 const secret = process.argv[5];
 
-// Parse stdin as JSON, fall back to wrapping as {input: ...}
+// Parse the payload as JSON, fall back to wrapping as {input: ...}
 let args = {};
-if (stdinData) {
-  try { args = JSON.parse(stdinData); } catch { args = { input: stdinData }; }
+if (payloadData) {
+  try { args = JSON.parse(payloadData); } catch { args = { input: payloadData }; }
 }
 
 const payload = JSON.stringify({
@@ -255,7 +258,7 @@ req.write(payload);
 req.end();
 // The $RANDOM-based ID here is discarded — the callback server overrides it
 // with a cryptographically strong UUID before use.
-' "$STDIN_DATA" "${tool.name}" "tc_\${RANDOM}\${RANDOM}" "\${AI_BRIDGE_REQUEST_ID:-}" "${secretArg}"
+' "$PAYLOAD_DATA" "${tool.name}" "tc_\${RANDOM}\${RANDOM}" "\${AI_BRIDGE_REQUEST_ID:-}" "${secretArg}"
 `;
   }
 }

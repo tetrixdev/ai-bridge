@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { ToolManager } from '../../src/tools/manager.js';
 import type { ToolDefinition } from '../../src/protocol/types.js';
 
@@ -215,6 +216,89 @@ describe('ToolManager', () => {
       expect(manager.getScriptDir()).toBeNull();
       const dir = manager.generateScripts(9999);
       expect(manager.getScriptDir()).toBe(dir);
+    });
+
+    it('wrapper reads the payload from the first CLI argument', () => {
+      manager.register([{ name: 'argTool', description: 'test', parameters: {} }]);
+
+      const scriptDir = manager.generateScripts(9999);
+      const content = fs.readFileSync(path.join(scriptDir, 'argTool'), 'utf-8');
+
+      // The payload is taken from $1 when present and non-empty.
+      expect(content).toContain('PAYLOAD_DATA="$1"');
+      expect(content).toContain('"$#" -ge 1');
+    });
+
+    it('wrapper still falls back to stdin when no argument is given', () => {
+      manager.register([{ name: 'stdinTool', description: 'test', parameters: {} }]);
+
+      const scriptDir = manager.generateScripts(9999);
+      const content = fs.readFileSync(path.join(scriptDir, 'stdinTool'), 'utf-8');
+
+      // Stdin fallback: when not a TTY and no $1, read from cat.
+      expect(content).toContain('elif [ ! -t 0 ]; then');
+      expect(content).toContain('PAYLOAD_DATA=$(cat)');
+      // The parsed payload is passed through to the node invocation.
+      expect(content).toContain('"$PAYLOAD_DATA"');
+    });
+
+    it('wrapper keeps the JSON-parse + {input: ...} fallback', () => {
+      manager.register([{ name: 'parseTool', description: 'test', parameters: {} }]);
+
+      const scriptDir = manager.generateScripts(9999);
+      const content = fs.readFileSync(path.join(scriptDir, 'parseTool'), 'utf-8');
+
+      expect(content).toContain('JSON.parse(payloadData)');
+      expect(content).toContain('{ input: payloadData }');
+    });
+
+    it('does not embed tool descriptions in the wrapper script', () => {
+      manager.register([
+        { name: 'descTool', description: 'SECRET-DESCRIPTION-MARKER', parameters: {} },
+      ]);
+
+      const scriptDir = manager.generateScripts(9999);
+      const content = fs.readFileSync(path.join(scriptDir, 'descTool'), 'utf-8');
+
+      expect(content).not.toContain('SECRET-DESCRIPTION-MARKER');
+    });
+  });
+
+  describe('buildScript() payload behavior (integration)', () => {
+    it('accepts a $1 argument without hanging on stdin', () => {
+      manager.register([{ name: 'echoTool', description: 'test', parameters: {} }]);
+      const scriptDir = manager.generateScripts(9999);
+      const scriptPath = path.join(scriptDir, 'echoTool');
+
+      // Invoke the wrapper with a JSON payload as $1.  With stdin redirected
+      // from /dev/null and no callback server listening, the script exits 1
+      // (Tool call failed) — but reaching that point proves $1 was consumed as
+      // the payload and the script did not block waiting for stdin.
+      const run = spawnSync('bash', [scriptPath, '{"x":1}'], {
+        encoding: 'utf-8',
+        input: '',
+        timeout: 10_000,
+      });
+
+      expect(run.status).toBe(1);
+      expect(run.stderr).toContain('Tool call failed');
+    });
+
+    it('falls back to stdin when no $1 argument is given', () => {
+      manager.register([{ name: 'stdinEchoTool', description: 'test', parameters: {} }]);
+      const scriptDir = manager.generateScripts(9999);
+      const scriptPath = path.join(scriptDir, 'stdinEchoTool');
+
+      // No argument: the payload is read from stdin instead.  Again the call
+      // fails to reach the bridge, proving the stdin path is still wired up.
+      const run = spawnSync('bash', [scriptPath], {
+        encoding: 'utf-8',
+        input: '{"y":2}',
+        timeout: 10_000,
+      });
+
+      expect(run.status).toBe(1);
+      expect(run.stderr).toContain('Tool call failed');
     });
   });
 

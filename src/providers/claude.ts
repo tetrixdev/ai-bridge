@@ -19,6 +19,7 @@ import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, appendStderr, formatStderrMessage } from './env.js';
+import { buildToolInstructions } from '../tools/prompt.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
@@ -82,8 +83,15 @@ export class ClaudeAdapter extends ProviderAdapter {
       args.push('--allowedTools=bash');
     }
 
-    // The user message is the final argument
-    args.push(userMessage);
+    // The user message is the final argument.  When server-defined tools are
+    // present, append the tool manifest so the model knows the tools exist and
+    // how to call them — appended every turn (new and resumed sessions) since
+    // Claude has no protocol-level concept of these external tools.
+    let promptArg = userMessage;
+    if (context.tools.length > 0) {
+      promptArg += '\n\n' + buildToolInstructions(context.tools);
+    }
+    args.push(promptArg);
 
     // Only build the truncated arg array when debug logging is active
     if (isDebugEnabled()) {

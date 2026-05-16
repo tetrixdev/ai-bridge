@@ -22,6 +22,7 @@ import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from './env.js';
+import { buildToolInstructions } from '../tools/prompt.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
@@ -57,12 +58,32 @@ export class GeminiAdapter extends ProviderAdapter {
       prompt = buildCombinedPrompt(request.system_prompt, userMessage);
     }
 
+    // When server-defined tools are present, append the tool manifest so the
+    // model knows the tools exist and how to call them — appended every turn
+    // (new and resumed sessions) since Gemini has no protocol-level concept of
+    // these external tools.
+    const hasTools = context.tools.length > 0;
+    if (hasTools) {
+      prompt += '\n\n' + buildToolInstructions(context.tools);
+    }
+
     // Build CLI arguments
     const args: string[] = [
       '--prompt', prompt,               // Non-interactive mode with prompt
       '--output-format', 'stream-json', // NDJSON streaming output
       '--skip-trust',                   // Required for headless/non-interactive mode
     ];
+
+    // Server-defined bridge tools are invoked as shell commands.  --skip-trust
+    // only trusts the workspace folder; it does NOT auto-approve tool/shell
+    // execution.  In non-interactive --prompt mode Gemini's default approval
+    // mode would block on an approval prompt the model cannot answer, stalling
+    // the request.  --yolo (approval-mode "yolo") auto-approves all tool calls
+    // so the wrapper scripts can run.  Only enabled when tools are present so
+    // tool-less requests keep Gemini's safer default approval behavior.
+    if (hasTools) {
+      args.push('--yolo');
+    }
 
     // Resume an existing session if we have a session ID
     if (cliSessionId) {

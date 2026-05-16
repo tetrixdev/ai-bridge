@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from './env.js';
+import { buildToolInstructions } from '../tools/prompt.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
@@ -37,33 +38,6 @@ const log = createLogger('CodexAdapter');
  * with both API key and ChatGPT auth modes.
  */
 const DEFAULT_MODEL = 'gpt-5.3-codex';
-
-/**
- * Build a system-prompt note that tells Codex about the server-defined bridge
- * tools available for this request.
- *
- * The bridge exposes each server-registered tool as a bash wrapper script on
- * PATH whose filename is the tool name. Codex has no protocol-level concept of
- * these external tools, so we describe them in the prompt: it can invoke any of
- * them as ordinary shell commands. The wrapper script handles routing the call
- * back through the bridge to the server.
- *
- * @param tools  The server-defined tool definitions for this request.
- * @returns A prompt fragment to append to the combined/user prompt, or an
- *          empty string when there are no tools.
- */
-function buildToolPromptNote(tools: import('../protocol/types.js').ToolDefinition[]): string {
-  if (tools.length === 0) return '';
-  const lines = tools.map((t) => `- \`${t.name}\`: ${t.description}`);
-  return (
-    '\n\n---\n' +
-    'The following bridge tools are available to you as shell commands. ' +
-    'Run a tool by executing its command name in the shell (passing any ' +
-    'arguments it documents); the command performs the action and prints the ' +
-    'result. Use them when they help answer the request:\n' +
-    lines.join('\n')
-  );
-}
 
 export class CodexAdapter extends ProviderAdapter {
   readonly providerName = 'codex';
@@ -127,7 +101,7 @@ export class CodexAdapter extends ProviderAdapter {
     // On a fresh session the system prompt is also prepended; on a resumed
     // session the original system prompt was already consumed by the first
     // turn, so the tool note is appended to the user message directly.
-    const toolNote = hasTools ? buildToolPromptNote(context.tools) : '';
+    const toolNote = hasTools ? '\n\n' + buildToolInstructions(context.tools) : '';
     if (!cliSessionId && request.system_prompt) {
       args.push('--', buildCombinedPrompt(request.system_prompt, userMessage) + toolNote);
     } else if (toolNote) {
