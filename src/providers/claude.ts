@@ -75,12 +75,14 @@ export class ClaudeAdapter extends ProviderAdapter {
       args.push('--max-tokens', String(request.options.max_tokens));
     }
 
-    // Enable Bash tool access when server-defined tools are available (wrapper
-    // scripts are invoked via bash).  Use the --allowedTools=bash equals-sign
-    // syntax: --allowedTools is variadic and would otherwise consume all
-    // remaining positional arguments, including the user's prompt message.
+    // Enable tool execution when server-defined tools are available. The wrapper
+    // scripts are invoked through Claude's Bash tool; in headless (-p) mode every
+    // Bash command would otherwise be denied with "requires approval" since there
+    // is no interactive approver. bypassPermissions auto-approves tool use — the
+    // bridge runs in the user's own trusted environment, mirroring Codex
+    // (approval_policy=never) and Gemini (--yolo).
     if (context.tools.length > 0 && context.toolScriptDir) {
-      args.push('--allowedTools=bash');
+      args.push('--permission-mode', 'bypassPermissions');
     }
 
     // The user message is the final argument.  When server-defined tools are
@@ -89,7 +91,7 @@ export class ClaudeAdapter extends ProviderAdapter {
     // Claude has no protocol-level concept of these external tools.
     let promptArg = userMessage;
     if (context.tools.length > 0) {
-      promptArg += '\n\n' + buildToolInstructions(context.tools);
+      promptArg += '\n\n' + buildToolInstructions(context.tools, context.toolScriptDir);
     }
     args.push(promptArg);
 
@@ -296,15 +298,14 @@ export class ClaudeAdapter extends ProviderAdapter {
           return;
         }
 
-        // Surface rate_limit_event to the server so it can notify the user.
+        // rate_limit_event is informational — Claude Code emits it to report
+        // rate-limit status (often status "allowed") and continues streaming.
+        // It must NOT be turned into a terminal error: doing so aborts the
+        // request mid-stream. A genuine hard rate-limit surfaces through the
+        // result event / non-zero exit, which the normal error path handles.
         if (type === 'rate_limit_event') {
-          log.warn('Claude rate limit event', { type });
-          onEvent({
-            event: 'error',
-            data: {
-              code: 'rate_limited',
-              message: 'Claude is currently rate-limited. The request may retry automatically, or you may need to try again in a moment.',
-            },
+          log.debug('Claude rate limit event (informational)', {
+            status: (parsed['rate_limit_info'] as Record<string, unknown> | undefined)?.['status'],
           });
           return;
         }

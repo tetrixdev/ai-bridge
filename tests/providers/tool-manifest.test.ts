@@ -121,6 +121,22 @@ describe('tool manifest injection — Claude', () => {
     const prompt = lastSpawnArgs[lastSpawnArgs.length - 1];
     expect(prompt).toContain('# Available Tools');
   });
+
+  it('uses bypassPermissions when tools are present so headless Bash calls run', async () => {
+    const adapter = new ClaudeAdapter();
+    await adapter.execute(makeContext(TOOLS), () => {});
+
+    const idx = lastSpawnArgs.indexOf('--permission-mode');
+    expect(idx).toBeGreaterThan(-1);
+    expect(lastSpawnArgs[idx + 1]).toBe('bypassPermissions');
+  });
+
+  it('does not bypass permissions when no tools are present', async () => {
+    const adapter = new ClaudeAdapter();
+    await adapter.execute(makeContext([]), () => {});
+
+    expect(lastSpawnArgs).not.toContain('bypassPermissions');
+  });
 });
 
 describe('tool manifest injection — Codex', () => {
@@ -141,6 +157,15 @@ describe('tool manifest injection — Codex', () => {
     const prompt = lastSpawnArgs[lastSpawnArgs.length - 1];
     expect(prompt).toBe('Hello there');
     expect(prompt).not.toContain('# Available Tools');
+  });
+
+  it('uses the danger-full-access sandbox when tools are present', async () => {
+    const adapter = new CodexAdapter();
+    await adapter.execute(makeContext(TOOLS), () => {});
+
+    const idx = lastSpawnArgs.indexOf('-s');
+    expect(idx).toBeGreaterThan(-1);
+    expect(lastSpawnArgs[idx + 1]).toBe('danger-full-access');
   });
 });
 

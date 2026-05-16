@@ -14,9 +14,26 @@ describe('buildToolInstructions()', () => {
     const out = buildToolInstructions(tools);
 
     expect(out).toContain('# Available Tools');
-    expect(out).toContain('PATH');
     expect(out).toContain('JSON object');
     expect(out).toContain('stdout');
+  });
+
+  it('uses the absolute tool path in examples when a script dir is given', () => {
+    const tools: ToolDefinition[] = [
+      { name: 'roll_dice', description: 'Rolls a die', parameters: {} },
+    ];
+    const out = buildToolInstructions(tools, '/tmp/ai-bridge-tools-abc');
+
+    expect(out).toContain(`Call it like: /tmp/ai-bridge-tools-abc/roll_dice '{}'`);
+  });
+
+  it('falls back to the bare tool name when no script dir is given', () => {
+    const tools: ToolDefinition[] = [
+      { name: 'roll_dice', description: 'Rolls a die', parameters: {} },
+    ];
+    const out = buildToolInstructions(tools);
+
+    expect(out).toContain(`Call it like: roll_dice '{}'`);
   });
 
   it('includes each tool name and description', () => {

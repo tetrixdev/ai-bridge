@@ -78,16 +78,20 @@ export class CodexAdapter extends ProviderAdapter {
     }
 
     // Server-defined bridge tools support.  Codex's `exec` sandbox defaults to
-    // read-only with no network access, which would block the wrapper script's
-    // loopback callback.  When tools are present we run with workspace-write,
-    // network access enabled, and approval_policy=never (so non-interactive
-    // exec does not stall on an approval prompt).  Tool-less requests keep
-    // Codex's safer default sandbox.
+    // read-only with no network access, which blocks the wrapper script's
+    // loopback callback.  When tools are present we run with danger-full-access
+    // and approval_policy=never: the wrapper scripts execute directly (no
+    // network restriction) and exec never stalls on an approval prompt.
+    // workspace-write was not used because its bubblewrap sandbox requires
+    // unprivileged user namespaces, which are unavailable in many container and
+    // hardened-kernel environments — there the tool callback fails entirely.
+    // This matches Claude (bypassPermissions) and Gemini (--yolo): the bridge
+    // runs the CLI in the user's own trusted environment.  Tool-less requests
+    // keep Codex's safer default sandbox.
     const hasTools = context.tools.length > 0;
     if (hasTools) {
       args.push(
-        '-s', 'workspace-write',
-        '-c', 'sandbox_workspace_write.network_access=true',
+        '-s', 'danger-full-access',
         '-c', 'approval_policy=never',
       );
     }
@@ -101,7 +105,7 @@ export class CodexAdapter extends ProviderAdapter {
     // On a fresh session the system prompt is also prepended; on a resumed
     // session the original system prompt was already consumed by the first
     // turn, so the tool note is appended to the user message directly.
-    const toolNote = hasTools ? '\n\n' + buildToolInstructions(context.tools) : '';
+    const toolNote = hasTools ? '\n\n' + buildToolInstructions(context.tools, context.toolScriptDir) : '';
     if (!cliSessionId && request.system_prompt) {
       args.push('--', buildCombinedPrompt(request.system_prompt, userMessage) + toolNote);
     } else if (toolNote) {

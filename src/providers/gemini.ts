@@ -64,7 +64,7 @@ export class GeminiAdapter extends ProviderAdapter {
     // these external tools.
     const hasTools = context.tools.length > 0;
     if (hasTools) {
-      prompt += '\n\n' + buildToolInstructions(context.tools);
+      prompt += '\n\n' + buildToolInstructions(context.tools, context.toolScriptDir);
     }
 
     // Build CLI arguments
@@ -321,27 +321,11 @@ export class GeminiAdapter extends ProviderAdapter {
             // Fatal errors terminate the response — emit done and mark settled.
             onEvent({ event: 'done', data: {} });
             settled = true;
-          } else if (severity === 'warning') {
-            // Warnings are non-fatal — only use 'rate_limited' when the message
-            // indicates a rate limit, else 'provider_warning', so users are not
-            // misled into waiting for a non-existent rate limit.
-            const lowerMsg = (message ?? '').toLowerCase();
-            const isRateLimit =
-              lowerMsg.includes('rate limit') ||
-              lowerMsg.includes('ratelimit') ||
-              lowerMsg.includes('quota') ||
-              lowerMsg.includes('429') ||
-              lowerMsg.includes('too many requests');
-            // Pass Gemini's original warning text through directly; only fall
-            // back when Gemini provided no message at all.
-            onEvent({
-              event: 'error',
-              data: {
-                code: isRateLimit ? 'rate_limited' : 'provider_warning',
-                message: message ?? 'Gemini warning',
-              },
-            });
           }
+          // severity 'warning' is non-fatal and informational — Gemini keeps
+          // streaming. It must NOT be emitted as a stream 'error' event: the
+          // server treats every error as terminal and would abort the request
+          // (dropping subsequent content and tool calls). Log it locally only.
           return;
         }
 

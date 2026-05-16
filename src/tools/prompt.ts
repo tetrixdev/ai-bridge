@@ -32,17 +32,28 @@ interface SchemaProperty {
  * @param tools  The server-defined tool definitions for this request.
  * @returns A markdown manifest, or an empty string when there are no tools.
  */
-export function buildToolInstructions(tools: ToolDefinition[]): string {
+export function buildToolInstructions(
+  tools: ToolDefinition[],
+  toolScriptDir?: string | null,
+): string {
   if (tools.length === 0) return '';
+
+  // Use the absolute path to each tool script in examples. Relying on PATH is
+  // fragile — some CLIs run commands through a login shell (`bash -lc`) that
+  // re-sources profile scripts and resets PATH, dropping the bridge's tool
+  // directory. An absolute path always resolves.
+  const cmd = (name: string): string =>
+    toolScriptDir ? `${toolScriptDir}/${name}` : name;
 
   const sections: string[] = [
     '# Available Tools',
     '',
-    'You have access to the following tools. Each tool is a shell command ' +
-      'available on your PATH. Call a tool by running its command name with a ' +
-      'single argument: a JSON object containing the parameters. The command ' +
-      'prints its result to stdout. Use these tools whenever they help fulfill ' +
-      'the request.',
+    'You have access to the following tools. Each tool is an executable ' +
+      'script. Call a tool by running it as a shell command with a single ' +
+      'argument: a JSON object containing the parameters. The command prints ' +
+      'its result to stdout. Run each tool using the exact path shown in its ' +
+      '"Call it like" example. Use these tools whenever they help fulfill the ' +
+      'request.',
   ];
 
   for (const tool of tools) {
@@ -57,7 +68,7 @@ export function buildToolInstructions(tools: ToolDefinition[]): string {
 
     if (propNames.length === 0) {
       sections.push('', 'Parameters: No parameters');
-      sections.push('', `Call it like: ${tool.name} '{}'`);
+      sections.push('', `Call it like: ${cmd(tool.name)} '{}'`);
       continue;
     }
 
@@ -79,7 +90,7 @@ export function buildToolInstructions(tools: ToolDefinition[]): string {
     const exampleParam = propNames[0];
     sections.push(
       '',
-      `Call it like: ${tool.name} '{"${exampleParam}":"<value>"}'`,
+      `Call it like: ${cmd(tool.name)} '{"${exampleParam}":"<value>"}'`,
     );
   }
 
