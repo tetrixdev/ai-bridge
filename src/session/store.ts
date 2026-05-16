@@ -89,12 +89,20 @@ export class SessionStore {
    */
   set(conversationId: string, cliSessionId: string, provider: string, systemPrompt?: string | null): void {
     const now = new Date().toISOString();
+    const existing = this.data[conversationId];
     this.data[conversationId] = {
       cli_session_id: cliSessionId,
       provider,
-      created_at: now,
+      // BL-002: Preserve the original created_at when updating an existing
+      // record — every resumed request calls set() again and would otherwise
+      // reset created_at to "now".
+      created_at: existing?.created_at ?? now,
       last_used_at: now,
-      system_prompt: systemPrompt ?? null,
+      // BL-002: Only overwrite system_prompt when a non-null value is supplied.
+      // Subsequent messages in a conversation carry no system_prompt; without
+      // this guard the stored prompt (BL-005 fallback data) would be erased
+      // on every second-and-later request.
+      system_prompt: systemPrompt ?? existing?.system_prompt ?? null,
     };
     this.persist();
     log.debug('Session stored', { conversationId, cliSessionId, provider });

@@ -34,11 +34,12 @@ const CLI_PROBES: CliProbe[] = [
     versionArgs: ['--version'],
     parseVersion: (output) => extractVersion(output),
     supports_streaming: true,
-    // ARCH-002: Codex advertised supports_tools:true but silently ignores server-defined
-    // tools at runtime (it uses its own native function-calling, not the bridge wrapper
-    // scripts).  Set to false so the server's hello handshake correctly reflects this
-    // limitation and the server can suppress the tools UI for Codex sessions.
-    supports_tools: false,
+    // BL-004: Codex supports server-defined bridge tools. The bridge injects the
+    // tool wrapper-script directory onto PATH and runs `codex exec` with a
+    // workspace-write sandbox + network access so the wrapper scripts can make
+    // their loopback callback to the bridge. The available tool commands are
+    // also described in Codex's prompt. See codex.ts for the full mechanism.
+    supports_tools: true,
     supports_thinking: true,
     supports_session_resume: true,
   },

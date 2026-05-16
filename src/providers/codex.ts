@@ -45,6 +45,33 @@ const log = createLogger('CodexAdapter');
  */
 const DEFAULT_MODEL = 'gpt-5.3-codex';
 
+/**
+ * BL-004: Build a system-prompt note that tells Codex about the server-defined
+ * bridge tools available for this request.
+ *
+ * The bridge exposes each server-registered tool as a bash wrapper script on
+ * PATH whose filename is the tool name. Codex has no protocol-level concept of
+ * these external tools, so we describe them in the prompt: it can invoke any of
+ * them as ordinary shell commands. The wrapper script handles routing the call
+ * back through the bridge to the server.
+ *
+ * @param tools  The server-defined tool definitions for this request.
+ * @returns A prompt fragment to append to the combined/user prompt, or an
+ *          empty string when there are no tools.
+ */
+function buildToolPromptNote(tools: import('../protocol/types.js').ToolDefinition[]): string {
+  if (tools.length === 0) return '';
+  const lines = tools.map((t) => `- \`${t.name}\`: ${t.description}`);
+  return (
+    '\n\n---\n' +
+    'The following bridge tools are available to you as shell commands. ' +
+    'Run a tool by executing its command name in the shell (passing any ' +
+    'arguments it documents); the command performs the action and prints the ' +
+    'result. Use them when they help answer the request:\n' +
+    lines.join('\n')
+  );
+}
+
 export class CodexAdapter extends ProviderAdapter {
   readonly providerName = 'codex';
 
@@ -71,7 +98,6 @@ export class CodexAdapter extends ProviderAdapter {
       if (request.options?.model) {
         args.push('-m', request.options.model);
       }
-      args.push(userMessage);
       log.debug('Resuming session', { cliSessionId });
     } else {
       // New session
@@ -82,15 +108,49 @@ export class CodexAdapter extends ProviderAdapter {
         '--ephemeral',
         '-m', model,
       ];
+    }
 
-      // Add system prompt if provided (passed as first positional arg to exec)
-      // codex exec --json "system prompt" reads user message from the prompt arg
-      // When system_prompt is set, we prepend it as instructions
-      if (request.system_prompt) {
-        args.push('--', buildCombinedPrompt(request.system_prompt, userMessage));
-      } else {
-        args.push(userMessage);
-      }
+    // BL-004: Server-defined bridge tools support.
+    //
+    // The bridge implements server-registered tools as generated bash wrapper
+    // scripts placed in `context.toolScriptDir`. When invoked, each wrapper
+    // makes a loopback HTTP callback to the bridge's local tool-callback server.
+    //
+    // Codex's `exec` sandbox defaults to read-only and blocks network access,
+    // which would prevent the wrapper script's loopback callback from working.
+    // When server tools are present we therefore:
+    //   - run with `-s workspace-write` so model-generated shell commands may run
+    //   - enable `sandbox_workspace_write.network_access=true` so the wrapper's
+    //     loopback HTTP callback to the bridge succeeds
+    //   - set `approval_policy=never` so non-interactive `exec` does not stall
+    //     waiting for an approval prompt that nobody can answer
+    // These flags are intentionally NOT added for plain (tool-less) requests so
+    // those keep Codex's safer default sandbox.
+    const hasTools = context.tools.length > 0;
+    if (hasTools) {
+      args.push(
+        '-s', 'workspace-write',
+        '-c', 'sandbox_workspace_write.network_access=true',
+        '-c', 'approval_policy=never',
+      );
+    }
+
+    // Build the prompt positional argument. The prompt is appended LAST, after
+    // every option flag, so Codex's argument parser never mistakes it for a
+    // flag value.
+    //
+    // When server tools are present we append a note listing the available
+    // tool command names so Codex knows it may run them as shell commands.
+    // On a fresh session the system prompt is also prepended; on a resumed
+    // session the original system prompt was already consumed by the first
+    // turn, so the tool note is appended to the user message directly.
+    const toolNote = hasTools ? buildToolPromptNote(context.tools) : '';
+    if (!cliSessionId && request.system_prompt) {
+      args.push('--', buildCombinedPrompt(request.system_prompt, userMessage) + toolNote);
+    } else if (toolNote) {
+      args.push('--', userMessage + toolNote);
+    } else {
+      args.push(userMessage);
     }
 
     // UX-009: Codex CLI does not support max_tokens directly.
@@ -115,20 +175,17 @@ export class CodexAdapter extends ProviderAdapter {
       let blockIndex = 0;
       let settled = false;
 
-      // BL-003: Codex handles tools internally via its own function-calling
-      // mechanism and does NOT support server-defined wrapper scripts.
-      // If the server registered tools, they will be silently unavailable for
-      // Codex requests.  We pass null for toolScriptDir to skip PATH injection,
-      // and warn the caller so the server can surface this to administrators.
-      if (context.tools.length > 0) {
-        log.warn(
-          'Server-defined tools are not supported by the Codex provider. ' +
-          'Codex uses its own native tool-calling and cannot invoke bridge wrapper scripts. ' +
-          'Server tools will be unavailable for this request.',
-          { toolCount: context.tools.length },
-        );
+      // BL-004: Server-defined bridge tools are supported by Codex.
+      // The bridge generates bash wrapper scripts in `context.toolScriptDir`;
+      // prepending that directory to PATH makes the tool commands invocable as
+      // ordinary shell commands by Codex's model-generated commands. When there
+      // are no tools we pass null so PATH is left untouched.
+      if (hasTools) {
+        log.info('Server-defined tools enabled for Codex request', {
+          toolCount: context.tools.length,
+        });
       }
-      const env = buildSpawnEnv(null, context.requestId);
+      const env = buildSpawnEnv(hasTools ? context.toolScriptDir : null, context.requestId);
 
       const child = spawn('codex', args, {
         env,

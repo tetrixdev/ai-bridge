@@ -317,11 +317,14 @@ export class GeminiAdapter extends ProviderAdapter {
               lowerMsg.includes('quota') ||
               lowerMsg.includes('429') ||
               lowerMsg.includes('too many requests');
+            // UX-003: Pass Gemini's original warning text through directly. The raw
+            // message is more informative than a generic fallback; only fall back
+            // when Gemini provided no message at all.
             onEvent({
               event: 'error',
               data: {
                 code: isRateLimit ? 'rate_limited' : 'provider_warning',
-                message: message ?? 'Gemini warning — the request may be affected.',
+                message: message ?? 'Gemini warning',
               },
             });
           }

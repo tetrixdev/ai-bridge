@@ -213,6 +213,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private isShuttingDown = false;
   private activeRequests = new Map<string, AbortController>();
+  /**
+   * UX-006: Request IDs that were aborted because the WebSocket dropped while
+   * they were in flight.  No 'done' event could be sent over the closed socket,
+   * so the server (and the browser) never learns these requests terminated.
+   * On the next successful welcome, these are replayed as session_expired
+   * errors so the browser exits its loading state.
+   */
+  private abortedRequestIds: string[] = [];
   /** SEC-002: Random secret for authenticating tool callback HTTP requests. */
   private readonly callbackSecret: string;
 
@@ -408,6 +416,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       this.welcomeTimeoutTimer = null;
     }
     this.ws = null;
+    // BL-003: Clear the stale session ID so the welcome-timeout guard on the
+    // next reconnect correctly detects a missing welcome.  Otherwise the guard
+    // sees the previous connection's sessionId, assumes a welcome arrived, and
+    // skips the reconnect — leaving the bridge stalled if the server is slow.
+    this.sessionId = null;
 
     // BL-006: Cancel all pending tool resolvers immediately on WebSocket close
     // to fail in-flight tool calls instead of letting them stall for 30s.
@@ -422,6 +435,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (!this.isShuttingDown) {
       for (const [id, controller] of this.activeRequests) {
         controller.abort();
+        // UX-006: Record the aborted request so it can be replayed as a
+        // session_expired error after reconnect.  The WebSocket is already
+        // closed here, so no terminal event can be delivered for it now —
+        // without the replay the browser stays stuck in a loading state.
+        this.abortedRequestIds.push(id);
         log.debug('Aborted active request on disconnect', { requestId: id });
       }
       this.activeRequests.clear();
@@ -611,6 +629,26 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     });
 
     this.emit('welcome', this.sessionId);
+
+    // UX-006: Replay any requests that were aborted by a previous disconnect.
+    // Their CLI subprocesses were killed and no terminal event could be sent
+    // over the (already closed) socket.  Emit a session_expired error for each
+    // now that the connection is back, so the browser exits its loading state
+    // instead of waiting for the server's own multi-minute timeout.
+    if (this.abortedRequestIds.length > 0) {
+      const replayed = this.abortedRequestIds;
+      this.abortedRequestIds = [];
+      for (const requestId of replayed) {
+        log.info('Replaying aborted request as session_expired error', { requestId });
+        this.send({
+          type: 'error',
+          request_id: requestId,
+          code: 'session_expired',
+          message: 'Request aborted: the bridge connection dropped while the response was streaming.',
+          fatal: false,
+        });
+      }
+    }
   }
 
   /**

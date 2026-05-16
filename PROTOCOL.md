@@ -156,7 +156,7 @@ Each provider entry may include a `models` array listing available models (popul
 
 If a CLI is not installed, `available` is `false` and the server won't route requests to it.
 
-**`supports_tools`** is `true` for all providers. Even if a CLI doesn't natively support tool calling, the bridge can inject tools via Bash scripts that route back through the WebSocket. See [Tool Calls](#tool-calls).
+**`supports_tools`** indicates whether the provider can invoke server-defined bridge tools. All three currently supported providers (Codex, Claude, Gemini) report `true`. Even CLIs without native tool calling can use bridge tools: the bridge injects them as Bash wrapper scripts on the CLI's `PATH` that route calls back through the WebSocket. For Codex this additionally requires running `codex exec` with a workspace-write sandbox and network access so the wrapper scripts' loopback callback succeeds — the bridge handles this automatically. Per-provider capability values are reported dynamically in the `hello` handshake; this spec documents the format, not fixed values. See [Tool Calls](#tool-calls).
 
 **`supports_session_resume`** indicates whether the provider supports resuming conversations by session ID. All three currently supported providers support this.
 
@@ -673,6 +673,7 @@ The server also tracks heartbeats. If no `ping` is received for 2x the heartbeat
 | `bridge_disconnected` | WebSocket connection lost | Auto-reconnect with backoff |
 | `tool_error` | Tool execution failed | CLI handles gracefully in response |
 | `rate_limited` | CLI provider rate limit hit | Exponential backoff, notify user |
+| `provider_warning` | Non-fatal provider warning (e.g. content policy notice). The request continues; the message is informational | Surface to user as informational notice |
 | `invalid_request` | Malformed request from server | Log and respond with error |
 
 ### Bridge → Server: Error Response

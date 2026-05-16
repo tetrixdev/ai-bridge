@@ -154,6 +154,17 @@ export class ClaudeAdapter extends ProviderAdapter {
         }
 
         if (type === 'assistant') {
+          // BL-008: A late readline-buffered assistant event can arrive after the
+          // stream is already settled (result + done emitted). Emitting further
+          // block events here would violate the protocol. The full settled guard
+          // is intentionally not applied (low-priority edge case per review); log
+          // only so the situation can be diagnosed if it ever occurs in practice.
+          if (settled) {
+            log.debug('Assistant event received after stream settled — block events would be emitted post-done', {
+              sessionId,
+            });
+          }
+
           // The assistant message contains the content blocks
           const message = parsed['message'] as Record<string, unknown> | undefined;
           if (!message) return;
