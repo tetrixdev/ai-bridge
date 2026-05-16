@@ -121,10 +121,18 @@ export class ToolCallbackServer {
       return;
     }
 
-    // SEC-002: Verify bearer token if a secret is configured
+    // SEC-002 / SEC-003: Verify bearer token if a secret is configured.
+    // Use timingSafeEqual to prevent timing-based token recovery — even though
+    // the callback server is loopback-only, defence in depth is cheap here.
     if (this.secret) {
       const authHeader = req.headers['authorization'];
-      if (!authHeader || authHeader !== `Bearer ${this.secret}`) {
+      const expected = `Bearer ${this.secret}`;
+      // Check lengths first (timingSafeEqual requires equal-length buffers)
+      if (
+        !authHeader ||
+        authHeader.length !== expected.length ||
+        !crypto.timingSafeEqual(Buffer.from(authHeader), Buffer.from(expected))
+      ) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Unauthorized' }));
         return;

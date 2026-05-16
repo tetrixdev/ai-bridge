@@ -208,6 +208,35 @@ describe('SessionStore', () => {
     });
   });
 
+  // CONS-013: Moved from tests/bridge/findings.test.ts to co-locate with other
+  // SessionStore tests (source: src/session/store.ts).
+  describe('getSystemPrompt()', () => {
+    it('stores and retrieves system_prompt alongside session', () => {
+      const store = new SessionStore();
+      store.set('conv-1', 'session-abc', 'claude', 'You are a helpful assistant.');
+      expect(store.getSystemPrompt('conv-1')).toBe('You are a helpful assistant.');
+    });
+
+    it('returns null for system_prompt when not stored', () => {
+      const store = new SessionStore();
+      store.set('conv-1', 'session-abc', 'claude');
+      expect(store.getSystemPrompt('conv-1')).toBeNull();
+    });
+
+    it('returns null for system_prompt on non-existent conversation', () => {
+      const store = new SessionStore();
+      expect(store.getSystemPrompt('no-such-conv')).toBeNull();
+    });
+
+    it('persists system_prompt to disk', () => {
+      const store1 = new SessionStore();
+      store1.set('conv-1', 'session-abc', 'claude', 'Persistent system prompt.');
+
+      const store2 = new SessionStore();
+      expect(store2.getSystemPrompt('conv-1')).toBe('Persistent system prompt.');
+    });
+  });
+
   describe('migration from old format', () => {
     it('migrates from old versioned format', () => {
       const dirPath = path.join(tmpDir, '.ai-bridge');
@@ -260,6 +289,97 @@ describe('SessionStore', () => {
       if (data['conv-ts']) {
         expect(typeof data['conv-ts'].last_used_at).toBe('string');
       }
+    });
+
+    // EFF-001: Migration should write back to disk so the old-format file is
+    // replaced, preventing re-migration on every subsequent restart.
+    it('writes migrated data back to disk (EFF-001)', () => {
+      const dirPath = path.join(tmpDir, '.ai-bridge');
+      fs.mkdirSync(dirPath, { recursive: true });
+      const filePath = path.join(dirPath, 'sessions.json');
+
+      const oldFormat = {
+        version: 1,
+        sessions: {
+          'conv-eff': {
+            cli_session_id: 'session-eff',
+            provider: 'claude',
+            created_at: Date.now() - 2000,
+            last_used_at: Date.now() - 1000,
+          },
+        },
+      };
+      fs.writeFileSync(filePath, JSON.stringify(oldFormat));
+
+      // Construct store — migration should write back to disk
+      new SessionStore();
+
+      // Read file again — should now be in flat format, not old versioned format
+      const written = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      expect(written).not.toHaveProperty('version');
+      expect(written).not.toHaveProperty('sessions');
+      expect(written['conv-eff']).toBeDefined();
+      expect(written['conv-eff'].cli_session_id).toBe('session-eff');
+    });
+
+    // SEC-007: Migration validation — records with missing cli_session_id
+    // or invalid last_used_at in the old format must be skipped.
+    it('skips migrated records with missing cli_session_id (SEC-007)', () => {
+      const dirPath = path.join(tmpDir, '.ai-bridge');
+      fs.mkdirSync(dirPath, { recursive: true });
+
+      const oldFormat = {
+        version: 1,
+        sessions: {
+          'bad-conv': {
+            // cli_session_id deliberately omitted
+            provider: 'claude',
+            created_at: Date.now() - 1000,
+            last_used_at: Date.now(),
+          },
+          'good-conv': {
+            cli_session_id: 'session-good',
+            provider: 'claude',
+            created_at: Date.now() - 1000,
+            last_used_at: Date.now(),
+          },
+        },
+      };
+
+      fs.writeFileSync(path.join(dirPath, 'sessions.json'), JSON.stringify(oldFormat));
+
+      const store = new SessionStore();
+      expect(store.get('bad-conv')).toBeNull();
+      expect(store.get('good-conv')).toBe('session-good');
+    });
+
+    it('skips migrated records with invalid last_used_at (SEC-007)', () => {
+      const dirPath = path.join(tmpDir, '.ai-bridge');
+      fs.mkdirSync(dirPath, { recursive: true });
+
+      const oldFormat = {
+        version: 1,
+        sessions: {
+          'nan-conv': {
+            cli_session_id: 'session-nan',
+            provider: 'claude',
+            created_at: Date.now() - 1000,
+            last_used_at: 'not-a-date',
+          },
+          'good-conv': {
+            cli_session_id: 'session-good',
+            provider: 'claude',
+            created_at: Date.now() - 1000,
+            last_used_at: Date.now(),
+          },
+        },
+      };
+
+      fs.writeFileSync(path.join(dirPath, 'sessions.json'), JSON.stringify(oldFormat));
+
+      const store = new SessionStore();
+      expect(store.get('nan-conv')).toBeNull();
+      expect(store.get('good-conv')).toBe('session-good');
     });
   });
 });

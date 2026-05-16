@@ -128,6 +128,16 @@ describe('ToolCallbackServer', () => {
 
     it('accepts requests with registered tool name', async () => {
       const toolNames = new Set(['myTool']);
+
+      // CONS-009: Use a promise that resolves when sendFn is first called
+      // instead of a fixed-duration sleep, so this test is deterministic on
+      // slow CI runners.
+      let resolveSendFnCalled!: (toolCallId: string) => void;
+      const sendFnCalled = new Promise<string>((res) => { resolveSendFnCalled = res; });
+      sendFn = vi.fn((_requestId: string, toolCallId: string) => {
+        resolveSendFnCalled(toolCallId);
+      }) as SendToolCallFn;
+
       server = new ToolCallbackServer(resolver, sendFn, toolNames);
       const port = await server.start();
 
@@ -138,18 +148,16 @@ describe('ToolCallbackServer', () => {
       });
 
       // The sendFn mock won't actually resolve, so the request will
-      // hang until the resolver times out. We'll resolve it manually.
+      // hang until we manually resolve the tool call.
       const reqPromise = makeRequest(port, { body });
 
-      // Wait a tick for the server to process and call the resolver
-      await new Promise((r) => setTimeout(r, 50));
+      // Wait until sendFn is invoked — event-driven, no fixed sleep
+      const toolCallId = await sendFnCalled;
 
       // The sendFn should have been called (via resolver.call)
       expect(sendFn).toHaveBeenCalled();
 
-      // Find the toolCallId that was used and resolve it
-      const callArgs = (sendFn as ReturnType<typeof vi.fn>).mock.calls[0];
-      const toolCallId = callArgs[1]; // second argument is toolCallId
+      // Resolve the tool call
       resolver.resolve(toolCallId, 'tool result');
 
       const res = await reqPromise;

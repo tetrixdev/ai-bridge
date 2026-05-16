@@ -119,7 +119,10 @@ export function formatStderrMessage(provider: string, stderr: string, exitCode: 
     lower.includes('sign in') ||
     lower.includes('credentials')
   ) {
-    return `Authentication required — run \`${provider} auth login\` to re-authenticate.`;
+    // UX-004: Codex uses `codex login`, while Claude and Gemini use `<provider> auth login`.
+    // Using a generic `auth login` suffix for Codex would produce a non-existent command.
+    const authCmd = provider === 'codex' ? `${provider} login` : `${provider} auth login`;
+    return `Authentication required — run \`${authCmd}\` to re-authenticate.`;
   }
 
   // Rate limit patterns

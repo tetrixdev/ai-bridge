@@ -256,7 +256,17 @@ The bridge acknowledges receipt before starting the CLI process:
 }
 ```
 
-**`cli_session_id`**: The local CLI session ID being used (either new or resumed). Informational — the server doesn't need to store this.
+For the first message of a new conversation (no existing session found), `cli_session_id` is `null`:
+
+```json
+{
+  "type": "ai_request_ack",
+  "request_id": "req_abc123",
+  "cli_session_id": null
+}
+```
+
+**`cli_session_id`**: The local CLI session ID being used (resumed), or `null` when the bridge is starting a new CLI session. Informational — the server does not need to store this.
 
 ---
 
@@ -342,10 +352,13 @@ The bridge persists session mappings to `~/.ai-bridge/sessions.json`:
     "provider": "claude",
     "cli_session_id": "session_def456",
     "created_at": "2026-05-14T10:30:00Z",
-    "last_used_at": "2026-05-14T11:45:00Z"
+    "last_used_at": "2026-05-14T11:45:00Z",
+    "system_prompt": "You are a helpful assistant."
   }
 }
 ```
+
+**`system_prompt`**: The system prompt used when the conversation was first started. Stored so that session resets can restore the original instructions even when the server omits `system_prompt` from the `session_reset` message. May be `null` if no system prompt was provided.
 
 Sessions are pruned after 7 days of inactivity.
 
@@ -672,11 +685,11 @@ For request-level errors (not streaming):
   "request_id": "req_abc123",
   "code": "session_expired",
   "message": "No local session found for conversation conv_xyz789",
-  "recoverable": true
+  "fatal": false
 }
 ```
 
-**`recoverable`**: Hint to the server whether this error can be recovered from (e.g., `session_expired` is recoverable via `session_reset`, `provider_unavailable` is not).
+**`fatal`**: Hint to the server whether this error is fatal (`true`) or recoverable (`false`). A `session_expired` error is non-fatal — the server can recover by sending `session_reset`. A `provider_unavailable` error is fatal — no recovery is possible without operator action.
 
 ---
 
@@ -761,9 +774,14 @@ Each provider outputs differently. The bridge normalizes:
 {"type": "content_block_stop"}
 ```
 
-**Gemini** outputs plain text (bridge wraps in a single `text` block):
-```
-The goblin attacks with its rusty sword...
+**Gemini** outputs structured NDJSON events that the bridge parses and normalizes:
+```json
+{"type":"init","session_id":"...","model":"...","timestamp":"..."}
+{"type":"message","role":"assistant","content":"...","delta":true,"timestamp":"..."}
+{"type":"tool_use","tool_name":"...","tool_id":"...","parameters":{},"timestamp":"..."}
+{"type":"tool_result","tool_id":"...","status":"success","output":"...","timestamp":"..."}
+{"type":"error","severity":"warning|error","message":"...","timestamp":"..."}
+{"type":"result","status":"success|error","stats":{"input_tokens":...,"output_tokens":...},"timestamp":"..."}
 ```
 
 The bridge maps all of these to the unified `block_start` / `block_delta` / `block_stop` event model defined in [Streaming Events](#streaming-events).

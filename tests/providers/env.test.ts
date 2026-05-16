@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildSpawnEnv, buildCombinedPrompt, appendStderr } from '../../src/providers/env.js';
+import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from '../../src/providers/env.js';
 
 describe('Environment Utilities', () => {
   describe('buildSpawnEnv()', () => {
@@ -147,6 +147,74 @@ describe('Environment Utilities', () => {
       const result = appendStderr('short', ' text');
       expect(result).toBe('short text');
       expect(result.length).toBeLessThan(10 * 1024);
+    });
+  });
+
+  // CONS-012: Moved from tests/bridge/findings.test.ts to co-locate with the
+  // other formatStderrMessage source (src/providers/env.ts).
+  describe('formatStderrMessage()', () => {
+    it('returns auth guidance for stderr containing "401"', () => {
+      const msg = formatStderrMessage('claude', 'Request failed with status code 401\nrun claude auth login', 1);
+      expect(msg).toContain('Authentication required');
+      expect(msg).toContain('claude auth login');
+    });
+
+    it('returns auth guidance for stderr containing "auth"', () => {
+      const msg = formatStderrMessage('claude', 'Error: Not authenticated. Please run: claude auth', 1);
+      expect(msg).toContain('Authentication required');
+    });
+
+    it('returns auth guidance for stderr containing "login"', () => {
+      const msg = formatStderrMessage('codex', 'Please login first', 1);
+      expect(msg).toContain('Authentication required');
+    });
+
+    it('uses provider-specific auth command for codex (codex login)', () => {
+      const msg = formatStderrMessage('codex', 'Error: 401 Unauthorized', 1);
+      expect(msg).toContain('codex login');
+      expect(msg).not.toContain('codex auth login');
+    });
+
+    it('uses provider-specific auth command for claude (claude auth login)', () => {
+      const msg = formatStderrMessage('claude', 'Error: 401 Unauthorized', 1);
+      expect(msg).toContain('claude auth login');
+    });
+
+    it('uses provider-specific auth command for gemini (gemini auth login)', () => {
+      const msg = formatStderrMessage('gemini', 'Error: 401 Unauthorized', 1);
+      expect(msg).toContain('gemini auth login');
+    });
+
+    it('returns rate limit guidance for "rate limit" in stderr', () => {
+      const msg = formatStderrMessage('gemini', 'Error: rate limit exceeded', 1);
+      expect(msg).toContain('Rate limit');
+    });
+
+    it('returns rate limit guidance for "429" in stderr', () => {
+      const msg = formatStderrMessage('codex', 'HTTP 429 Too Many Requests', 1);
+      expect(msg).toContain('Rate limit');
+    });
+
+    it('strips ANSI escape codes from raw stderr', () => {
+      const msg = formatStderrMessage('claude', '\x1b[31mSome error occurred\x1b[0m', 1);
+      expect(msg).not.toContain('\x1b');
+      expect(msg).toContain('Some error occurred');
+    });
+
+    it('returns first non-empty line for unrecognized errors', () => {
+      const msg = formatStderrMessage('gemini', 'Unknown error\nsome stack trace\nmore details', 1);
+      expect(msg).toBe('Unknown error');
+    });
+
+    it('returns generic message for empty stderr', () => {
+      const msg = formatStderrMessage('claude', '', 1);
+      expect(msg).toContain('exited with code 1');
+    });
+
+    it('truncates very long unrecognized messages to 500 chars', () => {
+      const long = 'X'.repeat(600);
+      const msg = formatStderrMessage('claude', long, 1);
+      expect(msg.length).toBeLessThanOrEqual(500);
     });
   });
 });

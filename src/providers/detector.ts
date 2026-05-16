@@ -34,7 +34,11 @@ const CLI_PROBES: CliProbe[] = [
     versionArgs: ['--version'],
     parseVersion: (output) => extractVersion(output),
     supports_streaming: true,
-    supports_tools: true,
+    // ARCH-002: Codex advertised supports_tools:true but silently ignores server-defined
+    // tools at runtime (it uses its own native function-calling, not the bridge wrapper
+    // scripts).  Set to false so the server's hello handshake correctly reflects this
+    // limitation and the server can suppress the tools UI for Codex sessions.
+    supports_tools: false,
     supports_thinking: true,
     supports_session_resume: true,
   },
@@ -84,9 +88,18 @@ async function probeOne(probe: CliProbe): Promise<ProviderCapability> {
   };
 
   try {
+    // SEC-005: Remove bridge credential variables from the probe environment.
+    // Version probes run arbitrary binaries from PATH; a malicious binary
+    // named 'claude' or 'codex' would receive the token in its environment
+    // (accessible via /proc/<pid>/environ on Linux) before the bridge has
+    // even connected to the server.
+    const probeEnv = { ...process.env };
+    delete probeEnv['AI_BRIDGE_TOKEN'];
+    delete probeEnv['AI_BRIDGE_SERVER'];
+
     const { stdout, stderr } = await execFileAsync(probe.binary, probe.versionArgs, {
       timeout: 5_000,
-      env: { ...process.env },
+      env: probeEnv,
     });
     const output = (stdout || '') + (stderr || '');
     capability.available = true;

@@ -75,18 +75,15 @@ export class GeminiAdapter extends ProviderAdapter {
       args.push('--model', request.options.model);
     }
 
-    // UX-008: Gemini CLI does not support max_tokens directly.
-    // Emit a non-fatal warning event so the server can notify the caller.
+    // UX-009: Gemini CLI does not support max_tokens directly.
+    // Only log a bridge-side warning; do NOT emit a stream error event to the
+    // server.  The server has no actionable response (it cannot retroactively
+    // remove max_tokens), and emitting an error before every response that
+    // includes max_tokens confuses users who see an "error" before a perfectly
+    // successful reply.
     if (request.options?.max_tokens) {
       log.warn('max_tokens option specified but Gemini CLI does not support it directly — ignoring', {
         max_tokens: request.options.max_tokens,
-      });
-      onEvent({
-        event: 'error',
-        data: {
-          code: 'option_unsupported',
-          message: `max_tokens is not supported by the Gemini provider and has been ignored (value: ${request.options.max_tokens}).`,
-        },
       });
     }
 
@@ -309,12 +306,22 @@ export class GeminiAdapter extends ProviderAdapter {
             onEvent({ event: 'done', data: {} });
             settled = true;
           } else if (severity === 'warning') {
-            // Warnings are non-fatal — forward as a non-fatal error code
+            // UX-003: Warnings are non-fatal — map to a specific code based on content.
+            // Only assign 'rate_limited' when the message content indicates a rate limit;
+            // all other warning types use 'provider_warning' to avoid misleading users
+            // into waiting for a rate limit that does not exist (e.g. content policy warnings).
+            const lowerMsg = (message ?? '').toLowerCase();
+            const isRateLimit =
+              lowerMsg.includes('rate limit') ||
+              lowerMsg.includes('ratelimit') ||
+              lowerMsg.includes('quota') ||
+              lowerMsg.includes('429') ||
+              lowerMsg.includes('too many requests');
             onEvent({
               event: 'error',
               data: {
-                code: 'rate_limited',
-                message: message ?? 'Gemini warning — the request may be delayed.',
+                code: isRateLimit ? 'rate_limited' : 'provider_warning',
+                message: message ?? 'Gemini warning — the request may be affected.',
               },
             });
           }
@@ -323,6 +330,12 @@ export class GeminiAdapter extends ProviderAdapter {
 
         // ── result (final) ───────────────────────────────────
         if (type === 'result') {
+          // BL-002: Guard against duplicate done events. If a fatal 'error'
+          // event already settled this request (emitting done), the result
+          // event that follows must be ignored — emitting a second done is a
+          // protocol violation.
+          if (settled) return;
+
           // Close any open text block
           if (inTextBlock) {
             onEvent({

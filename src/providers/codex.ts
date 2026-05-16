@@ -93,18 +93,15 @@ export class CodexAdapter extends ProviderAdapter {
       }
     }
 
-    // UX-008: Codex CLI does not support max_tokens directly.
-    // Emit a non-fatal warning event so the server can notify the caller.
+    // UX-009: Codex CLI does not support max_tokens directly.
+    // Only log a bridge-side warning; do NOT emit a stream error event to the
+    // server.  The server has no actionable response (it cannot retroactively
+    // remove max_tokens), and emitting an error before every response that
+    // includes max_tokens confuses users who see an "error" before a perfectly
+    // successful reply.
     if (request.options?.max_tokens) {
       log.warn('max_tokens option specified but Codex CLI does not support it directly — ignoring', {
         max_tokens: request.options.max_tokens,
-      });
-      onEvent({
-        event: 'error',
-        data: {
-          code: 'option_unsupported',
-          message: `max_tokens is not supported by the Codex provider and has been ignored (value: ${request.options.max_tokens}).`,
-        },
       });
     }
 
@@ -114,7 +111,6 @@ export class CodexAdapter extends ProviderAdapter {
     }
 
     return new Promise<string | null>((resolve) => {
-      // CONS-002: Renamed from sessionId to sessionId to match Claude/Gemini adapters
       let sessionId: string | null = null;
       let blockIndex = 0;
       let settled = false;

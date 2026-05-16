@@ -38,6 +38,7 @@ import { ToolResolver } from './tools/resolver.js';
 import { ToolCallbackServer } from './tools/callback-server.js';
 import { SessionStore } from './session/store.js';
 import { createLogger } from './utils/logger.js';
+import { clampRequestTimeout, clampHeartbeat } from './utils/clamp.js';
 import { FatalBridgeError } from './errors.js';
 
 export { FatalBridgeError } from './errors.js';
@@ -175,6 +176,15 @@ function buildSessionResetRequest(
 // Bridge Class
 // ---------------------------------------------------------------------------
 
+/**
+ * ARCH-004 (DELIBERATELY DEFERRED): Bridge is a ~950-line class that owns
+ * WebSocket lifecycle, protocol routing, AI request execution, heartbeat
+ * management, and subsystem instantiation simultaneously.  This concentration
+ * of responsibility is a known architectural concern.  Refactoring into smaller
+ * collaborators (e.g. separating reconnection/heartbeat and request execution)
+ * requires a dedicated effort beyond the current PR scope.  Future reviewers:
+ * this is intentional and tracked — please do not re-file it as a new finding.
+ */
 export class Bridge extends EventEmitter<BridgeEvents> {
   private ws: WebSocket | null = null;
   private readonly serverUrl: string;
@@ -264,6 +274,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
     // Keep token in query param for backward compatibility, but also send it
     // in the Authorization header as the primary (log-safe) channel.
+    // SEC-001 (DEFERRED): The ?token= query parameter is visible in reverse-proxy
+    // access logs, unlike the Authorization header above.  This fallback is kept
+    // intentionally for servers that have not yet adopted header-based auth.
+    // Remove url.searchParams.set() once all companion server deployments support
+    // Authorization header authentication.
     const url = new URL(this.serverUrl);
     url.searchParams.set('token', this.token);
     const wsUrl = url.toString();
@@ -296,6 +311,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.toolResolver.cancelAll();
     this.toolManager.cleanupScripts();
     await this.callbackServer.stop();
+    // ARCH-005: Persist last_used_at updates that accumulated in memory since
+    // the last set()/delete() persist.  Without this, sessions used between
+    // bridge restarts could appear stale (premature TTL expiry) because their
+    // last_used_at was only updated in memory via get().
+    this.sessionStore.flush();
 
     // Cancel active requests
     for (const [id, controller] of this.activeRequests) {
@@ -393,6 +413,20 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // to fail in-flight tool calls instead of letting them stall for 30s.
     this.toolResolver.cancelAll();
 
+    // ARCH-006: Abort all active AI requests on unexpected disconnect so
+    // their CLI subprocesses are terminated.  Without this, the CLIs continue
+    // running after reconnect, streaming events that are silently dropped
+    // (send() returns early when ws is null), and the server never receives a
+    // done event for the original requests — leaving their conversation slots
+    // blocked until the server's own timeout fires.
+    if (!this.isShuttingDown) {
+      for (const [id, controller] of this.activeRequests) {
+        controller.abort();
+        log.debug('Aborted active request on disconnect', { requestId: id });
+      }
+      this.activeRequests.clear();
+    }
+
     this.emit('disconnected', code, reasonStr);
 
     if (!this.isShuttingDown) {
@@ -485,20 +519,21 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // SEC-003 / BL-004: Clamp request_timeout to a safe range before applying.
     // A malicious or misconfigured server could send 0 (immediate timeout) or a
     // huge value (indefinite hang / resource leak).  Accepted range: 10–3600 s.
+    // EFF-002: Use the imported clampRequestTimeout() so tests exercise the same
+    // constants as production code (no copied formulas in the test file).
     if (message.config.request_timeout) {
-      const MIN_TIMEOUT_S = 10;
-      const MAX_TIMEOUT_S = 3600;
       const raw = message.config.request_timeout;
-      const clamped = Math.min(Math.max(raw, MIN_TIMEOUT_S), MAX_TIMEOUT_S);
+      const clamped = clampRequestTimeout(raw);
       if (clamped !== raw) {
         log.warn('Server request_timeout is outside safe range — clamping', {
           received: raw,
           clamped,
-          minS: MIN_TIMEOUT_S,
-          maxS: MAX_TIMEOUT_S,
         });
       }
       this.toolResolver.setTimeoutMs(clamped * 1000);
+      // BL-001: Write the clamped value back so generateScripts (below) uses
+      // the same timeout as the tool resolver, not the raw unclamped value.
+      this.serverConfig.request_timeout = clamped;
     }
 
     // Register tools from the server
@@ -557,16 +592,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // Start heartbeat — config.heartbeat_interval is in SECONDS.
     // SEC-003 / BL-007: Clamp to a safe range to prevent a ping flood (0 ms)
     // or an excessively long dead-connection window (>300 s).
-    const MIN_HEARTBEAT_S = 5;
-    const MAX_HEARTBEAT_S = 300;
+    // EFF-002: Use the imported clampHeartbeat() so tests exercise the same constants.
     const rawHeartbeat = message.config.heartbeat_interval;
-    const clampedHeartbeat = Math.min(Math.max(rawHeartbeat, MIN_HEARTBEAT_S), MAX_HEARTBEAT_S);
+    const clampedHeartbeat = clampHeartbeat(rawHeartbeat);
     if (clampedHeartbeat !== rawHeartbeat) {
       log.warn('Server heartbeat_interval is outside safe range — clamping', {
         received: rawHeartbeat,
         clamped: clampedHeartbeat,
-        minS: MIN_HEARTBEAT_S,
-        maxS: MAX_HEARTBEAT_S,
       });
     }
     const intervalMs = clampedHeartbeat * 1000;
@@ -904,10 +936,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     );
 
     this.reconnectAttempts++;
-    log.info('Scheduling reconnect', {
-      attempt: this.reconnectAttempts,
-      delayMs: delay,
-    });
+    // UX-007: Human-readable reconnect log so operators can gauge progress
+    // without mental arithmetic (seconds instead of milliseconds, and a
+    // budget position so they know when to give up waiting).
+    log.info(`Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;

@@ -128,6 +128,22 @@ describe('ToolManager', () => {
       manager.register(tools);
       expect(manager.count()).toBe(nonReserved.length);
     });
+
+    // SEC-006: Case-insensitive denylist — capitalised variants must be rejected
+    // to prevent shadowing system binaries on macOS (case-insensitive filesystem).
+    it('rejects reserved names with uppercase variants (SEC-006)', () => {
+      const capitalised = ['Curl', 'BASH', 'Git', 'Node', 'Npm', 'Python', 'Sudo', 'RM', 'Cat'];
+      const tools = capitalised.map((name) => ({ name, description: 'test', parameters: {} }));
+
+      manager.register(tools);
+      expect(manager.count()).toBe(0);
+      expect(manager.getRejectedToolNames()).toHaveLength(capitalised.length);
+    });
+
+    it('rejects mixed-case reserved names', () => {
+      manager.register([{ name: 'cUrL', description: 'test', parameters: {} }]);
+      expect(manager.count()).toBe(0);
+    });
   });
 
   describe('getRegisteredNames()', () => {

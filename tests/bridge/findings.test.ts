@@ -2,12 +2,14 @@
  * Unit tests for logic-bug findings resolved in the code review.
  *
  * Covers:
- *   BL-001 — Early return on session_expired
  *   BL-006 — NaN pruning of corrupted session records
  *   BL-012 — Codex duplicate done events
  *   SEC-003 — Clamping of server-provided timeout/heartbeat values
  *   SEC-009 — AI_BRIDGE_TOKEN/SERVER stripped from spawn env
- *   UX-005  — formatStderrMessage user-friendly formatting
+ *
+ * Moved to canonical locations (CONS-012, CONS-013):
+ *   UX-005  formatStderrMessage tests → tests/providers/env.test.ts
+ *   BL-001  getSystemPrompt tests → tests/session/store.test.ts
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -15,7 +17,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { SessionStore } from '../../src/session/store.js';
-import { buildSpawnEnv, formatStderrMessage } from '../../src/providers/env.js';
+import { buildSpawnEnv } from '../../src/providers/env.js';
+import { clampRequestTimeout, clampHeartbeat } from '../../src/utils/clamp.js';
 
 // ---------------------------------------------------------------------------
 // BL-006: NaN pruning — invalid last_used_at records must not persist
@@ -116,21 +119,9 @@ describe('BL-006: SessionStore — invalid record validation on load', () => {
 // ---------------------------------------------------------------------------
 
 describe('SEC-003: Value clamping helpers', () => {
-  /**
-   * Replicate the clamping logic from bridge.ts for unit testing.
-   * This mirrors the exact formulas used in handleWelcome().
-   */
-  function clampRequestTimeout(raw: number): number {
-    const MIN = 10;
-    const MAX = 3600;
-    return Math.min(Math.max(raw, MIN), MAX);
-  }
-
-  function clampHeartbeat(raw: number): number {
-    const MIN = 5;
-    const MAX = 300;
-    return Math.min(Math.max(raw, MIN), MAX);
-  }
+  // EFF-002 / CONS-004: Import the real clampRequestTimeout / clampHeartbeat
+  // from src/utils/clamp.ts so that tests exercise actual production constants.
+  // Previously these tests hand-copied the formulas, hiding any constant drift.
 
   it('clamps request_timeout: 0 → 10', () => {
     expect(clampRequestTimeout(0)).toBe(10);
@@ -203,102 +194,8 @@ describe('SEC-009: buildSpawnEnv — bridge credential stripping', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// UX-005: formatStderrMessage — user-friendly error formatting
-// ---------------------------------------------------------------------------
-
-describe('UX-005: formatStderrMessage', () => {
-  it('returns auth guidance for stderr containing "401"', () => {
-    const msg = formatStderrMessage('claude', 'Request failed with status code 401\nrun claude auth login', 1);
-    expect(msg).toContain('Authentication required');
-    expect(msg).toContain('claude auth login');
-  });
-
-  it('returns auth guidance for stderr containing "auth"', () => {
-    const msg = formatStderrMessage('claude', 'Error: Not authenticated. Please run: claude auth', 1);
-    expect(msg).toContain('Authentication required');
-  });
-
-  it('returns auth guidance for stderr containing "login"', () => {
-    const msg = formatStderrMessage('codex', 'Please login first', 1);
-    expect(msg).toContain('Authentication required');
-  });
-
-  it('returns rate limit guidance for "rate limit" in stderr', () => {
-    const msg = formatStderrMessage('gemini', 'Error: rate limit exceeded', 1);
-    expect(msg).toContain('Rate limit');
-  });
-
-  it('returns rate limit guidance for "429" in stderr', () => {
-    const msg = formatStderrMessage('codex', 'HTTP 429 Too Many Requests', 1);
-    expect(msg).toContain('Rate limit');
-  });
-
-  it('strips ANSI escape codes from raw stderr', () => {
-    const msg = formatStderrMessage('claude', '\x1b[31mSome error occurred\x1b[0m', 1);
-    expect(msg).not.toContain('\x1b');
-    expect(msg).toContain('Some error occurred');
-  });
-
-  it('returns first non-empty line for unrecognized errors', () => {
-    const msg = formatStderrMessage('gemini', 'Unknown error\nsome stack trace\nmore details', 1);
-    expect(msg).toBe('Unknown error');
-  });
-
-  it('returns generic message for empty stderr', () => {
-    const msg = formatStderrMessage('claude', '', 1);
-    expect(msg).toContain('exited with code 1');
-  });
-
-  it('truncates very long unrecognized messages to 500 chars', () => {
-    const long = 'X'.repeat(600);
-    const msg = formatStderrMessage('claude', long, 1);
-    expect(msg.length).toBeLessThanOrEqual(500);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// BL-001: Early return on session_expired
-// ---------------------------------------------------------------------------
-
-describe('BL-001: SessionStore — getSystemPrompt for session reset', () => {
-  let tmpDir: string;
-
-  beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-bridge-bl001-'));
-    vi.spyOn(os, 'homedir').mockReturnValue(tmpDir);
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  it('stores and retrieves system_prompt alongside session', () => {
-    const store = new SessionStore();
-    store.set('conv-1', 'session-abc', 'claude', 'You are a helpful assistant.');
-    expect(store.getSystemPrompt('conv-1')).toBe('You are a helpful assistant.');
-  });
-
-  it('returns null for system_prompt when not stored', () => {
-    const store = new SessionStore();
-    store.set('conv-1', 'session-abc', 'claude');
-    expect(store.getSystemPrompt('conv-1')).toBeNull();
-  });
-
-  it('returns null for system_prompt on non-existent conversation', () => {
-    const store = new SessionStore();
-    expect(store.getSystemPrompt('no-such-conv')).toBeNull();
-  });
-
-  it('persists system_prompt to disk', () => {
-    const store1 = new SessionStore();
-    store1.set('conv-1', 'session-abc', 'claude', 'Persistent system prompt.');
-
-    const store2 = new SessionStore();
-    expect(store2.getSystemPrompt('conv-1')).toBe('Persistent system prompt.');
-  });
-});
+// NOTE: formatStderrMessage tests moved to tests/providers/env.test.ts (CONS-012)
+// NOTE: getSystemPrompt tests moved to tests/session/store.test.ts (CONS-013)
 
 // ---------------------------------------------------------------------------
 // BL-012: Codex duplicate done — settled guard
@@ -334,6 +231,56 @@ describe('BL-012: Codex settled guard (direct logic test)', () => {
     handleTurnCompleted();
 
     expect(events).toEqual(['error', 'done']);
+    expect(events.filter((e) => e === 'done').length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BL-002: Gemini settled guard — result event after fatal error must not emit
+// a second done event
+// ---------------------------------------------------------------------------
+
+describe('BL-002: Gemini settled guard (direct logic test)', () => {
+  it('result event after fatal error is ignored (settled guard)', () => {
+    let settled = false;
+    const events: string[] = [];
+
+    // Simulate the fatal error handler
+    const handleFatalError = () => {
+      events.push('error');
+      events.push('done');
+      settled = true;
+    };
+
+    // Simulate the result handler with the BL-002 guard
+    const handleResult = () => {
+      if (settled) return; // BL-002 guard
+      events.push('done');
+      settled = true;
+    };
+
+    // Fatal error fires first
+    handleFatalError();
+    // Then result fires — must be a no-op due to guard
+    handleResult();
+
+    expect(events).toEqual(['error', 'done']);
+    expect(events.filter((e) => e === 'done').length).toBe(1);
+  });
+
+  it('result event without prior error emits done normally', () => {
+    let settled = false;
+    const events: string[] = [];
+
+    const handleResult = () => {
+      if (settled) return;
+      events.push('done');
+      settled = true;
+    };
+
+    handleResult();
+
+    expect(events).toEqual(['done']);
     expect(events.filter((e) => e === 'done').length).toBe(1);
   });
 });

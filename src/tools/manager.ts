@@ -63,8 +63,10 @@ export class ToolManager {
         continue;
       }
 
-      // SEC-005: Check against denylist of system binary names
-      if (RESERVED_TOOL_NAMES.has(tool.name)) {
+      // SEC-006: Check against denylist of system binary names (case-insensitive).
+      // On macOS the default filesystem is case-insensitive, so a tool named
+      // 'Curl' would shadow the system 'curl' binary in the PATH-injected dir.
+      if (RESERVED_TOOL_NAMES.has(tool.name.toLowerCase())) {
         log.error('Rejected tool with reserved name', {
           name: tool.name,
           reason: 'Tool name conflicts with a system binary',

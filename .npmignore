@@ -1,6 +1,7 @@
 src/
 tests/
 tsconfig.json
+tsconfig.test.json
 tsup.config.ts
 vitest.config.ts
 .github/

@@ -289,7 +289,7 @@ export class ClaudeAdapter extends ProviderAdapter {
             event: 'error',
             data: {
               code: 'rate_limited',
-              message: 'Claude is currently rate-limited. Please wait a moment; the request will continue.',
+              message: 'Claude is currently rate-limited. The request may retry automatically, or you may need to try again in a moment.',
             },
           });
           return;

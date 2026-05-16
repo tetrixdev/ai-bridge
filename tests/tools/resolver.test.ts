@@ -193,5 +193,34 @@ describe('ToolResolver', () => {
       // Catch the expected rejection to avoid unhandled promise rejection
       await expect(promise).rejects.toThrow();
     });
+
+    // UX-011: singular/plural correctness at the 60-second boundary
+    it('uses "1 minute" (singular) when timeout is exactly 60 seconds', async () => {
+      resolver.setTimeoutMs(60_000); // exactly 60s
+      const promise = resolver.call(mockSendFn, 'req-1', 'tc-60s', 'myTool', {});
+
+      vi.advanceTimersByTime(60_001);
+
+      await expect(promise).rejects.toThrow('1 minute');
+      await expect(promise).rejects.not.toThrow('1 minutes');
+    });
+
+    it('uses "2 minutes" (plural) for 120-second timeout', async () => {
+      resolver.setTimeoutMs(120_000);
+      const promise = resolver.call(mockSendFn, 'req-1', 'tc-120s', 'myTool', {});
+
+      vi.advanceTimersByTime(120_001);
+
+      await expect(promise).rejects.toThrow('2 minutes');
+    });
+
+    it('uses seconds format for sub-60-second timeouts', async () => {
+      // resolver is initialized with 5s timeout
+      const promise = resolver.call(mockSendFn, 'req-1', 'tc-5s', 'myTool', {});
+
+      vi.advanceTimersByTime(5_001);
+
+      await expect(promise).rejects.toThrow('5s');
+    });
   });
 });

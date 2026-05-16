@@ -10,6 +10,7 @@
  *   npx @tetrixdev/ai-bridge --server wss://... --token <token> --test
  */
 
+import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { Bridge, FatalBridgeError } from './bridge.js';
 import { detectProviders } from './providers/detector.js';
@@ -50,7 +51,7 @@ program
   )
   .option(
     '--test',
-    'Test mode — respond to AI requests with mock streaming data',
+    'Test mode — respond to AI requests with mock streaming data (--server and --token still required for the WebSocket connection)',
     false,
   )
   .action(async (opts: { token?: string; server?: string; debug: boolean; test: boolean }) => {
@@ -116,11 +117,14 @@ program
     const availableProviders = providers.filter((p) => p.available);
 
     if (availableProviders.length === 0 && !opts.test) {
-      // UX-006: Warn BEFORE connecting so the user understands the bridge is
+      // UX-005 / UX-006: Warn BEFORE connecting so the user understands the bridge is
       // non-functional before it spends time establishing a WebSocket session.
       log.warn('No AI CLI tools detected. The bridge will NOT be able to execute requests.');
       log.warn('Install one of: codex (https://github.com/openai/codex), claude (https://claude.ai/download), gemini (https://github.com/google-gemini/gemini-cli)');
       log.warn('Or use --test flag to run in test mode with mock responses.');
+      // UX-005: Restate the functional consequence so it remains visible after
+      // the connection succeeds and does not get confused for a normal state.
+      log.warn('AI requests will fail until a provider CLI is installed. See install links above.');
       log.warn('Connecting anyway so the server knows a bridge is present...');
     } else if (availableProviders.length > 0) {
       log.info(`Available providers: ${availableProviders.map((p) => `${p.name} (${p.version ?? 'unknown version'})`).join(', ')}`);
@@ -231,7 +235,7 @@ program
     // any in-flight requests, then exit so the operator has a clear signal that
     // the process needs to be restarted.
     process.on('unhandledRejection', (reason) => {
-      log.error('Unhandled rejection — bridge may be in a broken state, restarting', {
+      log.error('Unhandled rejection — bridge is in an unknown state, exiting (restart the bridge to recover)', {
         error: reason instanceof Error ? reason.message : String(reason),
       });
       // Best-effort disconnect (notify server we're going away)
@@ -251,7 +255,13 @@ program
 // Run
 // ---------------------------------------------------------------------------
 
-program.parseAsync(process.argv).catch((err: unknown) => {
-  log.error('Fatal error', { error: err instanceof Error ? err.message : String(err) });
-  process.exit(1);
-});
+// ARCH-001: Guard execution so that importing this module (e.g. from tooling
+// or tests that resolve package.json `main`) does not immediately invoke the
+// CLI and call process.exit().  When this file is run directly via Node (as
+// it is when installed via `bin`), import.meta.url matches process.argv[1].
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  program.parseAsync(process.argv).catch((err: unknown) => {
+    log.error('Fatal error', { error: err instanceof Error ? err.message : String(err) });
+    process.exit(1);
+  });
+}

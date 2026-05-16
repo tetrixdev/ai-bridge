@@ -7,7 +7,7 @@ A local CLI bridge that connects your AI command-line tools (Codex, Claude, Gemi
 The **connection token** is generated from the web application that uses the AI Bridge server package (for example, `php artisan ai-bridge:token` for Laravel apps). The **server URL** is the WebSocket server address provided by that application (typically `wss://your-app.com/api/ai-bridge/ws`).
 
 ```bash
-npx @tetrixdev/ai-bridge --server=wss://your-app.com/api/ai-bridge/ws --token=YOUR_CONNECTION_TOKEN
+npx @tetrixdev/ai-bridge --server wss://your-app.com/api/ai-bridge/ws --token YOUR_CONNECTION_TOKEN
 ```
 
 Or using environment variables:
@@ -42,7 +42,7 @@ The bridge auto-detects which CLIs are installed on startup.
 Use `--test` to verify your WebSocket connection and protocol behaviour without needing a real CLI installed. Note that `--server` and `--token` are still required in test mode — the WebSocket connection to the server is what test mode exercises.
 
 ```bash
-npx @tetrixdev/ai-bridge --server=wss://your-app.com/api/ai-bridge/ws --token=TOKEN --test
+npx @tetrixdev/ai-bridge --server wss://your-app.com/api/ai-bridge/ws --token TOKEN --test
 ```
 
 In test mode, AI requests receive mock streaming responses (thinking block + text block + done event) that exercise the full protocol.

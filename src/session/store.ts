@@ -122,6 +122,18 @@ export class SessionStore {
   }
 
   /**
+   * ARCH-005: Flush the current in-memory state to disk immediately.
+   * Call this on bridge shutdown to persist any last_used_at updates that
+   * were made in memory (via get()) since the last set()/delete() persist.
+   * Without this, a session used every day could appear expired after a restart
+   * if last_used_at was never written back between accesses.
+   */
+  flush(): void {
+    this.persist();
+    log.debug('Session store flushed to disk', { count: Object.keys(this.data).length });
+  }
+
+  /**
    * Remove all expired sessions. Returns the number of pruned entries.
    */
   prune(): number {
@@ -174,7 +186,25 @@ export class SessionStore {
               created_at: number | string;
               last_used_at: number | string;
             }>;
+            let migrateSkipped = 0;
             for (const [id, rec] of Object.entries(oldSessions)) {
+              // SEC-007: Apply the same validation as the new-format path to
+              // guard against corrupted old-format files.  Missing/empty
+              // cli_session_id would be passed to CLIs as an empty --session-id;
+              // unparseable last_used_at would produce NaN and never expire.
+              if (!rec.cli_session_id || typeof rec.cli_session_id !== 'string') {
+                log.warn('Skipping migrated session record with missing cli_session_id', { id });
+                migrateSkipped++;
+                continue;
+              }
+              const rawLastUsed = typeof rec.last_used_at === 'number'
+                ? rec.last_used_at
+                : new Date(rec.last_used_at ?? '').getTime();
+              if (Number.isNaN(rawLastUsed)) {
+                log.warn('Skipping migrated session record with invalid last_used_at', { id, last_used_at: rec.last_used_at });
+                migrateSkipped++;
+                continue;
+              }
               this.data[id] = {
                 cli_session_id: rec.cli_session_id,
                 provider: rec.provider ?? rec.provider_id ?? 'unknown',
@@ -182,7 +212,14 @@ export class SessionStore {
                 last_used_at: typeof rec.last_used_at === 'number' ? new Date(rec.last_used_at).toISOString() : rec.last_used_at,
               };
             }
+            if (migrateSkipped > 0) {
+              log.warn('Skipped invalid session records during migration', { count: migrateSkipped });
+            }
             log.debug('Migrated sessions from old format', { count: Object.keys(this.data).length });
+            // EFF-001: Persist the migrated data immediately so the old-format
+            // file is replaced on disk — without this, every bridge restart would
+            // re-migrate from the unchanged old file.
+            this.persist();
           } else {
             // BL-006: Validate individual records before accepting them.
             // Records with a missing/invalid cli_session_id or non-parseable

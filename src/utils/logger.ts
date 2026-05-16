@@ -28,13 +28,6 @@ export function setDebug(enabled: boolean): void {
   currentLevel = enabled ? 'debug' : 'info';
 }
 
-/** Returns the current minimum log level. */
-// CONS-007: getLevel is not used outside this module. Kept as an internal
-// utility; remove export if it remains unused.
-export function getLevel(): LogLevel {
-  return currentLevel;
-}
-
 /** EFF-003: Returns true if debug logging is currently enabled. */
 export function isDebugEnabled(): boolean {
   return currentLevel === 'debug';
