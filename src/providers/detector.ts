@@ -115,10 +115,6 @@ export async function detectProviders(): Promise<ProviderCapability[]> {
   return results;
 }
 
-/**
- * Returns only the providers that are installed and available.
- */
-export async function detectAvailableProviders(): Promise<ProviderCapability[]> {
-  const all = await detectProviders();
-  return all.filter((p) => p.available);
-}
+// EFF-001: detectAvailableProviders was exported but never used. Removed to
+// keep the module surface minimal. cli.ts uses the equivalent inline filter
+// on detectProviders() output. Re-add and export if future callers need it.

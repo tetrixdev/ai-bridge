@@ -13,18 +13,16 @@ import { SessionStore } from '../../src/session/store.js';
 
 describe('SessionStore', () => {
   let tmpDir: string;
-  let originalHomedir: () => string;
 
   beforeEach(() => {
     // Create a temporary directory to act as $HOME
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-bridge-test-'));
-    // Mock os.homedir to return our temp dir
-    originalHomedir = os.homedir;
-    os.homedir = () => tmpDir;
+    // CONS-013: Use vi.spyOn (idiomatic vitest pattern) instead of direct assignment
+    vi.spyOn(os, 'homedir').mockReturnValue(tmpDir);
   });
 
   afterEach(() => {
-    os.homedir = originalHomedir;
+    vi.restoreAllMocks();
     // Clean up temp directory
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });

@@ -5,6 +5,8 @@
  * normalizes its output into the Bridge protocol's stream event format.
  */
 
+import { ChildProcess } from 'node:child_process';
+import { Interface as ReadlineInterface } from 'node:readline';
 import type {
   ModelInfo,
   AiRequestMessage,
@@ -12,6 +14,7 @@ import type {
   StreamEventType,
   StreamEventData,
 } from '../protocol/types.js';
+import { formatStderrMessage } from './env.js';
 
 /** A stream event emitted by the adapter. */
 export interface AdapterStreamEvent {
@@ -36,6 +39,100 @@ export interface ExecutionContext {
   /** CLI session ID if resuming, or null for new session. */
   cliSessionId: string | null;
 }
+
+/**
+ * ARCH-001 / EFF-004: Shared subprocess finalization helper.
+ *
+ * Manages the race between the readline 'close' event and the child process
+ * 'close' event — the 'done' event must not be sent until both have fired.
+ *
+ * Returns an object containing:
+ *   - `onRlClose`    — call from rl.on('close')
+ *   - `onChildClose` — call from child.on('close', code)
+ *
+ * @param providerName   Provider name used in error messages.
+ * @param terminalEvent  Name of the expected terminal output event
+ *                       (e.g. 'result', 'turn.completed') for logging.
+ * @param getSettled     Returns the current settled flag (read-only).
+ * @param setSettled     Sets the settled flag to true.
+ * @param getSessionId   Returns the current session ID (may be null).
+ * @param getStderr      Returns the current stderr buffer.
+ * @param onEvent        Adapter's onEvent callback.
+ * @param resolve        Promise resolve function.
+ * @param signal         AbortSignal (for listener cleanup).
+ * @param onAbort        Abort listener to remove on finalization.
+ * @param onBeforeFinalize  Optional callback for provider-specific pre-finalize
+ *                          work (e.g. closing an open text block in Gemini).
+ */
+export function createFinalizer(opts: {
+  providerName: string;
+  terminalEvent: string;
+  getSettled: () => boolean;
+  setSettled: () => void;
+  getSessionId: () => string | null;
+  getStderr: () => string;
+  onEvent: (event: AdapterStreamEvent) => void;
+  resolve: (sessionId: string | null) => void;
+  signal: AbortSignal;
+  onAbort: () => void;
+  onBeforeFinalize?: () => void;
+}): { onRlClose: () => void; onChildClose: (code: number | null) => void } {
+  let rlClosed = false;
+  let childExitCode: number | null = null;
+  let childExited = false;
+
+  const tryFinalize = () => {
+    if (!rlClosed || !childExited) return;
+    opts.signal.removeEventListener('abort', opts.onAbort);
+
+    if (opts.getSettled()) {
+      opts.resolve(opts.getSessionId());
+      return;
+    }
+    opts.setSettled();
+
+    // Provider-specific pre-finalize work (e.g. close an open text block)
+    opts.onBeforeFinalize?.();
+
+    if (childExitCode !== 0 && childExitCode !== null) {
+      opts.onEvent({
+        event: 'error',
+        data: {
+          code: 'provider_error',
+          message: formatStderrMessage(opts.providerName, opts.getStderr(), childExitCode),
+        },
+      });
+      opts.onEvent({ event: 'done', data: {} });
+    } else {
+      // UX-030: Clean exit but no terminal event — emit a non-fatal error.
+      opts.onEvent({
+        event: 'error',
+        data: {
+          code: 'provider_empty_response',
+          message: 'The AI returned no response. Please try again.',
+        },
+      });
+      opts.onEvent({ event: 'done', data: {} });
+    }
+
+    opts.resolve(opts.getSessionId());
+  };
+
+  return {
+    onRlClose: () => {
+      rlClosed = true;
+      tryFinalize();
+    },
+    onChildClose: (code: number | null) => {
+      childExitCode = code;
+      childExited = true;
+      tryFinalize();
+    },
+  };
+}
+
+// Re-export child_process types needed by adapters that use createFinalizer
+export type { ChildProcess, ReadlineInterface };
 
 export abstract class ProviderAdapter {
   /** Provider name / identifier (e.g. "codex", "claude", "gemini"). */

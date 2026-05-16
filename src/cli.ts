@@ -70,12 +70,14 @@ program
     const serverUrl = opts.server;
 
     if (!token) {
-      log.error('Authentication token is required. Use --token <token> or set AI_BRIDGE_TOKEN.');
+      // UX-022: Add actionable guidance on where to obtain the token
+      log.error('Authentication token is required. Use --token <token> or set AI_BRIDGE_TOKEN. Generate a token from your web application (see README for details).');
       process.exit(1);
     }
 
     if (!serverUrl) {
-      log.error('Server URL is required. Use --server <url> or set AI_BRIDGE_SERVER.');
+      // UX-022: Add hint about expected URL format
+      log.error('Server URL is required. Use --server <url> or set AI_BRIDGE_SERVER. Use the wss:// address provided by your web application (e.g. wss://your-app.com/api/ai-bridge/ws).');
       process.exit(1);
     }
 
@@ -87,7 +89,8 @@ program
 
     // BL-013: Warn about unencrypted connections
     if (serverUrl.startsWith('ws://')) {
-      log.warn('WARNING: Connecting over unencrypted ws://. Use wss:// in production.');
+      // CONS-011: Removed 'WARNING:' prefix — the logger already adds [WRN] label
+      log.warn('Connecting over unencrypted ws://. Use wss:// in production.');
     }
 
     // SEC-006: Reject URLs that contain username/password components to prevent
@@ -108,12 +111,17 @@ program
     // -----------------------------------------------------------------------
 
     const providers = await detectProviders();
+    // EFF-001: Use the full provider list (available + unavailable) for the
+    // hello message capability declaration; filter separately for the UI check.
     const availableProviders = providers.filter((p) => p.available);
 
     if (availableProviders.length === 0 && !opts.test) {
-      log.warn('No AI CLI tools detected. The bridge will connect but cannot execute requests.');
-      log.warn('Install one of: codex, claude, gemini');
+      // UX-006: Warn BEFORE connecting so the user understands the bridge is
+      // non-functional before it spends time establishing a WebSocket session.
+      log.warn('No AI CLI tools detected. The bridge will NOT be able to execute requests.');
+      log.warn('Install one of: codex (https://github.com/openai/codex), claude (https://claude.ai/download), gemini (https://github.com/google-gemini/gemini-cli)');
       log.warn('Or use --test flag to run in test mode with mock responses.');
+      log.warn('Connecting anyway so the server knows a bridge is present...');
     } else if (availableProviders.length > 0) {
       log.info(`Available providers: ${availableProviders.map((p) => `${p.name} (${p.version ?? 'unknown version'})`).join(', ')}`);
     }
@@ -129,13 +137,17 @@ program
     ];
 
     const adapters = new Map<string, ProviderAdapter>();
-    for (const adapter of adapterInstances) {
-      // Only register adapters for providers that are actually available
+    // EFF-002: Run listModels() concurrently across all available providers,
+    // consistent with how detectProviders probes are run in parallel.
+    const availableAdapters = adapterInstances.filter((adapter) => {
       const capability = providers.find((p) => p.name === adapter.providerName);
-      if (capability?.available) {
-        adapters.set(adapter.providerName, adapter);
+      return capability?.available === true;
+    });
 
-        // Populate models on the capability object for the hello message
+    await Promise.all(
+      availableAdapters.map(async (adapter) => {
+        const capability = providers.find((p) => p.name === adapter.providerName)!;
+        adapters.set(adapter.providerName, adapter);
         try {
           const models = await adapter.listModels();
           capability.models = models;
@@ -145,10 +157,9 @@ program
             error: err instanceof Error ? err.message : String(err),
           });
         }
-
         log.debug('Registered adapter', { name: adapter.providerName });
-      }
-    }
+      }),
+    );
 
     // -----------------------------------------------------------------------
     // Create and connect bridge
@@ -174,10 +185,8 @@ program
       if (opts.test) {
         log.info('Test mode active — waiting for ai_request messages...');
       }
-      // UX-007: Remind the user if no providers are available
-      if (availableProviders.length === 0 && !opts.test) {
-        log.warn('Session established (no providers available — requests will fail)');
-      }
+      // UX-006: The pre-connection warning already covers the no-providers case.
+      // Removing this redundant second warning (the user was already informed).
     });
 
     bridge.on('disconnected', (code, reason) => {
@@ -197,8 +206,11 @@ program
       log.info(`Processing request ${requestId} with ${provider}${opts.test ? ' (test mode)' : ''}`);
     });
 
+    // UX-020: Use info level so operators can see request completions without
+    // enabling --debug.  This makes the log symmetric (start and end are both
+    // at info level).
     bridge.on('request_end', (requestId) => {
-      log.debug(`Request ${requestId} completed`);
+      log.info(`Request ${requestId} completed`);
     });
 
     // -----------------------------------------------------------------------
@@ -214,10 +226,17 @@ program
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-    // Unhandled rejection safety net
+    // UX-021: Unhandled rejections indicate a code bug that left the bridge in
+    // an unknown state.  Log the error, attempt a graceful disconnect to flush
+    // any in-flight requests, then exit so the operator has a clear signal that
+    // the process needs to be restarted.
     process.on('unhandledRejection', (reason) => {
-      log.error('Unhandled rejection', {
+      log.error('Unhandled rejection — bridge may be in a broken state, restarting', {
         error: reason instanceof Error ? reason.message : String(reason),
+      });
+      // Best-effort disconnect (notify server we're going away)
+      bridge.disconnect().catch(() => { /* ignore */ }).finally(() => {
+        process.exit(1);
       });
     });
 

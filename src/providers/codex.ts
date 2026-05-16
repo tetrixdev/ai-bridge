@@ -23,9 +23,9 @@ import { createInterface } from 'node:readline';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { ModelInfo } from '../protocol/types.js';
-import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv, buildCombinedPrompt, appendStderr } from './env.js';
-import { createLogger } from '../utils/logger.js';
+import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
+import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from './env.js';
+import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
 
@@ -35,6 +35,13 @@ const log = createLogger('CodexAdapter');
  * gpt-5.2-codex (the Codex CLI default) is NOT available on ChatGPT Team
  * plans. gpt-5.3-codex is the best coding-optimized model that works
  * with both API key and ChatGPT auth modes.
+ *
+ * UX-033 (DEFERRED): If OpenAI retires or renames this model, users who rely
+ * on the default will receive a confusing "model not found" error from the CLI.
+ * A future improvement would validate this identifier against the Codex models
+ * cache at startup and warn (or fall back to the first available model) when
+ * the default is not found.  This requires understanding the Codex CLI API
+ * contract and is beyond the current PR scope.
  */
 const DEFAULT_MODEL = 'gpt-5.3-codex';
 
@@ -86,22 +93,45 @@ export class CodexAdapter extends ProviderAdapter {
       }
     }
 
-    // ARCH-009: Codex CLI does not support max_tokens directly
+    // UX-008: Codex CLI does not support max_tokens directly.
+    // Emit a non-fatal warning event so the server can notify the caller.
     if (request.options?.max_tokens) {
       log.warn('max_tokens option specified but Codex CLI does not support it directly — ignoring', {
         max_tokens: request.options.max_tokens,
       });
+      onEvent({
+        event: 'error',
+        data: {
+          code: 'option_unsupported',
+          message: `max_tokens is not supported by the Codex provider and has been ignored (value: ${request.options.max_tokens}).`,
+        },
+      });
     }
 
-    log.debug('Spawning codex', { args: args.map((a) => a.length > 60 ? a.substring(0, 60) + '...' : a) });
+    // EFF-003 / CONS-004: Guard truncation behind debug check; also align limit to 50
+    if (isDebugEnabled()) {
+      log.debug('Spawning codex', { args: args.map((a) => a.length > 50 ? a.substring(0, 50) + '...' : a) });
+    }
 
     return new Promise<string | null>((resolve) => {
-      let threadId: string | null = null;
+      // CONS-002: Renamed from sessionId to sessionId to match Claude/Gemini adapters
+      let sessionId: string | null = null;
       let blockIndex = 0;
       let settled = false;
 
-      // Codex handles tools internally via its own function-calling mechanism,
-      // so we pass null for toolScriptDir to skip PATH injection.
+      // BL-003: Codex handles tools internally via its own function-calling
+      // mechanism and does NOT support server-defined wrapper scripts.
+      // If the server registered tools, they will be silently unavailable for
+      // Codex requests.  We pass null for toolScriptDir to skip PATH injection,
+      // and warn the caller so the server can surface this to administrators.
+      if (context.tools.length > 0) {
+        log.warn(
+          'Server-defined tools are not supported by the Codex provider. ' +
+          'Codex uses its own native tool-calling and cannot invoke bridge wrapper scripts. ' +
+          'Server tools will be unavailable for this request.',
+          { toolCount: context.tools.length },
+        );
+      }
       const env = buildSpawnEnv(null, context.requestId);
 
       const child = spawn('codex', args, {
@@ -116,47 +146,22 @@ export class CodexAdapter extends ProviderAdapter {
       };
       signal.addEventListener('abort', onAbort, { once: true });
 
-      // Track when both readline and the child process have finished to avoid
-      // a race condition where child.on('close') fires before readline has
-      // processed all buffered NDJSON lines (including the final 'turn.completed'
-      // line that carries the 'done' event).
-      let rlClosed = false;
-      let childExitCode: number | null = null;
-      let childExited = false;
+      // ARCH-001: Use shared finalizer from base.ts to avoid duplication.
+      // Track stderr in a variable so the finalizer closure can access it.
+      let stderrBuffer = '';
 
-      const tryFinalize = () => {
-        if (!rlClosed || !childExited) return;  // Wait for both
-        signal.removeEventListener('abort', onAbort);
-
-        if (settled) {
-          log.debug('Codex process closed', { code: childExitCode, threadId });
-          resolve(threadId);
-          return;
-        }
-        settled = true;
-
-        // If readline finished without a 'turn.completed' event and the process
-        // exited with an error code, report the error.
-        if (childExitCode !== 0 && childExitCode !== null) {
-          log.warn('Codex exited with non-zero code', { code: childExitCode, stderr: stderrBuffer.substring(0, 500) });
-
-          onEvent({
-            event: 'error',
-            data: {
-              code: 'provider_error',
-              message: stderrBuffer.trim().substring(0, 500) || `Codex exited with code ${childExitCode}`,
-            },
-          });
-          onEvent({ event: 'done', data: {} });
-        } else {
-          // Process exited cleanly but no 'turn.completed' event was seen — still send done
-          log.warn('Codex exited without turn.completed event', { code: childExitCode });
-          onEvent({ event: 'done', data: {} });
-        }
-
-        log.debug('Codex process closed', { code: childExitCode, threadId });
-        resolve(threadId);
-      };
+      const finalizer = createFinalizer({
+        providerName: 'codex',
+        terminalEvent: 'turn.completed',
+        getSettled: () => settled,
+        setSettled: () => { settled = true; },
+        getSessionId: () => sessionId,
+        getStderr: () => stderrBuffer,
+        onEvent,
+        resolve,
+        signal,
+        onAbort,
+      });
 
       // Parse NDJSON from stdout line by line
       const rl = createInterface({ input: child.stdout });
@@ -176,8 +181,8 @@ export class CodexAdapter extends ProviderAdapter {
 
         // ── thread.started ─────────────────────────────────
         if (type === 'thread.started') {
-          threadId = (parsed['thread_id'] as string) ?? null;
-          log.debug('Thread started', { threadId });
+          sessionId = (parsed['thread_id'] as string) ?? null;
+          log.debug('Thread started', { sessionId });
           return;
         }
 
@@ -257,6 +262,11 @@ export class CodexAdapter extends ProviderAdapter {
 
         // ── turn.completed ─────────────────────────────────
         if (type === 'turn.completed') {
+          // BL-012: Guard against duplicate done events. If an error item was
+          // already processed (and set settled=true), Codex may still emit a
+          // turn.completed — emitting a second done would be a protocol violation.
+          if (settled) return;
+
           const usage = parsed['usage'] as Record<string, unknown> | undefined;
           const inputTokens = usage ? (usage['input_tokens'] as number) ?? null : null;
           const outputTokens = usage ? (usage['output_tokens'] as number) ?? null : null;
@@ -310,14 +320,10 @@ export class CodexAdapter extends ProviderAdapter {
         log.debug('Unhandled Codex event type', { type });
       });
 
-      // When readline finishes processing all buffered lines
-      rl.on('close', () => {
-        rlClosed = true;
-        tryFinalize();
-      });
+      // ARCH-001: Use shared finalizer callbacks
+      rl.on('close', finalizer.onRlClose);
 
       // Capture stderr for error logging (SEC-005: capped at 10KB)
-      let stderrBuffer = '';
       child.stderr.on('data', (chunk: Buffer) => {
         stderrBuffer = appendStderr(stderrBuffer, chunk.toString());
       });
@@ -345,9 +351,8 @@ export class CodexAdapter extends ProviderAdapter {
       });
 
       child.on('close', (code) => {
-        childExitCode = code;
-        childExited = true;
-        tryFinalize();
+        log.debug('Codex process closed', { code, sessionId });
+        finalizer.onChildClose(code);
       });
     });
   }

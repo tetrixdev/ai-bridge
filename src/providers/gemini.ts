@@ -20,9 +20,9 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
-import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv, buildCombinedPrompt, appendStderr } from './env.js';
-import { createLogger } from '../utils/logger.js';
+import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
+import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from './env.js';
+import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
  * Known Gemini CLI model aliases and models.
@@ -75,14 +75,25 @@ export class GeminiAdapter extends ProviderAdapter {
       args.push('--model', request.options.model);
     }
 
-    // ARCH-009: Gemini CLI does not support max_tokens directly
+    // UX-008: Gemini CLI does not support max_tokens directly.
+    // Emit a non-fatal warning event so the server can notify the caller.
     if (request.options?.max_tokens) {
       log.warn('max_tokens option specified but Gemini CLI does not support it directly — ignoring', {
         max_tokens: request.options.max_tokens,
       });
+      onEvent({
+        event: 'error',
+        data: {
+          code: 'option_unsupported',
+          message: `max_tokens is not supported by the Gemini provider and has been ignored (value: ${request.options.max_tokens}).`,
+        },
+      });
     }
 
-    log.debug('Spawning gemini', { args: args.map((a) => a.length > 50 ? a.substring(0, 50) + '...' : a) });
+    // EFF-003: Guard truncation behind debug check
+    if (isDebugEnabled()) {
+      log.debug('Spawning gemini', { args: args.map((a) => a.length > 50 ? a.substring(0, 50) + '...' : a) });
+    }
 
     return new Promise<string | null>((resolve) => {
       let sessionId: string | null = null;
@@ -105,57 +116,33 @@ export class GeminiAdapter extends ProviderAdapter {
       };
       signal.addEventListener('abort', onAbort, { once: true });
 
-      // Track when both readline and the child process have finished to avoid
-      // a race condition where child.on('close') fires before readline has
-      // processed all buffered NDJSON lines (including the final 'result' line
-      // that carries the 'done' event).
-      let rlClosed = false;
-      let childExitCode: number | null = null;
-      let childExited = false;
+      // ARCH-001: Use shared finalizer from base.ts to avoid duplication.
+      // Track stderr in a variable so the finalizer closure can access it.
+      let stderrBuffer = '';
 
-      const tryFinalize = () => {
-        if (!rlClosed || !childExited) return;  // Wait for both
-        signal.removeEventListener('abort', onAbort);
-
-        if (settled) {
-          log.debug('Gemini process closed', { code: childExitCode, sessionId });
-          resolve(sessionId);
-          return;
-        }
-        settled = true;
-
-        // Close any open text block
-        if (inTextBlock) {
-          onEvent({
-            event: 'block_stop',
-            data: { block_index: blockIndex },
-          });
-          blockIndex++;
-          inTextBlock = false;
-        }
-
-        // If readline finished without a 'result' event and the process exited
-        // with an error code, report the error.
-        if (childExitCode !== 0 && childExitCode !== null) {
-          log.warn('Gemini exited with non-zero code', { code: childExitCode, stderr: stderrBuffer.substring(0, 500) });
-
-          onEvent({
-            event: 'error',
-            data: {
-              code: 'provider_error',
-              message: stderrBuffer.trim().substring(0, 500) || `Gemini exited with code ${childExitCode}`,
-            },
-          });
-          onEvent({ event: 'done', data: {} });
-        } else {
-          // Process exited cleanly but no 'result' event was seen — still send done
-          log.warn('Gemini exited without result event', { code: childExitCode });
-          onEvent({ event: 'done', data: {} });
-        }
-
-        log.debug('Gemini process closed', { code: childExitCode, sessionId });
-        resolve(sessionId);
-      };
+      const finalizer = createFinalizer({
+        providerName: 'gemini',
+        terminalEvent: 'result',
+        getSettled: () => settled,
+        setSettled: () => { settled = true; },
+        getSessionId: () => sessionId,
+        getStderr: () => stderrBuffer,
+        onEvent,
+        resolve,
+        signal,
+        onAbort,
+        // Gemini-specific: close any open text block before finalizing
+        onBeforeFinalize: () => {
+          if (inTextBlock) {
+            onEvent({
+              event: 'block_stop',
+              data: { block_index: blockIndex },
+            });
+            blockIndex++;
+            inTextBlock = false;
+          }
+        },
+      });
 
       // Parse NDJSON from stdout line by line
       const rl = createInterface({ input: child.stdout });
@@ -308,7 +295,8 @@ export class GeminiAdapter extends ProviderAdapter {
           log.warn('Gemini error event', { severity, message: message?.substring(0, 200) });
 
           // For severity='error', inform the server via a stream error event.
-          // Warnings are non-fatal — Gemini continues after those.
+          // UX-029: For severity='warning' (e.g. rate limits), also forward to
+          // the server so it can surface an informational message to the user.
           if (severity === 'error') {
             onEvent({
               event: 'error',
@@ -320,6 +308,15 @@ export class GeminiAdapter extends ProviderAdapter {
             // BL-002: Fatal errors terminate the response — emit done and mark settled.
             onEvent({ event: 'done', data: {} });
             settled = true;
+          } else if (severity === 'warning') {
+            // Warnings are non-fatal — forward as a non-fatal error code
+            onEvent({
+              event: 'error',
+              data: {
+                code: 'rate_limited',
+                message: message ?? 'Gemini warning — the request may be delayed.',
+              },
+            });
           }
           return;
         }
@@ -373,14 +370,10 @@ export class GeminiAdapter extends ProviderAdapter {
         log.debug('Unhandled Gemini event type', { type });
       });
 
-      // When readline finishes processing all buffered lines
-      rl.on('close', () => {
-        rlClosed = true;
-        tryFinalize();
-      });
+      // ARCH-001: Use shared finalizer callbacks
+      rl.on('close', finalizer.onRlClose);
 
       // Capture stderr for error logging (SEC-005: capped at 10KB)
-      let stderrBuffer = '';
       child.stderr.on('data', (chunk: Buffer) => {
         stderrBuffer = appendStderr(stderrBuffer, chunk.toString());
       });
@@ -408,9 +401,8 @@ export class GeminiAdapter extends ProviderAdapter {
       });
 
       child.on('close', (code) => {
-        childExitCode = code;
-        childExited = true;
-        tryFinalize();
+        log.debug('Gemini process closed', { code, sessionId });
+        finalizer.onChildClose(code);
       });
     });
   }

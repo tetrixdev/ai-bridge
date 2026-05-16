@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { buildSpawnEnv, buildCombinedPrompt, appendStderr } from '../../src/providers/env.js';
 
 describe('Environment Utilities', () => {
@@ -104,33 +104,34 @@ describe('Environment Utilities', () => {
       expect(result).toBe('first chunk');
     });
 
-    it('caps at MAX_STDERR_SIZE (10KB)', () => {
+    it('caps at MAX_STDERR_SIZE (10KB) keeping the first 10KB', () => {
       const maxSize = 10 * 1024;
       const existing = 'x'.repeat(maxSize - 10);
       const overflow = 'y'.repeat(100);
 
       const result = appendStderr(existing, overflow);
 
+      // UX-007: keeps first 10KB (not last), so result ends with first 10 chars of overflow
       expect(result.length).toBe(maxSize);
-      // Should keep the tail end (last 10KB)
-      expect(result.endsWith(overflow)).toBe(true);
+      expect(result.startsWith('x'.repeat(maxSize - 10))).toBe(true);
+      expect(result.endsWith('y'.repeat(10))).toBe(true);
     });
 
-    it('truncates from the beginning when exceeding limit', () => {
+    it('stops accumulating once buffer is at max size', () => {
       const maxSize = 10 * 1024;
+      // Fill the buffer to exactly max size
       const buffer = 'A'.repeat(maxSize);
       const chunk = 'B'.repeat(100);
 
       const result = appendStderr(buffer, chunk);
 
+      // UX-007: Buffer is already full — new chunk is ignored
       expect(result.length).toBe(maxSize);
-      // Should end with the new chunk
-      expect(result.endsWith(chunk)).toBe(true);
-      // Should have lost some of the beginning
       expect(result.startsWith('A')).toBe(true);
+      expect(result.endsWith('A')).toBe(true);
     });
 
-    it('handles buffer already at max size', () => {
+    it('handles buffer already at max size (no new content)', () => {
       const maxSize = 10 * 1024;
       const buffer = 'A'.repeat(maxSize);
       const chunk = 'B'.repeat(50);
@@ -138,7 +139,8 @@ describe('Environment Utilities', () => {
       const result = appendStderr(buffer, chunk);
 
       expect(result.length).toBe(maxSize);
-      expect(result.endsWith(chunk)).toBe(true);
+      // Buffer was full — new chunk discarded
+      expect(result.endsWith('A')).toBe(true);
     });
 
     it('does not truncate when total is under limit', () => {

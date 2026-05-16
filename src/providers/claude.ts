@@ -17,9 +17,9 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
-import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv, appendStderr } from './env.js';
-import { createLogger } from '../utils/logger.js';
+import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
+import { buildSpawnEnv, appendStderr, formatStderrMessage } from './env.js';
+import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
  * Known Claude CLI model aliases.
@@ -86,7 +86,10 @@ export class ClaudeAdapter extends ProviderAdapter {
     // The user message is the final argument
     args.push(userMessage);
 
-    log.debug('Spawning claude', { args: args.map((a) => a.length > 50 ? a.substring(0, 50) + '...' : a) });
+    // EFF-003: Only build the truncated arg array when debug logging is active
+    if (isDebugEnabled()) {
+      log.debug('Spawning claude', { args: args.map((a) => a.length > 50 ? a.substring(0, 50) + '...' : a) });
+    }
 
     return new Promise<string | null>((resolve, reject) => {
       let sessionId: string | null = null;
@@ -110,47 +113,22 @@ export class ClaudeAdapter extends ProviderAdapter {
       };
       signal.addEventListener('abort', onAbort, { once: true });
 
-      // Track when both readline and the child process have finished to avoid
-      // a race condition where child.on('close') fires before readline has
-      // processed all buffered NDJSON lines (including the final 'result' line
-      // that carries the 'done' event).
-      let rlClosed = false;
-      let childExitCode: number | null = null;
-      let childExited = false;
+      // ARCH-001: Use shared finalizer from base.ts to avoid duplication.
+      // Track stderr in a variable so the finalizer closure can access it.
+      let stderrBuffer = '';
 
-      const tryFinalize = () => {
-        if (!rlClosed || !childExited) return;  // Wait for both
-        signal.removeEventListener('abort', onAbort);
-
-        if (settled) {
-          log.debug('Claude process closed', { code: childExitCode, sessionId });
-          resolve(sessionId);
-          return;
-        }
-        settled = true;
-
-        // If readline finished without a 'result' event and the process exited
-        // with an error code, report the error.
-        if (childExitCode !== 0 && childExitCode !== null) {
-          log.warn('Claude exited with non-zero code', { code: childExitCode, stderr: stderrBuffer.substring(0, 500) });
-
-          onEvent({
-            event: 'error',
-            data: {
-              code: 'provider_error',
-              message: stderrBuffer.trim().substring(0, 500) || `Claude exited with code ${childExitCode}`,
-            },
-          });
-          onEvent({ event: 'done', data: {} });
-        } else {
-          // Process exited cleanly but no 'result' event was seen — still send done
-          log.warn('Claude exited without result event', { code: childExitCode });
-          onEvent({ event: 'done', data: {} });
-        }
-
-        log.debug('Claude process closed', { code: childExitCode, sessionId });
-        resolve(sessionId);
-      };
+      const finalizer = createFinalizer({
+        providerName: 'claude',
+        terminalEvent: 'result',
+        getSettled: () => settled,
+        setSettled: () => { settled = true; },
+        getSessionId: () => sessionId,
+        getStderr: () => stderrBuffer,
+        onEvent,
+        resolve,
+        signal,
+        onAbort,
+      });
 
       // Parse NDJSON from stdout line by line
       const rl = createInterface({ input: child.stdout });
@@ -304,20 +282,26 @@ export class ClaudeAdapter extends ProviderAdapter {
           return;
         }
 
-        // Ignore rate_limit_event and other non-essential events
-        if (type !== 'rate_limit_event') {
-          log.debug('Unhandled Claude event type', { type });
+        // UX-029: Surface rate_limit_event to the server so it can notify the user.
+        if (type === 'rate_limit_event') {
+          log.warn('Claude rate limit event', { type });
+          onEvent({
+            event: 'error',
+            data: {
+              code: 'rate_limited',
+              message: 'Claude is currently rate-limited. Please wait a moment; the request will continue.',
+            },
+          });
+          return;
         }
+
+        log.debug('Unhandled Claude event type', { type });
       });
 
-      // When readline finishes processing all buffered lines
-      rl.on('close', () => {
-        rlClosed = true;
-        tryFinalize();
-      });
+      // ARCH-001: Use shared finalizer callbacks
+      rl.on('close', finalizer.onRlClose);
 
       // Capture stderr for error logging (SEC-005: capped at 10KB)
-      let stderrBuffer = '';
       child.stderr.on('data', (chunk: Buffer) => {
         stderrBuffer = appendStderr(stderrBuffer, chunk.toString());
       });
@@ -345,9 +329,8 @@ export class ClaudeAdapter extends ProviderAdapter {
       });
 
       child.on('close', (code) => {
-        childExitCode = code;
-        childExited = true;
-        tryFinalize();
+        log.debug('Claude process closed', { code, sessionId });
+        finalizer.onChildClose(code);
       });
     });
   }

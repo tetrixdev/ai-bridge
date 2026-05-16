@@ -40,6 +40,8 @@ const RESERVED_TOOL_NAMES = new Set([
 export class ToolManager {
   private tools = new Map<string, ToolDefinition>();
   private scriptDir: string | null = null;
+  /** UX-003: Names of tools most recently rejected by register(). */
+  private rejectedTools: string[] = [];
 
   /**
    * Register tool definitions received from the server.
@@ -74,7 +76,9 @@ export class ToolManager {
       this.tools.set(tool.name, tool);
     }
 
-    // BL-032: Log rejected tools count and names
+    // UX-003: Expose rejected tool names so the bridge can notify the server.
+    this.rejectedTools = rejectedTools;
+
     if (rejectedTools.length > 0) {
       log.warn('Tools rejected by name validation', {
         count: rejectedTools.length,
@@ -83,6 +87,14 @@ export class ToolManager {
     }
 
     log.info('Registered tools', { accepted: this.tools.size, total: tools.length, names: Array.from(this.tools.keys()) });
+  }
+
+  /**
+   * UX-003: Return the list of tool names that were rejected during the last
+   * register() call.  The bridge uses this to notify the server.
+   */
+  getRejectedToolNames(): string[] {
+    return this.rejectedTools;
   }
 
   /**
@@ -123,12 +135,16 @@ export class ToolManager {
    *   3. Wait for the result
    *   4. Print the result to stdout
    *
-   * @param callbackPort The local HTTP port the bridge is listening on
-   *                     for tool call callbacks from spawned scripts.
-   * @param secret       Optional bearer token for callback server authentication (SEC-002).
+   * @param callbackPort  The local HTTP port the bridge is listening on
+   *                      for tool call callbacks from spawned scripts.
+   * @param secret        Optional bearer token for callback server auth (SEC-002).
+   * @param timeoutMs     BL-013: HTTP timeout for the callback request in ms.
+   *                      Should match the server-configured request_timeout so
+   *                      the bash script does not outlive the bridge-side timeout.
+   *                      Defaults to 300 000 ms (5 min).
    * @returns The path to the temporary directory containing the scripts.
    */
-  generateScripts(callbackPort: number, secret?: string): string {
+  generateScripts(callbackPort: number, secret?: string, timeoutMs: number = 300_000): string {
     // Clean up any previous script directory
     this.cleanupScripts();
 
@@ -137,8 +153,10 @@ export class ToolManager {
 
     for (const tool of this.tools.values()) {
       const scriptPath = path.join(this.scriptDir, tool.name);
-      const scriptContent = this.buildScript(tool, callbackPort, secret);
-      fs.writeFileSync(scriptPath, scriptContent, { mode: 0o755 });
+      const scriptContent = this.buildScript(tool, callbackPort, secret, timeoutMs);
+      // SEC-001: Use 0o700 (owner-only) instead of 0o755 to prevent other
+      // local users from reading the embedded callback bearer secret.
+      fs.writeFileSync(scriptPath, scriptContent, { mode: 0o700 });
       log.debug('Generated tool script', { tool: tool.name, path: scriptPath });
     }
 
@@ -182,7 +200,7 @@ export class ToolManager {
    * Tool names are pre-validated by register() so they are safe to embed.
    * Tool descriptions are NOT included in the script to prevent injection.
    */
-  private buildScript(tool: ToolDefinition, callbackPort: number, secret?: string): string {
+  private buildScript(tool: ToolDefinition, callbackPort: number, secret?: string, timeoutMs: number = 300_000): string {
     const secretArg = secret ?? '';
     return `#!/usr/bin/env bash
 # Auto-generated tool wrapper: ${tool.name}
@@ -222,7 +240,7 @@ const payload = JSON.stringify({
 const headers = { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) };
 if (secret) headers["Authorization"] = "Bearer " + secret;
 
-const req = http.request({ hostname: "127.0.0.1", port: ${callbackPort}, path: "/tool-call", method: "POST", headers, timeout: 300000 }, (res) => {
+const req = http.request({ hostname: "127.0.0.1", port: ${callbackPort}, path: "/tool-call", method: "POST", headers, timeout: ${timeoutMs} }, (res) => {
   let body = "";
   res.on("data", (c) => { body += c; });
   res.on("end", () => {
@@ -239,6 +257,9 @@ const req = http.request({ hostname: "127.0.0.1", port: ${callbackPort}, path: "
 req.on("error", (e) => { process.stderr.write("Tool call failed: " + e.message + "\\n"); process.exit(1); });
 req.write(payload);
 req.end();
+// SEC-005 (nitpick): $RANDOM has weak entropy (~33 bits).  The callback server
+// overrides this value with a cryptographically strong UUID before use, so the
+// bash-generated ID is discarded and never becomes the authoritative tool_call_id.
 ' "$STDIN_DATA" "${tool.name}" "tc_\${RANDOM}\${RANDOM}" "\${AI_BRIDGE_REQUEST_ID:-}" "${secretArg}"
 `;
   }

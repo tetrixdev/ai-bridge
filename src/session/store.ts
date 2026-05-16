@@ -31,6 +31,9 @@ interface SessionRecord {
   provider: string;
   created_at: string;   // ISO 8601
   last_used_at: string;  // ISO 8601
+  /** BL-005: Store the original system prompt so session resets can reuse it
+   *  even when the server omits system_prompt from the session_reset message. */
+  system_prompt?: string | null;
 }
 
 /** The full shape of the sessions.json file. */
@@ -80,17 +83,29 @@ export class SessionStore {
 
   /**
    * Store a mapping from conversation_id to cli_session_id.
+   * @param systemPrompt  The system prompt used for the first message in this
+   *   conversation (BL-005).  Stored so session resets can restore it even
+   *   when the server omits system_prompt from the session_reset message.
    */
-  set(conversationId: string, cliSessionId: string, provider: string): void {
+  set(conversationId: string, cliSessionId: string, provider: string, systemPrompt?: string | null): void {
     const now = new Date().toISOString();
     this.data[conversationId] = {
       cli_session_id: cliSessionId,
       provider,
       created_at: now,
       last_used_at: now,
+      system_prompt: systemPrompt ?? null,
     };
     this.persist();
     log.debug('Session stored', { conversationId, cliSessionId, provider });
+  }
+
+  /**
+   * BL-005: Retrieve the stored system prompt for a conversation.
+   * Returns null if not found or if no system_prompt was stored.
+   */
+  getSystemPrompt(conversationId: string): string | null {
+    return this.data[conversationId]?.system_prompt ?? null;
   }
 
   /**
@@ -169,21 +184,63 @@ export class SessionStore {
             }
             log.debug('Migrated sessions from old format', { count: Object.keys(this.data).length });
           } else {
-            this.data = parsed as SessionFile;
+            // BL-006: Validate individual records before accepting them.
+            // Records with a missing/invalid cli_session_id or non-parseable
+            // last_used_at would never expire (NaN > threshold === false) and
+            // would be returned by get() indefinitely.
+            const rawSessions = parsed as Record<string, unknown>;
+            let skipped = 0;
+            for (const [id, rec] of Object.entries(rawSessions)) {
+              const r = rec as Partial<SessionRecord>;
+              if (!r.cli_session_id || typeof r.cli_session_id !== 'string') {
+                log.warn('Skipping session record with missing cli_session_id', { id });
+                skipped++;
+                continue;
+              }
+              const lastUsed = new Date(r.last_used_at ?? '').getTime();
+              if (Number.isNaN(lastUsed)) {
+                log.warn('Skipping session record with invalid last_used_at', { id, last_used_at: r.last_used_at });
+                skipped++;
+                continue;
+              }
+              this.data[id] = r as SessionRecord;
+            }
+            if (skipped > 0) {
+              log.warn('Skipped invalid session records on load', { count: skipped });
+            }
             log.debug('Sessions loaded from disk', { count: Object.keys(this.data).length });
           }
         }
       }
     } catch (err) {
-      log.warn('Failed to load sessions file, starting fresh', {
+      // UX-004: Log at error level (not just warn) so operators notice that all
+      // existing sessions were lost.  Also try to preserve the corrupted file
+      // as a .bak so the user has a recovery option.
+      log.error('Failed to load sessions file — starting with empty session store', {
         error: err instanceof Error ? err.message : String(err),
       });
+      try {
+        if (fs.existsSync(this.filePath)) {
+          const bakPath = this.filePath + '.bak';
+          fs.copyFileSync(this.filePath, bakPath);
+          log.error('Corrupted sessions file saved as backup', { backupPath: bakPath });
+        }
+      } catch {
+        // Best-effort — ignore errors during backup
+      }
     }
 
     // Prune on load
     this.prune();
   }
 
+  // EFF-007 / CONS-009: persist() uses synchronous file I/O intentionally.
+  // The bridge processes one AI request at a time per conversation; persist()
+  // is called only on set/delete (at most once per completed request).  The
+  // cost of a single synchronous write on an SSD is negligible compared to the
+  // multi-second CLI invocations it bookends.  Converting to async would
+  // require an async initialize() factory pattern that complicates the
+  // constructor and all call sites without meaningful performance benefit.
   private persist(): void {
     try {
       if (!fs.existsSync(this.dir)) {

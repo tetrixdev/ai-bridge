@@ -53,7 +53,7 @@ describe('ToolResolver', () => {
       // Advance time past timeout
       vi.advanceTimersByTime(5001);
 
-      await expect(promise).rejects.toThrow('timed out after 5000ms');
+      await expect(promise).rejects.toThrow('timed out after 5s');
       expect(resolver.pendingCount()).toBe(0);
     });
 
@@ -73,7 +73,7 @@ describe('ToolResolver', () => {
       const promise = resolver.call(mockSendFn, 'req-1', 'tc-short', 'tool', {});
       vi.advanceTimersByTime(1001);
 
-      await expect(promise).rejects.toThrow('timed out after 1000ms');
+      await expect(promise).rejects.toThrow('timed out after 1s');
     });
   });
 

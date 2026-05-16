@@ -70,7 +70,10 @@ export class ToolResolver {
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(toolCallId);
-        reject(new Error(`Tool call ${toolName} (${toolCallId}) timed out after ${this.timeoutMs}ms`));
+        // UX-009: Format as human-readable duration instead of raw ms
+        const seconds = Math.round(this.timeoutMs / 1000);
+        const humanDuration = seconds >= 60 ? `${Math.round(seconds / 60)} minutes` : `${seconds}s`;
+        reject(new Error(`Tool call ${toolName} (${toolCallId}) timed out after ${humanDuration}`));
       }, this.timeoutMs);
 
       this.pending.set(toolCallId, {

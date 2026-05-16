@@ -1,5 +1,5 @@
 import { defineConfig } from 'tsup';
-import { readFileSync } from 'fs';
+import { readFileSync } from 'node:fs';
 
 const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'));
 
@@ -8,7 +8,10 @@ export default defineConfig({
   format: ['esm'],
   target: 'node20',
   clean: true,
-  dts: true,
+  // EFF-011: This is a CLI-only package (invoked via npx/bin, not imported as
+  // a library).  Type declarations serve no purpose for end users and add build
+  // time and package size unnecessarily.
+  dts: false,
   sourcemap: true,
   banner: {
     js: '#!/usr/bin/env node',

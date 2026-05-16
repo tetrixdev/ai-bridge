@@ -7,14 +7,13 @@
     "ai-bridge": "dist/cli.js"
   },
   "main": "dist/cli.js",
-  "types": "dist/cli.d.ts",
   "files": [
     "dist"
   ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "vitest",
+    "test": "vitest run",
     "start": "node dist/cli.js",
     "prepare": "npm run build"
   },

@@ -29,8 +29,15 @@ export function setDebug(enabled: boolean): void {
 }
 
 /** Returns the current minimum log level. */
+// CONS-007: getLevel is not used outside this module. Kept as an internal
+// utility; remove export if it remains unused.
 export function getLevel(): LogLevel {
   return currentLevel;
+}
+
+/** EFF-003: Returns true if debug logging is currently enabled. */
+export function isDebugEnabled(): boolean {
+  return currentLevel === 'debug';
 }
 
 function formatTimestamp(): string {
@@ -44,8 +51,10 @@ function shouldLog(level: LogLevel): boolean {
 function formatMessage(level: LogLevel, component: string, message: string, meta?: Record<string, unknown>): string {
   const ts = formatTimestamp();
   const label = LEVEL_LABEL[level];
+  // UX-010: Message before metadata so lines scan left-to-right naturally,
+  // e.g. "Connected to server {"url":"wss://..."}" instead of the reverse.
   const metaStr = meta ? ' ' + JSON.stringify(meta) : '';
-  return `${ts} [${label}] [${component}]${metaStr} ${message}`;
+  return `${ts} [${label}] [${component}] ${message}${metaStr}`;
 }
 
 /**
