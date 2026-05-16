@@ -111,7 +111,7 @@ describe('Environment Utilities', () => {
 
       const result = appendStderr(existing, overflow);
 
-      // UX-007: keeps first 10KB (not last), so result ends with first 10 chars of overflow
+      // keeps first 10KB (not last), so result ends with first 10 chars of overflow
       expect(result.length).toBe(maxSize);
       expect(result.startsWith('x'.repeat(maxSize - 10))).toBe(true);
       expect(result.endsWith('y'.repeat(10))).toBe(true);
@@ -125,7 +125,7 @@ describe('Environment Utilities', () => {
 
       const result = appendStderr(buffer, chunk);
 
-      // UX-007: Buffer is already full — new chunk is ignored
+      // Buffer is already full — new chunk is ignored
       expect(result.length).toBe(maxSize);
       expect(result.startsWith('A')).toBe(true);
       expect(result.endsWith('A')).toBe(true);
@@ -150,8 +150,6 @@ describe('Environment Utilities', () => {
     });
   });
 
-  // CONS-012: Moved from tests/bridge/findings.test.ts to co-locate with the
-  // other formatStderrMessage source (src/providers/env.ts).
   describe('formatStderrMessage()', () => {
     it('returns auth guidance for stderr containing "401"', () => {
       const msg = formatStderrMessage('claude', 'Request failed with status code 401\nrun claude auth login', 1);

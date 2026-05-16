@@ -129,9 +129,8 @@ describe('ToolCallbackServer', () => {
     it('accepts requests with registered tool name', async () => {
       const toolNames = new Set(['myTool']);
 
-      // CONS-009: Use a promise that resolves when sendFn is first called
-      // instead of a fixed-duration sleep, so this test is deterministic on
-      // slow CI runners.
+      // Use a promise that resolves when sendFn is first called instead of a
+      // fixed-duration sleep, so this test is deterministic on slow CI runners.
       let resolveSendFnCalled!: (toolCallId: string) => void;
       const sendFnCalled = new Promise<string>((res) => { resolveSendFnCalled = res; });
       sendFn = vi.fn((_requestId: string, toolCallId: string) => {

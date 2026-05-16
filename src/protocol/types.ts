@@ -71,10 +71,8 @@ export interface HelloMessage {
 /**
  * Acknowledges receipt of an ai_request and confirms processing has begun.
  *
- * CONS-008: cli_session_id is null when no existing session is found and the
- * bridge is starting a fresh CLI session.  Using null (rather than the magic
- * string 'new') is consistent with the null-for-absence pattern used elsewhere.
- * Servers should treat null as "new session" and any non-null string as the
+ * cli_session_id is null when no existing session is found (a fresh CLI
+ * session); servers treat null as "new session" and any non-null string as the
  * resumable CLI session identifier.
  */
 export interface AiRequestAckMessage {
@@ -116,7 +114,6 @@ export interface BridgeErrorMessage {
   request_id: string;
   code: string;
   message: string;
-  /** CONS-007: Standardized on `fatal` (same polarity as server ErrorMessage). */
   fatal: boolean;
 }
 
@@ -165,10 +162,8 @@ export interface AiRequestMessage {
 /**
  * Options that control how the AI request is executed.
  *
- * CONS-010: max_tokens and temperature are optional (may be absent, not just
- * null) for consistency with model which is also optional.  Absent = "use
- * provider default"; null = explicitly "no value".  Servers may omit these
- * fields entirely when they have no preference.
+ * All fields are optional: absent = "use provider default", null = explicitly
+ * "no value".
  */
 export interface AiRequestOptions {
   max_tokens?: number | null;

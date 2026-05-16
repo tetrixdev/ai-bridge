@@ -42,7 +42,7 @@ export class ToolResolver {
   }
 
   /**
-   * BL-005: Update the timeout duration (e.g., from server's request_timeout config).
+   * Update the timeout duration (e.g. from the server's request_timeout config).
    */
   setTimeoutMs(ms: number): void {
     this.timeoutMs = ms;
@@ -70,8 +70,6 @@ export class ToolResolver {
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(toolCallId);
-        // UX-009: Format as human-readable duration instead of raw ms.
-        // UX-011: Use correct singular/plural ('1 minute' not '1 minutes').
         const seconds = Math.round(this.timeoutMs / 1000);
         const minutes = Math.round(seconds / 60);
         const humanDuration = seconds >= 60 ? `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}` : `${seconds}s`;

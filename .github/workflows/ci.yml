@@ -1,7 +1,6 @@
 name: CI
 
-# SEC-011: Restrict all jobs to read-only by default.
-# The publish job only needs npm publish (NPM_TOKEN), not GITHUB_TOKEN write access.
+# Read-only by default; the publish job only needs NPM_TOKEN.
 permissions: read-all
 
 on:
@@ -21,11 +20,10 @@ jobs:
         node-version: [20, 22]
 
     steps:
-      # SEC-010: Pinned to commit SHA to prevent supply chain attacks via mutable version tags.
+      # Pinned to commit SHA to prevent supply-chain attacks via mutable tags.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
       - name: Setup Node.js ${{ matrix.node-version }}
-        # SEC-010: Pinned to commit SHA.
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
         with:
           node-version: ${{ matrix.node-version }}
@@ -34,7 +32,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # SEC-009: Fail CI if any moderate or higher severity vulnerability is found.
+      # Fail CI on any moderate or higher severity vulnerability.
       - name: Audit dependencies
         run: npm audit --audit-level=moderate
 
@@ -44,17 +42,15 @@ jobs:
   typecheck:
     name: Type check (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
-    # CONS-014: Run typecheck on both Node versions to catch Node-version-specific
-    # type incompatibilities (e.g. APIs available in Node 22 types but not Node 20).
+    # Typecheck on both Node versions to catch version-specific type incompatibilities.
     strategy:
       matrix:
         node-version: [20, 22]
     steps:
-      # SEC-010: Pinned to commit SHA.
+      # Pinned to commit SHA.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
       - name: Setup Node.js ${{ matrix.node-version }}
-        # SEC-010: Pinned to commit SHA.
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
         with:
           node-version: ${{ matrix.node-version }}
@@ -75,11 +71,10 @@ jobs:
     needs: [test, typecheck]
     if: github.event_name == 'release' && github.event.action == 'published'
     steps:
-      # SEC-010: Pinned to commit SHA.
+      # Pinned to commit SHA.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
       - name: Setup Node.js
-        # SEC-010: Pinned to commit SHA.
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
         with:
           node-version: 22

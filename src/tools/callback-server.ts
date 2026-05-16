@@ -30,10 +30,10 @@ export class ToolCallbackServer {
   private server: http.Server | null = null;
   private port: number | null = null;
 
-  /** Set of registered tool names for validation (SEC-001). */
+  /** Set of registered tool names for validation. */
   private registeredToolNames: Set<string> | null = null;
 
-  /** SEC-002: Shared secret for authenticating callback requests. */
+  /** Shared secret for authenticating callback requests. */
   private readonly secret: string | null;
 
   constructor(
@@ -121,9 +121,8 @@ export class ToolCallbackServer {
       return;
     }
 
-    // SEC-002 / SEC-003: Verify bearer token if a secret is configured.
-    // Use timingSafeEqual to prevent timing-based token recovery — even though
-    // the callback server is loopback-only, defence in depth is cheap here.
+    // Verify bearer token if a secret is configured, using timingSafeEqual to
+    // prevent timing-based token recovery.
     if (this.secret) {
       const authHeader = req.headers['authorization'];
       const expected = `Bearer ${this.secret}`;
@@ -139,7 +138,7 @@ export class ToolCallbackServer {
       }
     }
 
-    // BL-030: Enforce body size limit
+    // Enforce body size limit
     let body = '';
     let bodyLength = 0;
 
@@ -181,7 +180,7 @@ export class ToolCallbackServer {
 
     const { tool_name, arguments: args } = parsed;
 
-    // ARCH-001 / UX-006 / EFF-008: request_id comes exclusively from POST body
+    // request_id comes exclusively from the POST body
     const requestId = parsed.request_id;
     if (!requestId) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -189,7 +188,7 @@ export class ToolCallbackServer {
       return;
     }
 
-    // SEC-001: Validate tool_name against registered set
+    // Validate tool_name against the registered set
     if (this.registeredToolNames && !this.registeredToolNames.has(tool_name)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: `Unknown tool: ${tool_name}` }));

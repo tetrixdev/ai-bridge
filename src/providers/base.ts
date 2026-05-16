@@ -41,7 +41,7 @@ export interface ExecutionContext {
 }
 
 /**
- * ARCH-001 / EFF-004: Shared subprocess finalization helper.
+ * Shared subprocess finalization helper.
  *
  * Manages the race between the readline 'close' event and the child process
  * 'close' event — the 'done' event must not be sent until both have fired.
@@ -104,7 +104,7 @@ export function createFinalizer(opts: {
       });
       opts.onEvent({ event: 'done', data: {} });
     } else {
-      // UX-030: Clean exit but no terminal event — emit a non-fatal error.
+      // Clean exit but no terminal event — emit a non-fatal error.
       opts.onEvent({
         event: 'error',
         data: {

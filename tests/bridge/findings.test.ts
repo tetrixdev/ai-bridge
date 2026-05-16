@@ -1,15 +1,9 @@
 /**
- * Unit tests for logic-bug findings resolved in the code review.
- *
- * Covers:
- *   BL-006 — NaN pruning of corrupted session records
- *   BL-012 — Codex duplicate done events
- *   SEC-003 — Clamping of server-provided timeout/heartbeat values
- *   SEC-009 — AI_BRIDGE_TOKEN/SERVER stripped from spawn env
- *
- * Moved to canonical locations (CONS-012, CONS-013):
- *   UX-005  formatStderrMessage tests → tests/providers/env.test.ts
- *   BL-001  getSystemPrompt tests → tests/session/store.test.ts
+ * Unit tests covering:
+ *   - NaN pruning of corrupted session records
+ *   - Codex / Gemini duplicate done-event guards
+ *   - Clamping of server-provided timeout/heartbeat values
+ *   - AI_BRIDGE_TOKEN/SERVER stripped from spawn env
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -21,7 +15,7 @@ import { buildSpawnEnv } from '../../src/providers/env.js';
 import { clampRequestTimeout, clampHeartbeat } from '../../src/utils/clamp.js';
 
 // ---------------------------------------------------------------------------
-// BL-006: NaN pruning — invalid last_used_at records must not persist
+// NaN pruning — invalid last_used_at records must not persist
 // ---------------------------------------------------------------------------
 
 describe('BL-006: SessionStore — invalid record validation on load', () => {
@@ -115,13 +109,12 @@ describe('BL-006: SessionStore — invalid record validation on load', () => {
 });
 
 // ---------------------------------------------------------------------------
-// SEC-003: Clamping of server-provided timeout/heartbeat
+// Clamping of server-provided timeout/heartbeat
 // ---------------------------------------------------------------------------
 
 describe('SEC-003: Value clamping helpers', () => {
-  // EFF-002 / CONS-004: Import the real clampRequestTimeout / clampHeartbeat
-  // from src/utils/clamp.ts so that tests exercise actual production constants.
-  // Previously these tests hand-copied the formulas, hiding any constant drift.
+  // Imports the real clamp helpers from src/utils/clamp.ts so tests exercise
+  // the actual production constants.
 
   it('clamps request_timeout: 0 → 10', () => {
     expect(clampRequestTimeout(0)).toBe(10);
@@ -157,7 +150,7 @@ describe('SEC-003: Value clamping helpers', () => {
 });
 
 // ---------------------------------------------------------------------------
-// SEC-009: AI_BRIDGE_TOKEN / AI_BRIDGE_SERVER stripped from spawn env
+// AI_BRIDGE_TOKEN / AI_BRIDGE_SERVER stripped from spawn env
 // ---------------------------------------------------------------------------
 
 describe('SEC-009: buildSpawnEnv — bridge credential stripping', () => {
@@ -194,13 +187,8 @@ describe('SEC-009: buildSpawnEnv — bridge credential stripping', () => {
   });
 });
 
-// NOTE: formatStderrMessage tests moved to tests/providers/env.test.ts (CONS-012)
-// NOTE: getSystemPrompt tests moved to tests/session/store.test.ts (CONS-013)
-
 // ---------------------------------------------------------------------------
-// BL-012: Codex duplicate done — settled guard
-// Tested via the CodexAdapter execute() behavior by exercising the logic path
-// where settled=true is set before turn.completed fires.
+// Codex duplicate done — settled guard
 // ---------------------------------------------------------------------------
 
 describe('BL-012: Codex settled guard (direct logic test)', () => {
@@ -210,7 +198,7 @@ describe('BL-012: Codex settled guard (direct logic test)', () => {
     const events: string[] = [];
 
     const emitDone = () => {
-      if (settled) return; // BL-012 guard
+      if (settled) return; // duplicate-done guard
       events.push('done');
       settled = true;
     };
@@ -236,8 +224,8 @@ describe('BL-012: Codex settled guard (direct logic test)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// BL-002: Gemini settled guard — result event after fatal error must not emit
-// a second done event
+// Gemini settled guard — result event after fatal error must not emit a
+// second done event
 // ---------------------------------------------------------------------------
 
 describe('BL-002: Gemini settled guard (direct logic test)', () => {
@@ -252,9 +240,9 @@ describe('BL-002: Gemini settled guard (direct logic test)', () => {
       settled = true;
     };
 
-    // Simulate the result handler with the BL-002 guard
+    // Simulate the result handler with the settled guard
     const handleResult = () => {
-      if (settled) return; // BL-002 guard
+      if (settled) return; // duplicate-done guard
       events.push('done');
       settled = true;
     };

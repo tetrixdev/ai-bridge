@@ -71,13 +71,11 @@ program
     const serverUrl = opts.server;
 
     if (!token) {
-      // UX-022: Add actionable guidance on where to obtain the token
       log.error('Authentication token is required. Use --token <token> or set AI_BRIDGE_TOKEN. Generate a token from your web application (see README for details).');
       process.exit(1);
     }
 
     if (!serverUrl) {
-      // UX-022: Add hint about expected URL format
       log.error('Server URL is required. Use --server <url> or set AI_BRIDGE_SERVER. Use the wss:// address provided by your web application (e.g. wss://your-app.com/api/ai-bridge/ws).');
       process.exit(1);
     }
@@ -88,14 +86,13 @@ program
       process.exit(1);
     }
 
-    // BL-013: Warn about unencrypted connections
+    // Warn about unencrypted connections
     if (serverUrl.startsWith('ws://')) {
-      // CONS-011: Removed 'WARNING:' prefix — the logger already adds [WRN] label
       log.warn('Connecting over unencrypted ws://. Use wss:// in production.');
     }
 
-    // SEC-006: Reject URLs that contain username/password components to prevent
-    // URL authority confusion (e.g. wss://legit.com@attacker.com/ws)
+    // Reject URLs with username/password components to prevent URL authority
+    // confusion (e.g. wss://legit.com@attacker.com/ws)
     try {
       const parsedUrl = new URL(serverUrl);
       if (parsedUrl.username || parsedUrl.password) {
@@ -112,18 +109,13 @@ program
     // -----------------------------------------------------------------------
 
     const providers = await detectProviders();
-    // EFF-001: Use the full provider list (available + unavailable) for the
-    // hello message capability declaration; filter separately for the UI check.
     const availableProviders = providers.filter((p) => p.available);
 
     if (availableProviders.length === 0 && !opts.test) {
-      // UX-005 / UX-006: Warn BEFORE connecting so the user understands the bridge is
-      // non-functional before it spends time establishing a WebSocket session.
+      // Warn BEFORE connecting so the user knows the bridge is non-functional.
       log.warn('No AI CLI tools detected. The bridge will NOT be able to execute requests.');
       log.warn('Install one of: codex (https://github.com/openai/codex), claude (https://claude.ai/download), gemini (https://github.com/google-gemini/gemini-cli)');
       log.warn('Or use --test flag to run in test mode with mock responses.');
-      // UX-005: Restate the functional consequence so it remains visible after
-      // the connection succeeds and does not get confused for a normal state.
       log.warn('AI requests will fail until a provider CLI is installed. See install links above.');
       log.warn('Connecting anyway so the server knows a bridge is present...');
     } else if (availableProviders.length > 0) {
@@ -141,8 +133,7 @@ program
     ];
 
     const adapters = new Map<string, ProviderAdapter>();
-    // EFF-002: Run listModels() concurrently across all available providers,
-    // consistent with how detectProviders probes are run in parallel.
+    // Run listModels() concurrently across all available providers.
     const availableAdapters = adapterInstances.filter((adapter) => {
       const capability = providers.find((p) => p.name === adapter.providerName);
       return capability?.available === true;
@@ -189,8 +180,6 @@ program
       if (opts.test) {
         log.info('Test mode active — waiting for ai_request messages...');
       }
-      // UX-006: The pre-connection warning already covers the no-providers case.
-      // Removing this redundant second warning (the user was already informed).
     });
 
     bridge.on('disconnected', (code, reason) => {
@@ -200,7 +189,6 @@ program
     bridge.on('error', (err) => {
       log.error('Bridge error', { error: err.message });
 
-      // UX-001: Use typed error instead of string matching to detect fatal errors
       if (err instanceof FatalBridgeError) {
         process.exit(1);
       }
@@ -210,9 +198,6 @@ program
       log.info(`Processing request ${requestId} with ${provider}${opts.test ? ' (test mode)' : ''}`);
     });
 
-    // UX-020: Use info level so operators can see request completions without
-    // enabling --debug.  This makes the log symmetric (start and end are both
-    // at info level).
     bridge.on('request_end', (requestId) => {
       log.info(`Request ${requestId} completed`);
     });
@@ -230,10 +215,8 @@ program
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-    // UX-021: Unhandled rejections indicate a code bug that left the bridge in
-    // an unknown state.  Log the error, attempt a graceful disconnect to flush
-    // any in-flight requests, then exit so the operator has a clear signal that
-    // the process needs to be restarted.
+    // Unhandled rejections leave the bridge in an unknown state — log, attempt
+    // a graceful disconnect, then exit so the operator restarts the process.
     process.on('unhandledRejection', (reason) => {
       log.error('Unhandled rejection — bridge is in an unknown state, exiting (restart the bridge to recover)', {
         error: reason instanceof Error ? reason.message : String(reason),
@@ -255,10 +238,8 @@ program
 // Run
 // ---------------------------------------------------------------------------
 
-// ARCH-001: Guard execution so that importing this module (e.g. from tooling
-// or tests that resolve package.json `main`) does not immediately invoke the
-// CLI and call process.exit().  When this file is run directly via Node (as
-// it is when installed via `bin`), import.meta.url matches process.argv[1].
+// Guard execution so importing this module does not invoke the CLI.  When run
+// directly via Node, import.meta.url matches process.argv[1].
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   program.parseAsync(process.argv).catch((err: unknown) => {
     log.error('Fatal error', { error: err instanceof Error ? err.message : String(err) });

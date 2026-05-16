@@ -194,7 +194,7 @@ describe('ToolResolver', () => {
       await expect(promise).rejects.toThrow();
     });
 
-    // UX-011: singular/plural correctness at the 60-second boundary
+    // singular/plural correctness at the 60-second boundary
     it('uses "1 minute" (singular) when timeout is exactly 60 seconds', async () => {
       resolver.setTimeoutMs(60_000); // exactly 60s
       const promise = resolver.call(mockSendFn, 'req-1', 'tc-60s', 'myTool', {});

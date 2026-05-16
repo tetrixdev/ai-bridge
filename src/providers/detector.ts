@@ -34,11 +34,8 @@ const CLI_PROBES: CliProbe[] = [
     versionArgs: ['--version'],
     parseVersion: (output) => extractVersion(output),
     supports_streaming: true,
-    // BL-004: Codex supports server-defined bridge tools. The bridge injects the
-    // tool wrapper-script directory onto PATH and runs `codex exec` with a
-    // workspace-write sandbox + network access so the wrapper scripts can make
-    // their loopback callback to the bridge. The available tool commands are
-    // also described in Codex's prompt. See codex.ts for the full mechanism.
+    // Codex supports server-defined bridge tools via wrapper scripts on PATH.
+    // See codex.ts for the full mechanism.
     supports_tools: true,
     supports_thinking: true,
     supports_session_resume: true,
@@ -89,11 +86,8 @@ async function probeOne(probe: CliProbe): Promise<ProviderCapability> {
   };
 
   try {
-    // SEC-005: Remove bridge credential variables from the probe environment.
-    // Version probes run arbitrary binaries from PATH; a malicious binary
-    // named 'claude' or 'codex' would receive the token in its environment
-    // (accessible via /proc/<pid>/environ on Linux) before the bridge has
-    // even connected to the server.
+    // Remove bridge credential variables from the probe environment — version
+    // probes run arbitrary binaries from PATH that must not see the token.
     const probeEnv = { ...process.env };
     delete probeEnv['AI_BRIDGE_TOKEN'];
     delete probeEnv['AI_BRIDGE_SERVER'];
@@ -128,7 +122,3 @@ export async function detectProviders(): Promise<ProviderCapability[]> {
   log.info(`Detection complete: ${available.length}/${results.length} providers available`);
   return results;
 }
-
-// EFF-001: detectAvailableProviders was exported but never used. Removed to
-// keep the module surface minimal. cli.ts uses the equivalent inline filter
-// on detectProviders() output. Re-add and export if future callers need it.

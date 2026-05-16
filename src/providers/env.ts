@@ -6,7 +6,7 @@
  * adapter implementations.
  */
 
-/** SEC-005: Maximum stderr buffer size (10 KB). */
+/** Maximum stderr buffer size (10 KB). */
 const MAX_STDERR_BYTES = 10 * 1024;
 
 /**
@@ -27,10 +27,8 @@ export function buildSpawnEnv(toolScriptDir: string | null, requestId?: string):
   if (requestId) {
     env['AI_BRIDGE_REQUEST_ID'] = requestId;
   }
-  // SEC-009: Remove bridge credential variables from the child process environment.
-  // AI CLIs have no use for these values, and keeping them in the env leaks the
-  // connection token into /proc/<pid>/environ on Linux (accessible to other users)
-  // and into any debug logging the CLI itself might perform.
+  // Remove bridge credential variables from the child process environment so
+  // the token does not leak into /proc/<pid>/environ or the CLI's own logging.
   delete env['AI_BRIDGE_TOKEN'];
   delete env['AI_BRIDGE_SERVER'];
   return env;
@@ -47,32 +45,23 @@ export function buildSpawnEnv(toolScriptDir: string | null, requestId?: string):
  * @param userMessage   The user's actual request message.
  * @returns A single string with the system prompt followed by the user message.
  */
-// SEC-004 (nitpick): The "User request:" separator is a plain-text string.
-// A user message containing that exact prefix on its own line could
-// theoretically cause the AI to misparse the prompt boundary.  Using a more
-// distinctive separator (e.g. a UUID-prefixed marker) would harden this, but
-// exploitation requires a server that already has full control over both sides
-// of the conversation — a trusted principal.  Documented here as a known,
-// accepted limitation.
 export function buildCombinedPrompt(systemPrompt: string, userMessage: string): string {
   return `${systemPrompt}\n\nUser request:\n${userMessage}`;
 }
 
 /**
- * SEC-005 / UX-007: Append a chunk to a stderr buffer, capping at
- * MAX_STDERR_BYTES (10 KB).
+ * Append a chunk to a stderr buffer, capping at MAX_STDERR_BYTES (10 KB).
  *
- * We keep the FIRST 10 KB rather than the last, because the beginning of CLI
- * stderr almost always contains the root-cause error (authentication failures,
- * missing config, etc.), while the tail tends to contain less useful stack
- * traces.
+ * Keeps the FIRST 10 KB rather than the last, because the beginning of CLI
+ * stderr almost always contains the root-cause error while the tail tends to
+ * be less useful stack traces.
  *
  * @param buffer  Current buffer contents.
  * @param chunk   New data to append.
  * @returns The updated (possibly truncated) buffer.
  */
 export function appendStderr(buffer: string, chunk: string): string {
-  // UX-007: Once we have 10 KB, stop accumulating — root-cause is already there.
+  // Once we have 10 KB, stop accumulating — root-cause is already there.
   if (buffer.length >= MAX_STDERR_BYTES) {
     return buffer;
   }
@@ -84,7 +73,7 @@ export function appendStderr(buffer: string, chunk: string): string {
 }
 
 /**
- * UX-005: Produce a user-friendly error message from raw CLI stderr output.
+ * Produce a user-friendly error message from raw CLI stderr output.
  *
  * Detects common known patterns (auth failures, rate limits) and returns a
  * clear actionable message.  Strips ANSI escape codes and limits to the first
@@ -119,8 +108,7 @@ export function formatStderrMessage(provider: string, stderr: string, exitCode: 
     lower.includes('sign in') ||
     lower.includes('credentials')
   ) {
-    // UX-004: Codex uses `codex login`, while Claude and Gemini use `<provider> auth login`.
-    // Using a generic `auth login` suffix for Codex would produce a non-existent command.
+    // Codex uses `codex login`; Claude and Gemini use `<provider> auth login`.
     const authCmd = provider === 'codex' ? `${provider} login` : `${provider} auth login`;
     return `Authentication required — run \`${authCmd}\` to re-authenticate.`;
   }

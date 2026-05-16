@@ -67,12 +67,8 @@ export interface BridgeOptions {
 const DEFAULT_HEARTBEAT_SECONDS = 30;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS = 300;
 
-// BL-008: MAX_RECONNECT_ATTEMPTS is set high enough to cover typical server
-// maintenance windows.  With exponential backoff (1s, 2s, 4s, 8s, then
-// capped at 15s) the first 4 attempts take ~15s total; each subsequent attempt
-// adds 15s.  MAX=100 gives roughly (15 + 96×15) = ~1455s (~24 min) of retries
-// at negligible cost.  Infinite retry could mask configuration errors, so a
-// large-but-finite limit is preferred.
+// Large-but-finite cap (~24 min of retries with backoff); infinite retry could
+// mask configuration errors.
 const MAX_RECONNECT_ATTEMPTS = 100;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 15_000; // Cap at 15s per PROTOCOL.md
@@ -91,7 +87,7 @@ export interface BridgeEvents {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Escape XML characters in message content (SEC-003)
+// Helper: Escape XML characters in message content
 // ---------------------------------------------------------------------------
 
 function escapeXml(text: string): string {
@@ -99,13 +95,13 @@ function escapeXml(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Build a synthetic AiRequestMessage from a session reset (ARCH-010)
+// Helper: Build a synthetic AiRequestMessage from a session reset
 // ---------------------------------------------------------------------------
 
 /**
  * Construct an AiRequestMessage from a SessionResetMessage by extracting
  * the last user message and folding prior history into the system prompt
- * using XML-tagged structure to prevent prompt injection (SEC-003).
+ * using XML-tagged structure to prevent prompt injection.
  *
  * Returns null if no user message is found in history.
  */
@@ -115,7 +111,7 @@ function buildSessionResetRequest(
 ): AiRequestMessage | null {
   const { request_id, conversation_id, provider, history, options } = originalMsg;
 
-  // BL-017: Validate history roles — warn if unexpected values encountered
+  // Validate history roles — warn if unexpected values encountered
   const validRoles = new Set(['user', 'assistant', 'system']);
   const unexpectedRoles = history
     .map((h) => h.role)
@@ -126,7 +122,6 @@ function buildSessionResetRequest(
     });
   }
 
-  // EFF-010: Use findLastIndex instead of two-step find-then-lastIndexOf
   const lastUserIdx = history.findLastIndex((h) => h.role === 'user');
   if (lastUserIdx === -1) {
     return null;
@@ -137,14 +132,11 @@ function buildSessionResetRequest(
   // Build conversation context from prior history (excluding the last user message)
   const rawPriorHistory = history.slice(0, lastUserIdx);
 
-  // SEC-013: Exclude entries with unexpected roles from the history XML block.
-  // Forwarding unknown roles verbatim widens the injection surface — an entry
-  // with role="tool_instructions" could cause some AI models to treat crafted
-  // content as authoritative instructions.
+  // Exclude entries with unexpected roles to avoid widening the injection
+  // surface (an unknown role could be treated as authoritative instructions).
   const priorHistory = rawPriorHistory.filter((h) => validRoles.has(h.role));
 
-  // SEC-003: Wrap history in XML tags to prevent prompt injection.
-  // Escape < and > in message content to prevent tag injection.
+  // Wrap history in XML tags (with escaped content) to prevent prompt injection.
   let enhancedSystemPrompt: string | null;
   if (priorHistory.length > 0) {
     const historyXml = priorHistory
@@ -153,7 +145,7 @@ function buildSessionResetRequest(
 
     const historyBlock = `<conversation_history>\n${historyXml}\n</conversation_history>`;
 
-    // BL-013: If system_prompt is null/empty, use only the history context
+    // If system_prompt is null/empty, use only the history context
     enhancedSystemPrompt = currentSystemPrompt
       ? `${currentSystemPrompt}\n\n${historyBlock}`
       : historyBlock;
@@ -176,15 +168,6 @@ function buildSessionResetRequest(
 // Bridge Class
 // ---------------------------------------------------------------------------
 
-/**
- * ARCH-004 (DELIBERATELY DEFERRED): Bridge is a ~950-line class that owns
- * WebSocket lifecycle, protocol routing, AI request execution, heartbeat
- * management, and subsystem instantiation simultaneously.  This concentration
- * of responsibility is a known architectural concern.  Refactoring into smaller
- * collaborators (e.g. separating reconnection/heartbeat and request execution)
- * requires a dedicated effort beyond the current PR scope.  Future reviewers:
- * this is intentional and tracked — please do not re-file it as a new finding.
- */
 export class Bridge extends EventEmitter<BridgeEvents> {
   private ws: WebSocket | null = null;
   private readonly serverUrl: string;
@@ -203,7 +186,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     heartbeat_interval: DEFAULT_HEARTBEAT_SECONDS,
     request_timeout: DEFAULT_REQUEST_TIMEOUT_SECONDS,
   };
-  /** ARCH-002: Timer to detect a missing welcome message after hello is sent. */
+  /** Timer to detect a missing welcome message after hello is sent. */
   private welcomeTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
 
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -214,14 +197,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private isShuttingDown = false;
   private activeRequests = new Map<string, AbortController>();
   /**
-   * UX-006: Request IDs that were aborted because the WebSocket dropped while
-   * they were in flight.  No 'done' event could be sent over the closed socket,
-   * so the server (and the browser) never learns these requests terminated.
-   * On the next successful welcome, these are replayed as session_expired
-   * errors so the browser exits its loading state.
+   * Request IDs aborted because the WebSocket dropped while they were in
+   * flight. No terminal event could be sent over the closed socket, so on the
+   * next welcome these are replayed as session_expired errors to release the
+   * browser's loading state.
    */
   private abortedRequestIds: string[] = [];
-  /** SEC-002: Random secret for authenticating tool callback HTTP requests. */
+  /** Random secret for authenticating tool callback HTTP requests. */
   private readonly callbackSecret: string;
 
   constructor(options: BridgeOptions) {
@@ -233,11 +215,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.testMode = options.testMode ?? false;
     this.onTestRequest = options.onTestRequest;
 
-    // SEC-002: Generate a random secret for callback server authentication
+    // Generate a random secret for callback server authentication
     this.callbackSecret = crypto.randomBytes(32).toString('hex');
 
-    // ARCH-001: Pass sendFn directly to the callback server constructor
-    // so HTTP-based tool calls from scripts are forwarded over WebSocket.
+    // Forwards HTTP-based tool calls from scripts over the WebSocket.
     const sendFn = (reqId: string, tcId: string, tName: string, tArgs: Record<string, unknown>) => {
       this.send({
         type: 'tool_call',
@@ -263,12 +244,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   /**
    * Initiate the WebSocket connection to the server.
    *
-   * SEC-002: The token is sent as an Authorization: Bearer header so it does
-   * NOT appear in server/proxy access logs (which typically record the full
-   * request URL including query parameters).  The token is also kept in the
-   * URL query parameter as a backward-compatible fallback for servers that
-   * have not yet adopted the header-based flow; this can be removed once all
-   * companion server deployments support the header.
+   * The token is sent as an Authorization: Bearer header so it does NOT appear
+   * in server/proxy access logs.  It is also kept in the URL query parameter as
+   * a backward-compatible fallback for servers that have not yet adopted the
+   * header-based flow.
    *
    * NOTE: When passing --token on the command line the value is still visible
    * in process listings (ps aux).  Prefer the AI_BRIDGE_TOKEN environment
@@ -282,11 +261,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
     // Keep token in query param for backward compatibility, but also send it
     // in the Authorization header as the primary (log-safe) channel.
-    // SEC-001 (DEFERRED): The ?token= query parameter is visible in reverse-proxy
-    // access logs, unlike the Authorization header above.  This fallback is kept
-    // intentionally for servers that have not yet adopted header-based auth.
-    // Remove url.searchParams.set() once all companion server deployments support
-    // Authorization header authentication.
     const url = new URL(this.serverUrl);
     url.searchParams.set('token', this.token);
     const wsUrl = url.toString();
@@ -296,10 +270,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.ws = new WebSocket(wsUrl, {
       headers: {
         'User-Agent': `ai-bridge/${BRIDGE_VERSION}`,
-        // SEC-002: Send token via Authorization header (not visible in proxy logs)
+        // Send token via Authorization header (not visible in proxy logs)
         'Authorization': `Bearer ${this.token}`,
       },
-      // SEC-004: Limit incoming message size to 10MB to prevent memory exhaustion
+      // Limit incoming message size to 10MB to prevent memory exhaustion
       maxPayload: 10 * 1024 * 1024,
     });
 
@@ -319,10 +293,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.toolResolver.cancelAll();
     this.toolManager.cleanupScripts();
     await this.callbackServer.stop();
-    // ARCH-005: Persist last_used_at updates that accumulated in memory since
-    // the last set()/delete() persist.  Without this, sessions used between
-    // bridge restarts could appear stale (premature TTL expiry) because their
-    // last_used_at was only updated in memory via get().
+    // Persist in-memory last_used_at updates so sessions don't appear stale
+    // (premature TTL expiry) after a bridge restart.
     this.sessionStore.flush();
 
     // Cancel active requests
@@ -391,7 +363,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         break;
       case 'pong':
         log.debug('Pong received', { timestamp: message.timestamp });
-        // BL-004: Mark pong received and clear the timeout
+        // Mark pong received and clear the timeout
         this.awaitingPong = false;
         if (this.pongTimeoutTimer) {
           clearTimeout(this.pongTimeoutTimer);
@@ -410,35 +382,28 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     const reasonStr = reason.toString();
     log.info('WebSocket closed', { code, reason: reasonStr });
     this.stopHeartbeat();
-    // ARCH-002: Clear welcome timeout if connection closes before welcome arrives
+    // Clear welcome timeout if connection closes before welcome arrives
     if (this.welcomeTimeoutTimer) {
       clearTimeout(this.welcomeTimeoutTimer);
       this.welcomeTimeoutTimer = null;
     }
     this.ws = null;
-    // BL-003: Clear the stale session ID so the welcome-timeout guard on the
-    // next reconnect correctly detects a missing welcome.  Otherwise the guard
-    // sees the previous connection's sessionId, assumes a welcome arrived, and
-    // skips the reconnect — leaving the bridge stalled if the server is slow.
+    // Clear the stale session ID so the welcome-timeout guard on the next
+    // reconnect correctly detects a missing welcome.
     this.sessionId = null;
 
-    // BL-006: Cancel all pending tool resolvers immediately on WebSocket close
-    // to fail in-flight tool calls instead of letting them stall for 30s.
+    // Cancel all pending tool resolvers immediately on WebSocket close to fail
+    // in-flight tool calls instead of letting them stall.
     this.toolResolver.cancelAll();
 
-    // ARCH-006: Abort all active AI requests on unexpected disconnect so
-    // their CLI subprocesses are terminated.  Without this, the CLIs continue
-    // running after reconnect, streaming events that are silently dropped
-    // (send() returns early when ws is null), and the server never receives a
-    // done event for the original requests — leaving their conversation slots
-    // blocked until the server's own timeout fires.
+    // Abort all active AI requests on unexpected disconnect so their CLI
+    // subprocesses are terminated; otherwise the server never receives a done
+    // event and the conversation slot stays blocked until its timeout fires.
     if (!this.isShuttingDown) {
       for (const [id, controller] of this.activeRequests) {
         controller.abort();
-        // UX-006: Record the aborted request so it can be replayed as a
-        // session_expired error after reconnect.  The WebSocket is already
-        // closed here, so no terminal event can be delivered for it now —
-        // without the replay the browser stays stuck in a loading state.
+        // Record the aborted request so it can be replayed as a
+        // session_expired error after reconnect.
         this.abortedRequestIds.push(id);
         log.debug('Aborted active request on disconnect', { requestId: id });
       }
@@ -450,16 +415,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (!this.isShuttingDown) {
       // Check for authentication rejection — don't retry, exit immediately
       if (code === 4001) {
-        // ARCH-003: Clean up tool scripts and callback server before emitting fatal error
+        // Clean up tool scripts and callback server before emitting fatal error
         this.toolManager.cleanupScripts();
         this.callbackServer.stop().catch(() => {
           // Best-effort cleanup; ignore errors during shutdown
         });
 
         this.isShuttingDown = true;
-        // UX-002: Removed duplicate log.error here — the emitted error event
-        // (handled by cli.ts) is sufficient.
-        // UX-020: Include token source guidance in the error message.
         this.emit(
           'error',
           new FatalBridgeError(
@@ -501,9 +463,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       providers: this.providers.filter((p) => p.available).map((p) => p.name),
     });
 
-    // ARCH-002: Start a 15-second timeout.  If no welcome is received within
-    // that window the server silently dropped our hello (bug, misconfiguration,
-    // or version mismatch).  Close and reconnect so we don't stall forever.
+    // If no welcome arrives within 15s the server silently dropped our hello;
+    // close and reconnect so we don't stall forever.
     this.welcomeTimeoutTimer = setTimeout(() => {
       this.welcomeTimeoutTimer = null;
       if (!this.sessionId && !this.isShuttingDown) {
@@ -514,7 +475,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   }
 
   private async handleWelcome(message: WelcomeMessage): Promise<void> {
-    // ARCH-002: Cancel the welcome-timeout now that we've received the welcome.
+    // Cancel the welcome-timeout now that we've received the welcome.
     if (this.welcomeTimeoutTimer) {
       clearTimeout(this.welcomeTimeoutTimer);
       this.welcomeTimeoutTimer = null;
@@ -522,7 +483,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.sessionId = message.session_id;
     this.serverConfig = message.config;
 
-    // BL-033: Check protocol version compatibility if the server provides one
+    // Check protocol version compatibility if the server provides one
     if (message.protocol_version) {
       const serverMajor = message.protocol_version.split('.')[0];
       const bridgeMajor = PROTOCOL_VERSION.split('.')[0];
@@ -534,11 +495,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       }
     }
 
-    // SEC-003 / BL-004: Clamp request_timeout to a safe range before applying.
-    // A malicious or misconfigured server could send 0 (immediate timeout) or a
-    // huge value (indefinite hang / resource leak).  Accepted range: 10–3600 s.
-    // EFF-002: Use the imported clampRequestTimeout() so tests exercise the same
-    // constants as production code (no copied formulas in the test file).
+    // Clamp request_timeout to a safe range (10–3600 s) before applying — a
+    // malicious or misconfigured server could send 0 or a huge value.
     if (message.config.request_timeout) {
       const raw = message.config.request_timeout;
       const clamped = clampRequestTimeout(raw);
@@ -549,21 +507,20 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         });
       }
       this.toolResolver.setTimeoutMs(clamped * 1000);
-      // BL-001: Write the clamped value back so generateScripts (below) uses
-      // the same timeout as the tool resolver, not the raw unclamped value.
+      // Write the clamped value back so generateScripts (below) uses the same
+      // timeout as the tool resolver.
       this.serverConfig.request_timeout = clamped;
     }
 
     // Register tools from the server
     this.toolManager.register(message.tools);
 
-    // BL-001: Update the callback server's validation set so it accepts
-    // tool calls for the tools we just registered.
+    // Update the callback server's validation set so it accepts tool calls
+    // for the tools we just registered.
     this.callbackServer.setRegisteredToolNames(this.toolManager.getRegisteredNames());
 
-    // UX-003: Notify the server about any tools that were rejected during
-    // registration (unsafe names / reserved names).  This allows the server
-    // to surface a warning to administrators or users who rely on those tools.
+    // Notify the server about any tools rejected during registration (unsafe
+    // or reserved names) so it can surface a warning.
     const rejectedTools = this.toolManager.getRejectedToolNames();
     if (rejectedTools.length > 0) {
       this.send({
@@ -581,8 +538,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         await this.callbackServer.start();
         const port = this.callbackServer.getPort();
         if (port) {
-          // BL-013: Pass the server-configured request timeout so the bash
-          // script's HTTP timeout matches the bridge-side tool resolver timeout.
+          // Pass the server-configured request timeout so the bash script's
+          // HTTP timeout matches the bridge-side tool resolver timeout.
           this.toolManager.generateScripts(port, this.callbackSecret, this.serverConfig.request_timeout * 1000);
           log.info('Tool scripts generated', {
             count: message.tools.length,
@@ -594,9 +551,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         log.error('Failed to set up tool callback server', {
           error: err instanceof Error ? err.message : String(err),
         });
-        // UX-002: Notify the server so it can surface a warning to the user.
-        // All tool calls will fail for this session because the local HTTP
-        // callback server could not be started.
+        // Notify the server so it can warn the user — all tool calls will fail
+        // for this session because the callback server could not start.
         this.send({
           type: 'error',
           request_id: 'setup',
@@ -607,10 +563,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       }
     }
 
-    // Start heartbeat — config.heartbeat_interval is in SECONDS.
-    // SEC-003 / BL-007: Clamp to a safe range to prevent a ping flood (0 ms)
-    // or an excessively long dead-connection window (>300 s).
-    // EFF-002: Use the imported clampHeartbeat() so tests exercise the same constants.
+    // Start heartbeat — config.heartbeat_interval is in SECONDS.  Clamp to a
+    // safe range to prevent a ping flood or an excessively long dead-connection
+    // window.
     const rawHeartbeat = message.config.heartbeat_interval;
     const clampedHeartbeat = clampHeartbeat(rawHeartbeat);
     if (clampedHeartbeat !== rawHeartbeat) {
@@ -630,11 +585,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
     this.emit('welcome', this.sessionId);
 
-    // UX-006: Replay any requests that were aborted by a previous disconnect.
-    // Their CLI subprocesses were killed and no terminal event could be sent
-    // over the (already closed) socket.  Emit a session_expired error for each
-    // now that the connection is back, so the browser exits its loading state
-    // instead of waiting for the server's own multi-minute timeout.
+    // Replay any requests aborted by a previous disconnect as session_expired
+    // errors now that the connection is back, so the browser exits its loading
+    // state instead of waiting for the server's own timeout.
     if (this.abortedRequestIds.length > 0) {
       const replayed = this.abortedRequestIds;
       this.abortedRequestIds = [];
@@ -653,7 +606,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
   /**
    * Handle an incoming ai_request: send ack, then execute.
-   * BL-004: The ack is sent here; executeAiRequestInternal does the actual work.
    */
   private handleAiRequest(message: AiRequestMessage): void {
     const { request_id, provider, conversation_id } = message;
@@ -663,18 +615,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       ? this.sessionStore.get(conversation_id)
       : null;
 
-    // BL-001: If a conversation_id was provided but no session was found AND
-    // the message has no system_prompt (i.e. this is a follow-up, not a new
-    // conversation), send a session_expired error and return early.
-    //
-    // Continuing to execute here would produce two conflicting signals to the
-    // server: a session_expired error AND a streamed response from a brand-new
-    // CLI session that has no prior context.  The server's session_reset flow
-    // exists specifically to recover this situation by replaying history.
-    //
-    // The server is expected to surface this to the user as:
-    //   "Your previous conversation context expired. Starting a new conversation."
-    // before triggering a session_reset to replay history.
+    // If a conversation_id was provided but no session was found AND the
+    // message has no system_prompt (a follow-up, not a new conversation), send
+    // a session_expired error and return early.  Continuing would produce two
+    // conflicting signals: an error AND a streamed response from a context-less
+    // CLI session.  The server's session_reset flow recovers from this.
     if (conversation_id && !existingCliSessionId && !message.system_prompt) {
       log.warn('Session not found for conversation — notifying server', {
         conversationId: conversation_id,
@@ -691,9 +636,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return;
     }
 
-    // Send ai_request_ack with the CLI session ID.
-    // CONS-008: Use null (not the magic string 'new') when there is no existing
-    // session, consistent with the null-for-absence pattern elsewhere.
+    // Send ai_request_ack with the CLI session ID (null when there is no
+    // existing session).
     this.send({
       type: 'ai_request_ack',
       request_id,
@@ -706,7 +650,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
   /**
    * Internal request execution logic shared by handleAiRequest and handleSessionReset.
-   * BL-004: Does NOT send ai_request_ack — the caller is responsible for that.
+   * Does NOT send ai_request_ack — the caller is responsible for that.
    */
   private executeAiRequestInternal(
     message: AiRequestMessage,
@@ -743,7 +687,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     const adapter = this.adapters.get(provider);
     if (!adapter) {
       log.error('No adapter for requested provider', { provider });
-      // UX-012: Include install guidance in the error message.
       const installHints: Record<string, string> = {
         codex: ' Install the Codex CLI (https://github.com/openai/codex) on the machine running the bridge and restart it.',
         claude: ' Install the Claude CLI (https://claude.ai/download) on the machine running the bridge and restart it.',
@@ -792,8 +735,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   ): Promise<void> {
     const { request_id, conversation_id } = request;
 
-    // ARCH-001: requestId is now part of ExecutionContext instead of being
-    // set on the callback server via setCurrentRequestId().
     // Build execution context
     const context: ExecutionContext = {
       request,
@@ -821,8 +762,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       cliSessionId,
     };
 
-    // BL-011: Wrap in try/finally to ensure session mapping is persisted
-    // even if the adapter throws after producing a session ID.
+    // Wrap in try/finally to ensure the session mapping is persisted even if
+    // the adapter throws after producing a session ID.
     let newCliSessionId: string | null = null;
     try {
       // Run the adapter — it returns the new CLI session ID
@@ -830,9 +771,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         this.sendStreamEvent(request_id, event.event, event.data);
       });
     } finally {
-      // Store the session mapping for future resume.
-      // BL-005: Also persist system_prompt so session resets can restore it
-      // even when the server omits system_prompt from the session_reset message.
+      // Store the session mapping for future resume.  Also persist
+      // system_prompt so session resets can restore it even when the server
+      // omits it from the session_reset message.
       if (newCliSessionId && conversation_id) {
         this.sessionStore.set(
           conversation_id,
@@ -847,24 +788,20 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   /**
    * Handle a session_reset message by constructing a synthetic ai_request
    * from the conversation history and executing it without sending an ack.
-   * BL-004: Calls executeAiRequestInternal directly (no ack for session_reset).
-   * ARCH-010: Uses the buildSessionResetRequest pure function.
    */
   private handleSessionReset(message: SessionResetMessage): void {
     const { request_id, conversation_id } = message;
 
-    // BL-005: Retrieve the stored system prompt BEFORE deleting the session,
-    // so it can be used as a fallback if the server omits system_prompt from
-    // the session_reset message.
+    // Retrieve the stored system prompt BEFORE deleting the session, so it can
+    // be used as a fallback if the server omits system_prompt.
     const storedSystemPrompt = this.sessionStore.getSystemPrompt(conversation_id);
 
     // Delete the old session so the adapter starts fresh
     const deleted = this.sessionStore.delete(conversation_id);
     log.info('Session reset', { conversationId: conversation_id, found: deleted, historyLength: message.history.length });
 
-    // BL-005: Prefer the server-provided system_prompt; fall back to the stored
-    // one if the server omits it (which it may do when treating it as already
-    // embedded in history).
+    // Prefer the server-provided system_prompt; fall back to the stored one if
+    // the server omits it.
     const effectiveSystemPrompt = message.system_prompt ?? storedSystemPrompt;
     if (!message.system_prompt && storedSystemPrompt) {
       log.warn('session_reset has no system_prompt — using stored system prompt for this conversation', {
@@ -872,7 +809,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       });
     }
 
-    // ARCH-010: Extract history reconstruction into a pure function
     const syntheticRequest = buildSessionResetRequest(message, effectiveSystemPrompt);
 
     if (!syntheticRequest) {
@@ -888,7 +824,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
 
     log.info('Re-processing session_reset as new ai_request', { requestId: request_id, provider: message.provider });
-    // BL-004: Call internal handler directly — no ack for session_reset
     this.executeAiRequestInternal(syntheticRequest);
   }
 
@@ -897,8 +832,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (message.fatal) {
       log.error('Fatal server error — disconnecting');
       this.isShuttingDown = true;
-      // BL-002: Clean up tool scripts and callback server (best-effort) before
-      // closing, matching what the 4001 close path already does.
+      // Clean up tool scripts and callback server (best-effort) before closing.
       this.toolManager.cleanupScripts();
       this.callbackServer.stop().catch(() => {
         // Best-effort cleanup; ignore errors during shutdown
@@ -918,8 +852,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         this.send({ type: 'ping', timestamp: Date.now() });
         log.debug('Ping sent');
 
-        // BL-004: Set a 10-second timeout for the pong response.
-        // If no pong arrives, treat the connection as dead.
+        // Set a 10-second timeout for the pong response; if none arrives,
+        // treat the connection as dead.
         this.awaitingPong = true;
         if (this.pongTimeoutTimer) {
           clearTimeout(this.pongTimeoutTimer);
@@ -957,7 +891,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         attempts: this.reconnectAttempts,
         max: MAX_RECONNECT_ATTEMPTS,
       });
-      // UX-010: Include recovery guidance in the exhaustion message
       this.emit(
         'error',
         new FatalBridgeError(
@@ -974,9 +907,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     );
 
     this.reconnectAttempts++;
-    // UX-007: Human-readable reconnect log so operators can gauge progress
-    // without mental arithmetic (seconds instead of milliseconds, and a
-    // budget position so they know when to give up waiting).
     log.info(`Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
 
     this.reconnectTimer = setTimeout(() => {

@@ -25,7 +25,7 @@ const log = createLogger('ToolManager');
 /** Strict pattern for safe tool names: must start with a letter, alphanumeric/underscore/hyphen only. */
 const SAFE_TOOL_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
 
-/** SEC-003: Expanded denylist of system binary names that must not be used as tool names. */
+/** Denylist of system binary names that must not be used as tool names. */
 const RESERVED_TOOL_NAMES = new Set([
   'curl', 'wget', 'node', 'npm', 'npx', 'bash', 'sh', 'zsh',
   'python', 'python3', 'ruby', 'perl', 'git', 'ssh', 'scp',
@@ -40,7 +40,7 @@ const RESERVED_TOOL_NAMES = new Set([
 export class ToolManager {
   private tools = new Map<string, ToolDefinition>();
   private scriptDir: string | null = null;
-  /** UX-003: Names of tools most recently rejected by register(). */
+  /** Names of tools most recently rejected by register(). */
   private rejectedTools: string[] = [];
 
   /**
@@ -63,9 +63,8 @@ export class ToolManager {
         continue;
       }
 
-      // SEC-006: Check against denylist of system binary names (case-insensitive).
-      // On macOS the default filesystem is case-insensitive, so a tool named
-      // 'Curl' would shadow the system 'curl' binary in the PATH-injected dir.
+      // Check against the denylist case-insensitively — on case-insensitive
+      // filesystems (macOS) a tool named 'Curl' would shadow the system 'curl'.
       if (RESERVED_TOOL_NAMES.has(tool.name.toLowerCase())) {
         log.error('Rejected tool with reserved name', {
           name: tool.name,
@@ -78,7 +77,7 @@ export class ToolManager {
       this.tools.set(tool.name, tool);
     }
 
-    // UX-003: Expose rejected tool names so the bridge can notify the server.
+    // Expose rejected tool names so the bridge can notify the server.
     this.rejectedTools = rejectedTools;
 
     if (rejectedTools.length > 0) {
@@ -92,8 +91,7 @@ export class ToolManager {
   }
 
   /**
-   * UX-003: Return the list of tool names that were rejected during the last
-   * register() call.  The bridge uses this to notify the server.
+   * Return the list of tool names rejected during the last register() call.
    */
   getRejectedToolNames(): string[] {
     return this.rejectedTools;
@@ -139,10 +137,10 @@ export class ToolManager {
    *
    * @param callbackPort  The local HTTP port the bridge is listening on
    *                      for tool call callbacks from spawned scripts.
-   * @param secret        Optional bearer token for callback server auth (SEC-002).
-   * @param timeoutMs     BL-013: HTTP timeout for the callback request in ms.
-   *                      Should match the server-configured request_timeout so
-   *                      the bash script does not outlive the bridge-side timeout.
+   * @param secret        Optional bearer token for callback server auth.
+   * @param timeoutMs     HTTP timeout for the callback request in ms.  Should
+   *                      match the server-configured request_timeout so the
+   *                      bash script does not outlive the bridge-side timeout.
    *                      Defaults to 300 000 ms (5 min).
    * @returns The path to the temporary directory containing the scripts.
    */
@@ -156,8 +154,8 @@ export class ToolManager {
     for (const tool of this.tools.values()) {
       const scriptPath = path.join(this.scriptDir, tool.name);
       const scriptContent = this.buildScript(tool, callbackPort, secret, timeoutMs);
-      // SEC-001: Use 0o700 (owner-only) instead of 0o755 to prevent other
-      // local users from reading the embedded callback bearer secret.
+      // 0o700 (owner-only) so other local users cannot read the embedded
+      // callback bearer secret.
       fs.writeFileSync(scriptPath, scriptContent, { mode: 0o700 });
       log.debug('Generated tool script', { tool: tool.name, path: scriptPath });
     }
@@ -194,13 +192,9 @@ export class ToolManager {
   /**
    * Build the Bash script content for a single tool.
    *
-   * EFF-006: Uses a single Node.js invocation that handles input parsing,
-   * payload building, HTTP call, and output extraction.
-   *
-   * SEC-002: Embeds bearer token for callback server authentication.
-   *
-   * Tool names are pre-validated by register() so they are safe to embed.
-   * Tool descriptions are NOT included in the script to prevent injection.
+   * Embeds the bearer token for callback server authentication.  Tool names
+   * are pre-validated by register() so they are safe to embed; tool
+   * descriptions are NOT included to prevent injection.
    */
   private buildScript(tool: ToolDefinition, callbackPort: number, secret?: string, timeoutMs: number = 300_000): string {
     const secretArg = secret ?? '';
@@ -216,8 +210,8 @@ if [ ! -t 0 ]; then
   STDIN_DATA=$(cat)
 fi
 
-# EFF-006: Single Node.js invocation for input parsing, payload building,
-# HTTP call, and output extraction.
+# Single Node.js invocation for input parsing, payload building, HTTP call,
+# and output extraction.
 node -e '
 const http = require("http");
 const stdinData = process.argv[1];
@@ -259,9 +253,8 @@ const req = http.request({ hostname: "127.0.0.1", port: ${callbackPort}, path: "
 req.on("error", (e) => { process.stderr.write("Tool call failed: " + e.message + "\\n"); process.exit(1); });
 req.write(payload);
 req.end();
-// SEC-005 (nitpick): $RANDOM has weak entropy (~33 bits).  The callback server
-// overrides this value with a cryptographically strong UUID before use, so the
-// bash-generated ID is discarded and never becomes the authoritative tool_call_id.
+// The $RANDOM-based ID here is discarded — the callback server overrides it
+// with a cryptographically strong UUID before use.
 ' "$STDIN_DATA" "${tool.name}" "tc_\${RANDOM}\${RANDOM}" "\${AI_BRIDGE_REQUEST_ID:-}" "${secretArg}"
 `;
   }

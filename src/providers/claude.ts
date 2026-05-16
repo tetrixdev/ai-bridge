@@ -74,11 +74,10 @@ export class ClaudeAdapter extends ProviderAdapter {
       args.push('--max-tokens', String(request.options.max_tokens));
     }
 
-    // UX-003: Enable Bash tool access when server-defined tools are available.
-    // The wrapper scripts are invoked via bash, so Claude needs --allowedTools bash.
-    // IMPORTANT: Use --allowedTools=bash (equals sign syntax) because --allowedTools
-    // is a variadic CLI option (<tools...>) that would otherwise consume ALL remaining
-    // positional arguments — including the user's prompt message.
+    // Enable Bash tool access when server-defined tools are available (wrapper
+    // scripts are invoked via bash).  Use the --allowedTools=bash equals-sign
+    // syntax: --allowedTools is variadic and would otherwise consume all
+    // remaining positional arguments, including the user's prompt message.
     if (context.tools.length > 0 && context.toolScriptDir) {
       args.push('--allowedTools=bash');
     }
@@ -86,7 +85,7 @@ export class ClaudeAdapter extends ProviderAdapter {
     // The user message is the final argument
     args.push(userMessage);
 
-    // EFF-003: Only build the truncated arg array when debug logging is active
+    // Only build the truncated arg array when debug logging is active
     if (isDebugEnabled()) {
       log.debug('Spawning claude', { args: args.map((a) => a.length > 50 ? a.substring(0, 50) + '...' : a) });
     }
@@ -113,7 +112,6 @@ export class ClaudeAdapter extends ProviderAdapter {
       };
       signal.addEventListener('abort', onAbort, { once: true });
 
-      // ARCH-001: Use shared finalizer from base.ts to avoid duplication.
       // Track stderr in a variable so the finalizer closure can access it.
       let stderrBuffer = '';
 
@@ -154,11 +152,8 @@ export class ClaudeAdapter extends ProviderAdapter {
         }
 
         if (type === 'assistant') {
-          // BL-008: A late readline-buffered assistant event can arrive after the
-          // stream is already settled (result + done emitted). Emitting further
-          // block events here would violate the protocol. The full settled guard
-          // is intentionally not applied (low-priority edge case per review); log
-          // only so the situation can be diagnosed if it ever occurs in practice.
+          // A late readline-buffered assistant event can arrive after the
+          // stream is already settled; log it for diagnosis.
           if (settled) {
             log.debug('Assistant event received after stream settled — block events would be emitted post-done', {
               sessionId,
@@ -293,7 +288,7 @@ export class ClaudeAdapter extends ProviderAdapter {
           return;
         }
 
-        // UX-029: Surface rate_limit_event to the server so it can notify the user.
+        // Surface rate_limit_event to the server so it can notify the user.
         if (type === 'rate_limit_event') {
           log.warn('Claude rate limit event', { type });
           onEvent({
@@ -309,17 +304,16 @@ export class ClaudeAdapter extends ProviderAdapter {
         log.debug('Unhandled Claude event type', { type });
       });
 
-      // ARCH-001: Use shared finalizer callbacks
       rl.on('close', finalizer.onRlClose);
 
-      // Capture stderr for error logging (SEC-005: capped at 10KB)
+      // Capture stderr for error logging (capped at 10KB)
       child.stderr.on('data', (chunk: Buffer) => {
         stderrBuffer = appendStderr(stderrBuffer, chunk.toString());
       });
 
       child.on('error', (err: NodeJS.ErrnoException) => {
         log.error('Failed to spawn claude', { error: err.message });
-        // UX-002: Provide user-friendly message for ENOENT
+        // Provide user-friendly message for ENOENT
         const errorMessage = err.code === 'ENOENT'
           ? 'claude CLI not found. Install it or ensure it is on your PATH.'
           : `Failed to spawn claude: ${err.message}`;

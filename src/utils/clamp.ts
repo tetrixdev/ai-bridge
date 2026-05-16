@@ -1,10 +1,8 @@
 /**
  * Clamping utilities for server-provided configuration values.
  *
- * Extracted from Bridge.handleWelcome() so that the exact production
- * constants and logic can be imported by both the bridge and the test
- * suite — preventing drift between test copies and real code (EFF-002 /
- * ARCH-003 / CONS-004).
+ * Shared by the bridge and the test suite so both exercise the same
+ * constants and logic.
  */
 
 /** Accepted range for the server-provided request_timeout (seconds). */

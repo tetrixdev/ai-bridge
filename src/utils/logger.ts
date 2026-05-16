@@ -28,7 +28,7 @@ export function setDebug(enabled: boolean): void {
   currentLevel = enabled ? 'debug' : 'info';
 }
 
-/** EFF-003: Returns true if debug logging is currently enabled. */
+/** Returns true if debug logging is currently enabled. */
 export function isDebugEnabled(): boolean {
   return currentLevel === 'debug';
 }
@@ -44,8 +44,6 @@ function shouldLog(level: LogLevel): boolean {
 function formatMessage(level: LogLevel, component: string, message: string, meta?: Record<string, unknown>): string {
   const ts = formatTimestamp();
   const label = LEVEL_LABEL[level];
-  // UX-010: Message before metadata so lines scan left-to-right naturally,
-  // e.g. "Connected to server {"url":"wss://..."}" instead of the reverse.
   const metaStr = meta ? ' ' + JSON.stringify(meta) : '';
   return `${ts} [${label}] [${component}] ${message}${metaStr}`;
 }

@@ -35,19 +35,12 @@ const log = createLogger('CodexAdapter');
  * gpt-5.2-codex (the Codex CLI default) is NOT available on ChatGPT Team
  * plans. gpt-5.3-codex is the best coding-optimized model that works
  * with both API key and ChatGPT auth modes.
- *
- * UX-033 (DEFERRED): If OpenAI retires or renames this model, users who rely
- * on the default will receive a confusing "model not found" error from the CLI.
- * A future improvement would validate this identifier against the Codex models
- * cache at startup and warn (or fall back to the first available model) when
- * the default is not found.  This requires understanding the Codex CLI API
- * contract and is beyond the current PR scope.
  */
 const DEFAULT_MODEL = 'gpt-5.3-codex';
 
 /**
- * BL-004: Build a system-prompt note that tells Codex about the server-defined
- * bridge tools available for this request.
+ * Build a system-prompt note that tells Codex about the server-defined bridge
+ * tools available for this request.
  *
  * The bridge exposes each server-registered tool as a bash wrapper script on
  * PATH whose filename is the tool name. Codex has no protocol-level concept of
@@ -94,7 +87,7 @@ export class CodexAdapter extends ProviderAdapter {
         'exec', 'resume', cliSessionId,
         '--json',
       ];
-      // BL-012: Pass model flag on resume if specified in request options
+      // Pass model flag on resume if specified in request options
       if (request.options?.model) {
         args.push('-m', request.options.model);
       }
@@ -110,22 +103,12 @@ export class CodexAdapter extends ProviderAdapter {
       ];
     }
 
-    // BL-004: Server-defined bridge tools support.
-    //
-    // The bridge implements server-registered tools as generated bash wrapper
-    // scripts placed in `context.toolScriptDir`. When invoked, each wrapper
-    // makes a loopback HTTP callback to the bridge's local tool-callback server.
-    //
-    // Codex's `exec` sandbox defaults to read-only and blocks network access,
-    // which would prevent the wrapper script's loopback callback from working.
-    // When server tools are present we therefore:
-    //   - run with `-s workspace-write` so model-generated shell commands may run
-    //   - enable `sandbox_workspace_write.network_access=true` so the wrapper's
-    //     loopback HTTP callback to the bridge succeeds
-    //   - set `approval_policy=never` so non-interactive `exec` does not stall
-    //     waiting for an approval prompt that nobody can answer
-    // These flags are intentionally NOT added for plain (tool-less) requests so
-    // those keep Codex's safer default sandbox.
+    // Server-defined bridge tools support.  Codex's `exec` sandbox defaults to
+    // read-only with no network access, which would block the wrapper script's
+    // loopback callback.  When tools are present we run with workspace-write,
+    // network access enabled, and approval_policy=never (so non-interactive
+    // exec does not stall on an approval prompt).  Tool-less requests keep
+    // Codex's safer default sandbox.
     const hasTools = context.tools.length > 0;
     if (hasTools) {
       args.push(
@@ -153,19 +136,16 @@ export class CodexAdapter extends ProviderAdapter {
       args.push(userMessage);
     }
 
-    // UX-009: Codex CLI does not support max_tokens directly.
-    // Only log a bridge-side warning; do NOT emit a stream error event to the
-    // server.  The server has no actionable response (it cannot retroactively
-    // remove max_tokens), and emitting an error before every response that
-    // includes max_tokens confuses users who see an "error" before a perfectly
-    // successful reply.
+    // Codex CLI does not support max_tokens directly — log a warning only; do
+    // not emit a stream error (the server has no actionable response and it
+    // would confuse users who see an error before a successful reply).
     if (request.options?.max_tokens) {
       log.warn('max_tokens option specified but Codex CLI does not support it directly — ignoring', {
         max_tokens: request.options.max_tokens,
       });
     }
 
-    // EFF-003 / CONS-004: Guard truncation behind debug check; also align limit to 50
+    // Only build the truncated arg array when debug logging is active
     if (isDebugEnabled()) {
       log.debug('Spawning codex', { args: args.map((a) => a.length > 50 ? a.substring(0, 50) + '...' : a) });
     }
@@ -175,11 +155,9 @@ export class CodexAdapter extends ProviderAdapter {
       let blockIndex = 0;
       let settled = false;
 
-      // BL-004: Server-defined bridge tools are supported by Codex.
-      // The bridge generates bash wrapper scripts in `context.toolScriptDir`;
-      // prepending that directory to PATH makes the tool commands invocable as
-      // ordinary shell commands by Codex's model-generated commands. When there
-      // are no tools we pass null so PATH is left untouched.
+      // Prepend the tool-script directory to PATH so the wrapper commands are
+      // invocable by Codex's model-generated shell commands; pass null when
+      // there are no tools so PATH is left untouched.
       if (hasTools) {
         log.info('Server-defined tools enabled for Codex request', {
           toolCount: context.tools.length,
@@ -199,7 +177,6 @@ export class CodexAdapter extends ProviderAdapter {
       };
       signal.addEventListener('abort', onAbort, { once: true });
 
-      // ARCH-001: Use shared finalizer from base.ts to avoid duplication.
       // Track stderr in a variable so the finalizer closure can access it.
       let stderrBuffer = '';
 
@@ -303,7 +280,7 @@ export class CodexAdapter extends ProviderAdapter {
               event: 'error',
               data: { code: 'provider_error', message },
             });
-            // CONS-003: Emit done event after error so the server always gets a terminal event.
+            // Emit done after error so the server always gets a terminal event.
             onEvent({ event: 'done', data: {} });
             settled = true;
           }
@@ -315,9 +292,8 @@ export class CodexAdapter extends ProviderAdapter {
 
         // ── turn.completed ─────────────────────────────────
         if (type === 'turn.completed') {
-          // BL-012: Guard against duplicate done events. If an error item was
-          // already processed (and set settled=true), Codex may still emit a
-          // turn.completed — emitting a second done would be a protocol violation.
+          // Guard against duplicate done events — an error item may already
+          // have settled the stream before turn.completed arrives.
           if (settled) return;
 
           const usage = parsed['usage'] as Record<string, unknown> | undefined;
@@ -373,17 +349,16 @@ export class CodexAdapter extends ProviderAdapter {
         log.debug('Unhandled Codex event type', { type });
       });
 
-      // ARCH-001: Use shared finalizer callbacks
       rl.on('close', finalizer.onRlClose);
 
-      // Capture stderr for error logging (SEC-005: capped at 10KB)
+      // Capture stderr for error logging (capped at 10KB)
       child.stderr.on('data', (chunk: Buffer) => {
         stderrBuffer = appendStderr(stderrBuffer, chunk.toString());
       });
 
       child.on('error', (err: NodeJS.ErrnoException) => {
         log.error('Failed to spawn codex', { error: err.message });
-        // UX-002: Provide user-friendly message for ENOENT
+        // Provide user-friendly message for ENOENT
         const errorMessage = err.code === 'ENOENT'
           ? 'codex CLI not found. Install it or ensure it is on your PATH.'
           : `Failed to spawn codex: ${err.message}`;
@@ -437,7 +412,6 @@ export class CodexAdapter extends ProviderAdapter {
           is_default: m.slug === DEFAULT_MODEL,
         }));
     } catch (err) {
-      // UX-009: Include guidance about populating the models cache
       log.warn('Failed to read Codex models cache. Run codex once to populate models cache. Showing default model only.', {
         error: err instanceof Error ? err.message : String(err),
       });

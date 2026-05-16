@@ -17,7 +17,6 @@ describe('SessionStore', () => {
   beforeEach(() => {
     // Create a temporary directory to act as $HOME
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-bridge-test-'));
-    // CONS-013: Use vi.spyOn (idiomatic vitest pattern) instead of direct assignment
     vi.spyOn(os, 'homedir').mockReturnValue(tmpDir);
   });
 
@@ -208,8 +207,6 @@ describe('SessionStore', () => {
     });
   });
 
-  // CONS-013: Moved from tests/bridge/findings.test.ts to co-locate with other
-  // SessionStore tests (source: src/session/store.ts).
   describe('getSystemPrompt()', () => {
     it('stores and retrieves system_prompt alongside session', () => {
       const store = new SessionStore();
@@ -291,8 +288,8 @@ describe('SessionStore', () => {
       }
     });
 
-    // EFF-001: Migration should write back to disk so the old-format file is
-    // replaced, preventing re-migration on every subsequent restart.
+    // Migration writes back to disk so the old-format file is replaced,
+    // preventing re-migration on every subsequent restart.
     it('writes migrated data back to disk (EFF-001)', () => {
       const dirPath = path.join(tmpDir, '.ai-bridge');
       fs.mkdirSync(dirPath, { recursive: true });
@@ -322,8 +319,8 @@ describe('SessionStore', () => {
       expect(written['conv-eff'].cli_session_id).toBe('session-eff');
     });
 
-    // SEC-007: Migration validation — records with missing cli_session_id
-    // or invalid last_used_at in the old format must be skipped.
+    // Migration validation — records with missing cli_session_id or invalid
+    // last_used_at in the old format must be skipped.
     it('skips migrated records with missing cli_session_id (SEC-007)', () => {
       const dirPath = path.join(tmpDir, '.ai-bridge');
       fs.mkdirSync(dirPath, { recursive: true });

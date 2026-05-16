@@ -75,19 +75,16 @@ export class GeminiAdapter extends ProviderAdapter {
       args.push('--model', request.options.model);
     }
 
-    // UX-009: Gemini CLI does not support max_tokens directly.
-    // Only log a bridge-side warning; do NOT emit a stream error event to the
-    // server.  The server has no actionable response (it cannot retroactively
-    // remove max_tokens), and emitting an error before every response that
-    // includes max_tokens confuses users who see an "error" before a perfectly
-    // successful reply.
+    // Gemini CLI does not support max_tokens directly — log a warning only; do
+    // not emit a stream error (the server has no actionable response and it
+    // would confuse users who see an error before a successful reply).
     if (request.options?.max_tokens) {
       log.warn('max_tokens option specified but Gemini CLI does not support it directly — ignoring', {
         max_tokens: request.options.max_tokens,
       });
     }
 
-    // EFF-003: Guard truncation behind debug check
+    // Only build the truncated arg array when debug logging is active
     if (isDebugEnabled()) {
       log.debug('Spawning gemini', { args: args.map((a) => a.length > 50 ? a.substring(0, 50) + '...' : a) });
     }
@@ -113,7 +110,6 @@ export class GeminiAdapter extends ProviderAdapter {
       };
       signal.addEventListener('abort', onAbort, { once: true });
 
-      // ARCH-001: Use shared finalizer from base.ts to avoid duplication.
       // Track stderr in a variable so the finalizer closure can access it.
       let stderrBuffer = '';
 
@@ -291,9 +287,8 @@ export class GeminiAdapter extends ProviderAdapter {
           const message = parsed['message'] as string;
           log.warn('Gemini error event', { severity, message: message?.substring(0, 200) });
 
-          // For severity='error', inform the server via a stream error event.
-          // UX-029: For severity='warning' (e.g. rate limits), also forward to
-          // the server so it can surface an informational message to the user.
+          // severity='error' and severity='warning' are both forwarded to the
+          // server as stream events.
           if (severity === 'error') {
             onEvent({
               event: 'error',
@@ -302,14 +297,13 @@ export class GeminiAdapter extends ProviderAdapter {
                 message: message ?? 'Unknown Gemini error',
               },
             });
-            // BL-002: Fatal errors terminate the response — emit done and mark settled.
+            // Fatal errors terminate the response — emit done and mark settled.
             onEvent({ event: 'done', data: {} });
             settled = true;
           } else if (severity === 'warning') {
-            // UX-003: Warnings are non-fatal — map to a specific code based on content.
-            // Only assign 'rate_limited' when the message content indicates a rate limit;
-            // all other warning types use 'provider_warning' to avoid misleading users
-            // into waiting for a rate limit that does not exist (e.g. content policy warnings).
+            // Warnings are non-fatal — only use 'rate_limited' when the message
+            // indicates a rate limit, else 'provider_warning', so users are not
+            // misled into waiting for a non-existent rate limit.
             const lowerMsg = (message ?? '').toLowerCase();
             const isRateLimit =
               lowerMsg.includes('rate limit') ||
@@ -317,9 +311,8 @@ export class GeminiAdapter extends ProviderAdapter {
               lowerMsg.includes('quota') ||
               lowerMsg.includes('429') ||
               lowerMsg.includes('too many requests');
-            // UX-003: Pass Gemini's original warning text through directly. The raw
-            // message is more informative than a generic fallback; only fall back
-            // when Gemini provided no message at all.
+            // Pass Gemini's original warning text through directly; only fall
+            // back when Gemini provided no message at all.
             onEvent({
               event: 'error',
               data: {
@@ -333,10 +326,8 @@ export class GeminiAdapter extends ProviderAdapter {
 
         // ── result (final) ───────────────────────────────────
         if (type === 'result') {
-          // BL-002: Guard against duplicate done events. If a fatal 'error'
-          // event already settled this request (emitting done), the result
-          // event that follows must be ignored — emitting a second done is a
-          // protocol violation.
+          // Guard against duplicate done events — a fatal 'error' event may
+          // already have settled this request before result arrives.
           if (settled) return;
 
           // Close any open text block
@@ -386,17 +377,16 @@ export class GeminiAdapter extends ProviderAdapter {
         log.debug('Unhandled Gemini event type', { type });
       });
 
-      // ARCH-001: Use shared finalizer callbacks
       rl.on('close', finalizer.onRlClose);
 
-      // Capture stderr for error logging (SEC-005: capped at 10KB)
+      // Capture stderr for error logging (capped at 10KB)
       child.stderr.on('data', (chunk: Buffer) => {
         stderrBuffer = appendStderr(stderrBuffer, chunk.toString());
       });
 
       child.on('error', (err: NodeJS.ErrnoException) => {
         log.error('Failed to spawn gemini', { error: err.message });
-        // UX-002: Provide user-friendly message for ENOENT
+        // Provide user-friendly message for ENOENT
         const errorMessage = err.code === 'ENOENT'
           ? 'gemini CLI not found. Install it or ensure it is on your PATH.'
           : `Failed to spawn gemini: ${err.message}`;
