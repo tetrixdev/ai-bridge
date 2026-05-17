@@ -10,6 +10,7 @@
  *   npx @tetrixdev/ai-bridge --server wss://... --token <token> --test
  */
 
+import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { Bridge, FatalBridgeError } from './bridge.js';
@@ -238,9 +239,32 @@ program
 // Run
 // ---------------------------------------------------------------------------
 
-// Guard execution so importing this module does not invoke the CLI.  When run
-// directly via Node, import.meta.url matches process.argv[1].
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+/**
+ * Determine whether this module is being executed directly as the CLI entry
+ * point (as opposed to being imported by another module or a test).
+ *
+ * npm installs the package `bin` entry as a symlink
+ * (`node_modules/.bin/ai-bridge` -> `.../dist/cli.js`). When executed,
+ * `process.argv[1]` is the *symlink* path while `import.meta.url` resolves to
+ * the *real* file path, so a plain string comparison fails and the CLI exits
+ * silently without doing anything. Comparing the resolved real paths makes the
+ * check symlink-safe. `realpathSync` is wrapped in try/catch because either
+ * path may not exist on disk (e.g. argv1 from an unusual launcher).
+ *
+ * @param argv1     The script path Node was invoked with (`process.argv[1]`).
+ * @param moduleUrl This module's URL (`import.meta.url`).
+ */
+export function isMainModule(argv1: string | undefined, moduleUrl: string): boolean {
+  if (!argv1) return false;
+  try {
+    return realpathSync(argv1) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+// Guard execution so importing this module does not invoke the CLI.
+if (isMainModule(process.argv[1], import.meta.url)) {
   program.parseAsync(process.argv).catch((err: unknown) => {
     log.error('Fatal error', { error: err instanceof Error ? err.message : String(err) });
     process.exit(1);
