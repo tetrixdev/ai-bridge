@@ -711,13 +711,29 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
     this.executeRequest(adapter, message, cliSessionId, controller.signal)
       .catch((err) => {
+        const errMessage = err instanceof Error ? err.message : String(err);
+
+        // A failure on a request that attempted to RESUME an existing CLI
+        // session is treated as a recoverable "cannot_resume": the stored
+        // session is dropped so the next turn starts fresh, and the server is
+        // told it can recover by replaying history via session_reset. A
+        // genuinely unrelated failure (rate limit, etc.) simply resurfaces on
+        // the fresh retry, so this broad treatment is safe.
+        const wasResumeAttempt = cliSessionId !== null;
+        if (wasResumeAttempt && message.conversation_id) {
+          this.sessionStore.delete(message.conversation_id);
+        }
+
         log.error('Request execution failed', {
           requestId: request_id,
-          error: err instanceof Error ? err.message : String(err),
+          resumeAttempt: wasResumeAttempt,
+          error: errMessage,
         });
         this.sendStreamEvent(request_id, 'error', {
-          code: 'provider_error',
-          message: err instanceof Error ? err.message : String(err),
+          code: wasResumeAttempt ? 'cannot_resume' : 'provider_error',
+          message: wasResumeAttempt
+            ? `Could not resume the existing CLI session: ${errMessage}. The session has been cleared — retry to start a fresh one.`
+            : errMessage,
         });
         this.sendStreamEvent(request_id, 'done', {});
       })
