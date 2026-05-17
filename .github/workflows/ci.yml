@@ -84,6 +84,25 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The release tag is the single source of truth for the published
+      # version. Stamp package.json from the tag *before* building so the
+      # version constant injected into dist/cli.js matches what is published.
+      # This removes the need to hand-bump package.json before a release.
+      - name: Derive and validate version from release tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Release tag '$TAG' is not a valid semver version (expected vX.Y.Z)"
+            exit 1
+          fi
+          if npm view "@tetrixdev/ai-bridge@$VERSION" version > /dev/null 2>&1; then
+            echo "::error::Version $VERSION is already published to npm - bump the release tag"
+            exit 1
+          fi
+          echo "Publishing @tetrixdev/ai-bridge@$VERSION (from tag $TAG)"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
       - name: Build
         run: npm run build
 
