@@ -668,7 +668,8 @@ The server also tracks heartbeats. If no `ping` is received for 2x the heartbeat
 | `invalid_token` | Connection token invalid or expired | User generates a new token in web UI |
 | `provider_unavailable` | Requested CLI not installed on bridge | Server falls back or notifies user |
 | `provider_error` | CLI exited with non-zero code | Retry or notify user |
-| `session_expired` | CLI session not found locally | Server sends `session_reset` or starts fresh |
+| `session_expired` | CLI session not found locally (no resume attempted) | Server sends `session_reset` or starts fresh |
+| `cannot_resume` | A resume of an existing CLI session failed | Bridge has cleared the stale session; server replays history via `session_reset`, or the next turn starts fresh automatically |
 | `timeout` | Request exceeded `request_timeout` | Server notifies user, can retry |
 | `bridge_disconnected` | WebSocket connection lost | Auto-reconnect with backoff |
 | `tool_error` | Tool execution failed | CLI handles gracefully in response |
