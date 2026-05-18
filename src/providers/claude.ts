@@ -5,7 +5,7 @@
  *
  * CLI invocation:
  *   New session:    claude -p --output-format stream-json --verbose "user message"
- *   Resume session: claude -p --session-id <UUID> --output-format stream-json --verbose "user message"
+ *   Resume session: claude -p --resume <UUID> --output-format stream-json --verbose "user message"
  *   System prompt:  Passed via --system-prompt flag on first message
  *
  * Output format (NDJSON):
@@ -20,6 +20,7 @@ import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, appendStderr, formatStderrMessage } from './env.js';
 import { buildToolInstructions } from '../tools/prompt.js';
+import { resumeAwareErrorCode } from './session-error.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
@@ -54,9 +55,12 @@ export class ClaudeAdapter extends ProviderAdapter {
       '--verbose',                       // Required for stream-json in print mode
     ];
 
-    // Resume an existing session if we have a session ID
+    // Resume an existing session if we have a session ID. `--resume <id>`
+    // continues the conversation under the SAME session id (unlike
+    // `--session-id`, which creates a new session with a chosen id and errors
+    // with "Session ID is already in use" when that id already exists).
     if (cliSessionId) {
-      args.push('--session-id', cliSessionId);
+      args.push('--resume', cliSessionId);
       log.debug('Resuming session', { cliSessionId });
     }
 
@@ -280,6 +284,29 @@ export class ClaudeAdapter extends ProviderAdapter {
         if (type === 'result') {
           // Extract final session ID and usage from result
           sessionId = (parsed['session_id'] as string) ?? sessionId;
+
+          // An error `result` (e.g. subtype "error_during_execution") must NOT
+          // be reported as a successful `done` — that silently drops the turn.
+          // When the request tried to RESUME a session and the CLI could not
+          // find it, surface `session_lost` so the server recovers by
+          // re-issuing the turn fresh; any other error is a plain provider_error.
+          if (parsed['is_error'] === true) {
+            const errs = Array.isArray(parsed['errors']) ? parsed['errors'] : [];
+            const errText = errs.length > 0
+              ? errs.join('; ')
+              : String(parsed['subtype'] ?? 'Claude reported an error');
+
+            onEvent({
+              event: 'error',
+              data: {
+                code: resumeAwareErrorCode(context.cliSessionId, errText),
+                message: errText,
+              },
+            });
+            onEvent({ event: 'done', data: {} });
+            settled = true;
+            return;
+          }
 
           const usage = parsed['usage'] as Record<string, unknown> | undefined;
           const inputTokens = usage ? (usage['input_tokens'] as number) ?? null : null;

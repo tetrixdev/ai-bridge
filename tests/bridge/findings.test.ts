@@ -1,112 +1,13 @@
 /**
  * Unit tests covering:
- *   - NaN pruning of corrupted session records
  *   - Codex / Gemini duplicate done-event guards
  *   - Clamping of server-provided timeout/heartbeat values
  *   - AI_BRIDGE_TOKEN/SERVER stripped from spawn env
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
-import { SessionStore } from '../../src/session/store.js';
 import { buildSpawnEnv } from '../../src/providers/env.js';
 import { clampRequestTimeout, clampHeartbeat } from '../../src/utils/clamp.js';
-
-// ---------------------------------------------------------------------------
-// NaN pruning — invalid last_used_at records must not persist
-// ---------------------------------------------------------------------------
-
-describe('BL-006: SessionStore — invalid record validation on load', () => {
-  let tmpDir: string;
-
-  beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-bridge-bl006-'));
-    vi.spyOn(os, 'homedir').mockReturnValue(tmpDir);
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  it('skips records with missing cli_session_id', () => {
-    const dirPath = path.join(tmpDir, '.ai-bridge');
-    fs.mkdirSync(dirPath, { recursive: true });
-
-    const sessions = {
-      'bad-conv': {
-        // cli_session_id is missing
-        provider: 'claude',
-        created_at: new Date().toISOString(),
-        last_used_at: new Date().toISOString(),
-      },
-      'good-conv': {
-        cli_session_id: 'session-good',
-        provider: 'claude',
-        created_at: new Date().toISOString(),
-        last_used_at: new Date().toISOString(),
-      },
-    };
-
-    fs.writeFileSync(path.join(dirPath, 'sessions.json'), JSON.stringify(sessions));
-
-    const store = new SessionStore();
-    // Bad record should have been skipped — returns null
-    expect(store.get('bad-conv')).toBeNull();
-    // Good record should be available
-    expect(store.get('good-conv')).toBe('session-good');
-  });
-
-  it('skips records with invalid (NaN-producing) last_used_at', () => {
-    const dirPath = path.join(tmpDir, '.ai-bridge');
-    fs.mkdirSync(dirPath, { recursive: true });
-
-    const sessions = {
-      'nan-conv': {
-        cli_session_id: 'session-nan',
-        provider: 'claude',
-        created_at: new Date().toISOString(),
-        // Invalid date string — produces NaN from new Date().getTime()
-        last_used_at: '',
-      },
-      'good-conv': {
-        cli_session_id: 'session-good',
-        provider: 'claude',
-        created_at: new Date().toISOString(),
-        last_used_at: new Date().toISOString(),
-      },
-    };
-
-    fs.writeFileSync(path.join(dirPath, 'sessions.json'), JSON.stringify(sessions));
-
-    const store = new SessionStore();
-    // Record with invalid date should be skipped (not returned indefinitely)
-    expect(store.get('nan-conv')).toBeNull();
-    // Good record should still be available
-    expect(store.get('good-conv')).toBe('session-good');
-  });
-
-  it('does not skip records with valid last_used_at', () => {
-    const dirPath = path.join(tmpDir, '.ai-bridge');
-    fs.mkdirSync(dirPath, { recursive: true });
-
-    const sessions = {
-      'valid-conv': {
-        cli_session_id: 'session-valid',
-        provider: 'claude',
-        created_at: new Date().toISOString(),
-        last_used_at: new Date().toISOString(),
-      },
-    };
-
-    fs.writeFileSync(path.join(dirPath, 'sessions.json'), JSON.stringify(sessions));
-
-    const store = new SessionStore();
-    expect(store.get('valid-conv')).toBe('session-valid');
-  });
-});
 
 // ---------------------------------------------------------------------------
 // Clamping of server-provided timeout/heartbeat

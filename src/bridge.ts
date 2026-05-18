@@ -24,19 +24,19 @@ import type {
   BridgeToServerMessage,
   ServerToBridgeMessage,
   AiRequestMessage,
-  SessionResetMessage,
+  ConversationEntry,
   WelcomeMessage,
   ToolDefinition,
   ServerConfig,
   StreamEventType,
   StreamEventData,
+  DoneData,
 } from './protocol/types.js';
 import { PROTOCOL_VERSION, BRIDGE_VERSION } from './protocol/version.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './providers/base.js';
 import { ToolManager } from './tools/manager.js';
 import { ToolResolver } from './tools/resolver.js';
 import { ToolCallbackServer } from './tools/callback-server.js';
-import { SessionStore } from './session/store.js';
 import { createLogger } from './utils/logger.js';
 import { clampRequestTimeout, clampHeartbeat } from './utils/clamp.js';
 import { FatalBridgeError } from './errors.js';
@@ -95,73 +95,49 @@ function escapeXml(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Build a synthetic AiRequestMessage from a session reset
+// Helper: Seed a fresh CLI session with prior conversation history
 // ---------------------------------------------------------------------------
 
 /**
- * Construct an AiRequestMessage from a SessionResetMessage by extracting
- * the last user message and folding prior history into the system prompt
- * using XML-tagged structure to prevent prompt injection.
+ * Fold prior conversation history into the system prompt so a fresh CLI
+ * session starts with context.
  *
- * Returns null if no user message is found in history.
+ * Used when cli_session_id is null but the conversation already has history —
+ * e.g. the first turn after the server reset a lost session. History is
+ * wrapped in XML tags with escaped content so prior turns cannot be
+ * interpreted as authoritative instructions (prompt-injection hardening).
+ *
+ * Returns the system prompt unchanged when there is no history to fold in.
  */
-function buildSessionResetRequest(
-  originalMsg: SessionResetMessage,
-  currentSystemPrompt: string | null,
-): AiRequestMessage | null {
-  const { request_id, conversation_id, provider, history, options } = originalMsg;
-
-  // Validate history roles — warn if unexpected values encountered
+function foldHistoryIntoSystemPrompt(
+  history: ConversationEntry[],
+  systemPrompt: string | null,
+): string | null {
   const validRoles = new Set(['user', 'assistant', 'system']);
+
   const unexpectedRoles = history
     .map((h) => h.role)
     .filter((role) => !validRoles.has(role));
   if (unexpectedRoles.length > 0) {
-    log.warn('Session reset history contains unexpected role values', {
+    log.warn('Conversation history contains unexpected role values', {
       unexpectedRoles: [...new Set(unexpectedRoles)],
     });
   }
 
-  const lastUserIdx = history.findLastIndex((h) => h.role === 'user');
-  if (lastUserIdx === -1) {
-    return null;
-  }
-
-  const lastUserMessage = history[lastUserIdx];
-
-  // Build conversation context from prior history (excluding the last user message)
-  const rawPriorHistory = history.slice(0, lastUserIdx);
-
   // Exclude entries with unexpected roles to avoid widening the injection
   // surface (an unknown role could be treated as authoritative instructions).
-  const priorHistory = rawPriorHistory.filter((h) => validRoles.has(h.role));
-
-  // Wrap history in XML tags (with escaped content) to prevent prompt injection.
-  let enhancedSystemPrompt: string | null;
-  if (priorHistory.length > 0) {
-    const historyXml = priorHistory
-      .map((h) => `<message role="${escapeXml(h.role)}">${escapeXml(h.content)}</message>`)
-      .join('\n');
-
-    const historyBlock = `<conversation_history>\n${historyXml}\n</conversation_history>`;
-
-    // If system_prompt is null/empty, use only the history context
-    enhancedSystemPrompt = currentSystemPrompt
-      ? `${currentSystemPrompt}\n\n${historyBlock}`
-      : historyBlock;
-  } else {
-    enhancedSystemPrompt = currentSystemPrompt;
+  const priorHistory = history.filter((h) => validRoles.has(h.role));
+  if (priorHistory.length === 0) {
+    return systemPrompt;
   }
 
-  return {
-    type: 'ai_request',
-    request_id,
-    conversation_id,
-    provider,
-    message: lastUserMessage.content,
-    system_prompt: enhancedSystemPrompt,
-    options,
-  };
+  const historyXml = priorHistory
+    .map((h) => `<message role="${escapeXml(h.role)}">${escapeXml(h.content)}</message>`)
+    .join('\n');
+  const historyBlock = `<conversation_history>\n${historyXml}\n</conversation_history>`;
+
+  // If system_prompt is null/empty, use only the history context.
+  return systemPrompt ? `${systemPrompt}\n\n${historyBlock}` : historyBlock;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +152,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly adapters: Map<string, ProviderAdapter>;
   private readonly toolManager = new ToolManager();
   private readonly toolResolver = new ToolResolver();
-  private readonly sessionStore = new SessionStore();
   private readonly callbackServer: ToolCallbackServer;
   private readonly testMode: boolean;
   private readonly onTestRequest?: BridgeOptions['onTestRequest'];
@@ -199,7 +174,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   /**
    * Request IDs aborted because the WebSocket dropped while they were in
    * flight. No terminal event could be sent over the closed socket, so on the
-   * next welcome these are replayed as session_expired errors to release the
+   * next welcome these are replayed as terminal errors to release the
    * browser's loading state.
    */
   private abortedRequestIds: string[] = [];
@@ -293,9 +268,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.toolResolver.cancelAll();
     this.toolManager.cleanupScripts();
     await this.callbackServer.stop();
-    // Persist in-memory last_used_at updates so sessions don't appear stale
-    // (premature TTL expiry) after a bridge restart.
-    this.sessionStore.flush();
 
     // Cancel active requests
     for (const [id, controller] of this.activeRequests) {
@@ -352,9 +324,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       case 'ai_request':
         this.handleAiRequest(message);
         break;
-      case 'session_reset':
-        this.handleSessionReset(message);
-        break;
       case 'tool_resolve':
         this.toolResolver.resolve(message.tool_call_id, message.result);
         break;
@@ -403,7 +372,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       for (const [id, controller] of this.activeRequests) {
         controller.abort();
         // Record the aborted request so it can be replayed as a
-        // session_expired error after reconnect.
+        // terminal error after reconnect.
         this.abortedRequestIds.push(id);
         log.debug('Aborted active request on disconnect', { requestId: id });
       }
@@ -585,18 +554,18 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
     this.emit('welcome', this.sessionId);
 
-    // Replay any requests aborted by a previous disconnect as session_expired
-    // errors now that the connection is back, so the browser exits its loading
-    // state instead of waiting for the server's own timeout.
+    // Replay any requests aborted by a previous disconnect as terminal errors
+    // now that the connection is back, so the browser exits its loading state
+    // instead of waiting for the server's own timeout.
     if (this.abortedRequestIds.length > 0) {
       const replayed = this.abortedRequestIds;
       this.abortedRequestIds = [];
       for (const requestId of replayed) {
-        log.info('Replaying aborted request as session_expired error', { requestId });
+        log.info('Replaying aborted request as a terminal error', { requestId });
         this.send({
           type: 'error',
           request_id: requestId,
-          code: 'session_expired',
+          code: 'bridge_disconnected',
           message: 'Request aborted: the bridge connection dropped while the response was streaming.',
           fatal: false,
         });
@@ -606,59 +575,50 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
   /**
    * Handle an incoming ai_request: send ack, then execute.
+   *
+   * The server owns the conversation→CLI-session mapping. `message.cli_session_id`
+   * is the session to resume (non-null) or null to start fresh. On a fresh
+   * start, `message.history` (when present) is folded into the system prompt
+   * so the new CLI session is seeded with context — e.g. the first turn after
+   * the server reset a lost session.
    */
   private handleAiRequest(message: AiRequestMessage): void {
-    const { request_id, provider, conversation_id } = message;
+    const { request_id } = message;
+    const cliSessionId = message.cli_session_id ?? null;
 
-    // Look up existing CLI session for this conversation
-    const existingCliSessionId = conversation_id
-      ? this.sessionStore.get(conversation_id)
-      : null;
-
-    // If a conversation_id was provided but no session was found AND the
-    // message has no system_prompt (a follow-up, not a new conversation), send
-    // a session_expired error and return early.  Continuing would produce two
-    // conflicting signals: an error AND a streamed response from a context-less
-    // CLI session.  The server's session_reset flow recovers from this.
-    if (conversation_id && !existingCliSessionId && !message.system_prompt) {
-      log.warn('Session not found for conversation — notifying server', {
-        conversationId: conversation_id,
-      });
-      this.send({
-        type: 'error',
-        request_id,
-        code: 'session_expired',
-        message: `No local session found for conversation ${conversation_id}`,
-        fatal: false,
-      });
-      // Do NOT proceed: the server will send a session_reset with full history
-      // to allow the bridge to reconstruct the context.
-      return;
-    }
-
-    // Send ai_request_ack with the CLI session ID (null when there is no
-    // existing session).
+    // Acknowledge receipt, echoing the session the server asked us to use.
     this.send({
       type: 'ai_request_ack',
       request_id,
-      cli_session_id: existingCliSessionId ?? null,
+      cli_session_id: cliSessionId,
     });
 
-    // Delegate to the internal handler (shared with session reset)
-    this.executeAiRequestInternal(message, existingCliSessionId);
+    // Fresh session: seed the new CLI session with any prior history the
+    // server sent. A resumed session already holds its own context.
+    let effectiveMessage = message;
+    if (cliSessionId === null && message.history && message.history.length > 0) {
+      log.debug('Seeding fresh CLI session with prior history', {
+        conversationId: message.conversation_id,
+        historyLength: message.history.length,
+      });
+      effectiveMessage = {
+        ...message,
+        system_prompt: foldHistoryIntoSystemPrompt(message.history, message.system_prompt),
+      };
+    }
+
+    this.executeAiRequestInternal(effectiveMessage, cliSessionId);
   }
 
   /**
-   * Internal request execution logic shared by handleAiRequest and handleSessionReset.
-   * Does NOT send ai_request_ack — the caller is responsible for that.
+   * Internal request execution: resolve the adapter and run the request.
+   * Does NOT send ai_request_ack — handleAiRequest does that.
    */
   private executeAiRequestInternal(
     message: AiRequestMessage,
-    existingCliSessionId?: string | null,
+    cliSessionId: string | null,
   ): void {
     const { request_id, provider } = message;
-
-    const cliSessionId = existingCliSessionId ?? null;
 
     // Test mode: use mock handler
     if (this.testMode && this.onTestRequest) {
@@ -712,28 +672,33 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.executeRequest(adapter, message, cliSessionId, controller.signal)
       .catch((err) => {
         const errMessage = err instanceof Error ? err.message : String(err);
-
-        // A failure on a request that attempted to RESUME an existing CLI
-        // session is treated as a recoverable "cannot_resume": the stored
-        // session is dropped so the next turn starts fresh, and the server is
-        // told it can recover by replaying history via session_reset. A
-        // genuinely unrelated failure (rate limit, etc.) simply resurfaces on
-        // the fresh retry, so this broad treatment is safe.
         const wasResumeAttempt = cliSessionId !== null;
-        if (wasResumeAttempt && message.conversation_id) {
-          this.sessionStore.delete(message.conversation_id);
-        }
 
         log.error('Request execution failed', {
           requestId: request_id,
           resumeAttempt: wasResumeAttempt,
           error: errMessage,
         });
+
+        if (wasResumeAttempt) {
+          // The server asked to resume a CLI session this bridge could not
+          // resume (expired, cleared, or created on another machine). Report
+          // it as `session_lost` — a recoverable signal: the server wipes the
+          // stored id and silently re-issues the turn as a fresh session. No
+          // `done` is sent here; the re-issued turn produces its own terminal
+          // events. (A genuinely unrelated failure simply resurfaces on the
+          // fresh retry, so this broad treatment is safe.)
+          this.sendStreamEvent(request_id, 'error', {
+            code: 'session_lost',
+            message: `Could not resume CLI session: ${errMessage}`,
+          });
+          return;
+        }
+
+        // A genuine failure on a fresh request — surface it and end the turn.
         this.sendStreamEvent(request_id, 'error', {
-          code: wasResumeAttempt ? 'cannot_resume' : 'provider_error',
-          message: wasResumeAttempt
-            ? `Could not resume the existing CLI session: ${errMessage}. The session has been cleared — retry to start a fresh one.`
-            : errMessage,
+          code: 'provider_error',
+          message: errMessage,
         });
         this.sendStreamEvent(request_id, 'done', {});
       })
@@ -749,7 +714,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     cliSessionId: string | null,
     signal: AbortSignal,
   ): Promise<void> {
-    const { request_id, conversation_id } = request;
+    const { request_id } = request;
 
     // Build execution context
     const context: ExecutionContext = {
@@ -778,69 +743,34 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       cliSessionId,
     };
 
-    // Wrap in try/finally to ensure the session mapping is persisted even if
-    // the adapter throws after producing a session ID.
-    let newCliSessionId: string | null = null;
-    try {
-      // Run the adapter — it returns the new CLI session ID
-      newCliSessionId = await adapter.execute(context, (event: AdapterStreamEvent) => {
-        this.sendStreamEvent(request_id, event.event, event.data);
-      });
-    } finally {
-      // Store the session mapping for future resume.  Also persist
-      // system_prompt so session resets can restore it even when the server
-      // omits it from the session_reset message.
-      if (newCliSessionId && conversation_id) {
-        this.sessionStore.set(
-          conversation_id,
-          newCliSessionId,
-          adapter.providerName,
-          request.system_prompt,
-        );
+    // The adapter emits its own `done`, but the CLI session id is only known
+    // once execute() resolves. Capture the adapter's `done` data, withhold the
+    // event, and re-emit `done` after — with cli_session_id attached — so the
+    // server can persist the session for the next turn's resume.
+    let doneData: DoneData = {};
+    let sessionLost = false;
+    const newCliSessionId = await adapter.execute(context, (event: AdapterStreamEvent) => {
+      if (event.event === 'done') {
+        doneData = event.data as DoneData;
+        return;
       }
-    }
-  }
+      if (event.event === 'error' && (event.data as { code?: string }).code === 'session_lost') {
+        sessionLost = true;
+      }
+      this.sendStreamEvent(request_id, event.event, event.data);
+    });
 
-  /**
-   * Handle a session_reset message by constructing a synthetic ai_request
-   * from the conversation history and executing it without sending an ack.
-   */
-  private handleSessionReset(message: SessionResetMessage): void {
-    const { request_id, conversation_id } = message;
-
-    // Retrieve the stored system prompt BEFORE deleting the session, so it can
-    // be used as a fallback if the server omits system_prompt.
-    const storedSystemPrompt = this.sessionStore.getSystemPrompt(conversation_id);
-
-    // Delete the old session so the adapter starts fresh
-    const deleted = this.sessionStore.delete(conversation_id);
-    log.info('Session reset', { conversationId: conversation_id, found: deleted, historyLength: message.history.length });
-
-    // Prefer the server-provided system_prompt; fall back to the stored one if
-    // the server omits it.
-    const effectiveSystemPrompt = message.system_prompt ?? storedSystemPrompt;
-    if (!message.system_prompt && storedSystemPrompt) {
-      log.warn('session_reset has no system_prompt — using stored system prompt for this conversation', {
-        conversationId: conversation_id,
-      });
-    }
-
-    const syntheticRequest = buildSessionResetRequest(message, effectiveSystemPrompt);
-
-    if (!syntheticRequest) {
-      log.error('Session reset has no user message in history', { conversationId: conversation_id });
-      this.send({
-        type: 'error',
-        request_id,
-        code: 'session_reset_failed',
-        message: 'No user message found in conversation history',
-        fatal: true,
-      });
+    // On session_lost the error was already forwarded and the server recovers
+    // by re-issuing the turn — withhold `done` so its in-flight request stays
+    // open for the re-issue.
+    if (sessionLost) {
       return;
     }
 
-    log.info('Re-processing session_reset as new ai_request', { requestId: request_id, provider: message.provider });
-    this.executeAiRequestInternal(syntheticRequest);
+    this.sendStreamEvent(request_id, 'done', {
+      ...doneData,
+      cli_session_id: newCliSessionId,
+    });
   }
 
   private handleServerError(message: { type: 'error'; code: string; message: string; fatal: boolean }): void {

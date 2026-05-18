@@ -148,6 +148,12 @@ export interface ServerConfig {
   request_timeout: number;
 }
 
+/** A single prior turn in a conversation's history. */
+export interface ConversationEntry {
+  role: string;
+  content: string;
+}
+
 /** A request from the server to run an AI prompt through a local CLI. */
 export interface AiRequestMessage {
   type: 'ai_request';
@@ -157,6 +163,20 @@ export interface AiRequestMessage {
   message: string;
   system_prompt: string | null;
   options: AiRequestOptions;
+  /**
+   * The CLI session to resume, or null to start a fresh session.
+   *
+   * The server owns this mapping (persisted per conversation) and is the
+   * single source of truth — the bridge keeps no session map of its own.
+   * Non-null: resume that CLI session. Null: start fresh.
+   */
+  cli_session_id: string | null;
+  /**
+   * Prior conversation history, included only when cli_session_id is null so
+   * a fresh CLI session can be seeded with context. Omitted/empty when
+   * resuming — the resumed CLI session already holds the history.
+   */
+  history?: ConversationEntry[];
 }
 
 /**
@@ -170,17 +190,6 @@ export interface AiRequestOptions {
   temperature?: number | null;
   /** Model to use (provider-specific identifier, e.g. "sonnet", "gpt-5.4") */
   model?: string | null;
-}
-
-/** Instructs the bridge to reset/clear a conversation session. */
-export interface SessionResetMessage {
-  type: 'session_reset';
-  request_id: string;
-  conversation_id: string;
-  provider: string;
-  system_prompt: string | null;
-  history: Array<{ role: string; content: string }>;
-  options: AiRequestOptions;
 }
 
 /** Server responds with the result of a tool call. */
@@ -217,7 +226,6 @@ export interface ErrorMessage {
 export type ServerToBridgeMessage =
   | WelcomeMessage
   | AiRequestMessage
-  | SessionResetMessage
   | ToolResolveMessage
   | ToolErrorMessage
   | PongMessage
@@ -269,6 +277,12 @@ export interface ToolResultData {
 /** Data payload for done events. */
 export interface DoneData {
   usage?: TokenUsage;
+  /**
+   * The CLI session id this turn ran under — the id created on a fresh
+   * session, or the id resumed. The server persists it on the conversation
+   * so the next turn can resume. Null/absent when no session id was produced.
+   */
+  cli_session_id?: string | null;
 }
 
 /** Data payload for error events. */

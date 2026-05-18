@@ -26,6 +26,7 @@ import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from './env.js';
 import { buildToolInstructions } from '../tools/prompt.js';
+import { resumeAwareErrorCode } from './session-error.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
@@ -256,7 +257,7 @@ export class CodexAdapter extends ProviderAdapter {
 
             onEvent({
               event: 'error',
-              data: { code: 'provider_error', message },
+              data: { code: resumeAwareErrorCode(cliSessionId, message), message },
             });
             // Emit done after error so the server always gets a terminal event.
             onEvent({ event: 'done', data: {} });
@@ -299,7 +300,7 @@ export class CodexAdapter extends ProviderAdapter {
 
           onEvent({
             event: 'error',
-            data: { code: 'provider_error', message },
+            data: { code: resumeAwareErrorCode(cliSessionId, message), message },
           });
 
           onEvent({ event: 'done', data: {} });
@@ -316,7 +317,7 @@ export class CodexAdapter extends ProviderAdapter {
           // Codex exits with code 0 after this and no turn.failed follows.
           onEvent({
             event: 'error',
-            data: { code: 'provider_error', message },
+            data: { code: resumeAwareErrorCode(cliSessionId, message), message },
           });
           onEvent({ event: 'done', data: {} });
           settled = true;

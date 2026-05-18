@@ -20,7 +20,7 @@ import { ClaudeAdapter } from './providers/claude.js';
 import { GeminiAdapter } from './providers/gemini.js';
 import type { ProviderAdapter } from './providers/base.js';
 import { handleTestRequest } from './test-mode.js';
-import { setDebug, createLogger } from './utils/logger.js';
+import { setDebug, setLogFile, closeLogFile, createLogger } from './utils/logger.js';
 import { BRIDGE_VERSION, PROTOCOL_VERSION } from './protocol/version.js';
 
 const log = createLogger('CLI');
@@ -55,13 +55,27 @@ program
     'Test mode — respond to AI requests with mock streaming data (--server and --token still required for the WebSocket connection)',
     false,
   )
-  .action(async (opts: { token?: string; server?: string; debug: boolean; test: boolean }) => {
+  .option(
+    '--log-file <path>',
+    'Also append logs to this file (or set AI_BRIDGE_LOG_FILE env var). Rotates once past 5 MB, keeping one previous copy.',
+    process.env['AI_BRIDGE_LOG_FILE'],
+  )
+  .action(async (opts: { token?: string; server?: string; debug: boolean; test: boolean; logFile?: string }) => {
     // Enable debug logging if requested
     if (opts.debug) {
       setDebug(true);
     }
 
+    // Start file logging before anything else is logged, so the run is
+    // captured from the first line.
+    if (opts.logFile) {
+      setLogFile(opts.logFile);
+    }
+
     log.info(`AI Bridge v${BRIDGE_VERSION} (protocol v${PROTOCOL_VERSION})`);
+    if (opts.logFile) {
+      log.info(`Logging to file: ${opts.logFile}`);
+    }
 
     if (opts.test) {
       log.info('Running in TEST MODE — AI requests will receive mock responses');
@@ -210,6 +224,7 @@ program
     const shutdown = async (signal: string) => {
       log.info(`Received ${signal} — shutting down gracefully`);
       await bridge.disconnect();
+      closeLogFile();
       process.exit(0);
     };
 
