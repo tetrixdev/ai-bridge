@@ -23,6 +23,7 @@ import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from './env.js';
 import { buildToolInstructions } from '../tools/prompt.js';
+import { resumeAwareErrorCode } from './session-error.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
@@ -311,11 +312,12 @@ export class GeminiAdapter extends ProviderAdapter {
           // severity='error' and severity='warning' are both forwarded to the
           // server as stream events.
           if (severity === 'error') {
+            const errText = message ?? 'Unknown Gemini error';
             onEvent({
               event: 'error',
               data: {
-                code: 'provider_error',
-                message: message ?? 'Unknown Gemini error',
+                code: resumeAwareErrorCode(cliSessionId, errText),
+                message: errText,
               },
             });
             // Fatal errors terminate the response — emit done and mark settled.
@@ -355,7 +357,7 @@ export class GeminiAdapter extends ProviderAdapter {
             onEvent({
               event: 'error',
               data: {
-                code: 'provider_error',
+                code: resumeAwareErrorCode(cliSessionId, errorMessage),
                 message: errorMessage,
               },
             });

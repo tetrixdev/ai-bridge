@@ -26,6 +26,7 @@ npx @tetrixdev/ai-bridge
 | `--token <token>` | `AI_BRIDGE_TOKEN` | Connection token from the web app |
 | `--test` | | Test mode -- responds with mock data instead of calling real CLIs |
 | `--debug` | | Enable verbose debug logging |
+| `--log-file <path>` | `AI_BRIDGE_LOG_FILE` | Also append logs to this file. Rotates once past 5 MB, keeping one previous copy (`<path>.1`) |
 
 ## Supported Providers
 

@@ -66,6 +66,7 @@ function makeRequest(overrides: Partial<AiRequestMessage> = {}): AiRequestMessag
     message: 'Hello there',
     system_prompt: null,
     options: {},
+    cli_session_id: null,
     ...overrides,
   };
 }
