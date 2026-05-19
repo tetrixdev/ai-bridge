@@ -14,7 +14,6 @@
  *   {"type":"result","subtype":"success","session_id":"...","usage":{...},"total_cost_usd":...}
  */
 
-import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
@@ -114,10 +113,7 @@ export class ClaudeAdapter extends ProviderAdapter {
       // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
       delete env['CLAUDECODE'];
 
-      const child = spawn('claude', args, {
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'], // stdin must be 'ignore' — Claude CLI hangs if stdin is a pipe
-      });
+      const child = this.spawnCli('claude', args, env);
 
       // Set up abort handling
       const onAbort = () => {

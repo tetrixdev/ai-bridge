@@ -17,7 +17,6 @@
  *   {"type":"turn.failed","error":{"message":"..."}}
  */
 
-import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { homedir } from 'node:os';
@@ -144,10 +143,7 @@ export class CodexAdapter extends ProviderAdapter {
       }
       const env = buildSpawnEnv(hasTools ? context.toolScriptDir : null, context.requestId);
 
-      const child = spawn('codex', args, {
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      const child = this.spawnCli('codex', args, env);
 
       // Set up abort handling
       const onAbort = () => {

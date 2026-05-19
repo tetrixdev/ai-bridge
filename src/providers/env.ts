@@ -6,8 +6,42 @@
  * adapter implementations.
  */
 
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 /** Maximum stderr buffer size (10 KB). */
 const MAX_STDERR_BYTES = 10 * 1024;
+
+/** Cached path of the dedicated CLI working directory (created once). */
+let cachedWorkingDir: string | null = null;
+
+/**
+ * Resolve the dedicated, empty working directory that every provider CLI is
+ * spawned in.
+ *
+ * Claude, Codex and Gemini all auto-load project context files
+ * (CLAUDE.md / AGENTS.md / GEMINI.md) from their working directory and its
+ * parent directories. If a CLI inherited the bridge process's own cwd it
+ * would silently absorb whatever happened to be there. Pinning every spawn
+ * to a dedicated empty directory closes that leak.
+ *
+ * NOTE: user-level files (e.g. ~/.claude/CLAUDE.md) load regardless of cwd —
+ * those are outside the working-directory mechanism and not affected here.
+ *
+ * @returns Absolute path to the empty working directory (created if absent).
+ */
+export function getBridgeWorkingDir(): string {
+  if (cachedWorkingDir) {
+    return cachedWorkingDir;
+  }
+  // mkdtempSync gives us a per-process directory guaranteed to be empty —
+  // a fixed name like ai-bridge-workdir/ could carry over files from a
+  // previous run and quietly break the "empty cwd" guarantee.
+  const dir = mkdtempSync(join(tmpdir(), 'ai-bridge-workdir-'));
+  cachedWorkingDir = dir;
+  return dir;
+}
 
 /**
  * Build the environment variables for spawning a CLI subprocess.
