@@ -6,7 +6,7 @@
  * adapter implementations.
  */
 
-import { mkdirSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -35,8 +35,10 @@ export function getBridgeWorkingDir(): string {
   if (cachedWorkingDir) {
     return cachedWorkingDir;
   }
-  const dir = join(tmpdir(), 'ai-bridge-workdir');
-  mkdirSync(dir, { recursive: true });
+  // mkdtempSync gives us a per-process directory guaranteed to be empty —
+  // a fixed name like ai-bridge-workdir/ could carry over files from a
+  // previous run and quietly break the "empty cwd" guarantee.
+  const dir = mkdtempSync(join(tmpdir(), 'ai-bridge-workdir-'));
   cachedWorkingDir = dir;
   return dir;
 }

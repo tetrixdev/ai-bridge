@@ -310,11 +310,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.reconnectAttempts = 0;
     this.emit('connected');
     this.sendHello();
-    // Re-probe the local CLIs after every handshake. The hello above already
-    // advertised the last-known set; if detection now finds a different set
-    // (a CLI installed or removed since), refreshProviders() pushes a
-    // providers_update. Runs in the background so it never delays the hello.
-    void this.refreshProviders();
+    // Re-probing happens once handleWelcome() completes the handshake — so
+    // any providers_update that fires is strictly post-welcome and never
+    // arrives at the server with the connection still pending. See
+    // handleWelcome().
   }
 
   private onMessage(data: WebSocket.RawData): void {
@@ -629,6 +628,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     });
 
     this.emit('welcome', this.sessionId);
+
+    // Re-probe the local CLIs now that the handshake is fully complete. The
+    // hello above already advertised the last-known set; if detection now
+    // finds a different set (a CLI installed or removed since),
+    // refreshProviders() pushes a providers_update. Runs in the background
+    // and is intentionally post-welcome so any update is unambiguously
+    // ordered after the handshake.
+    void this.refreshProviders();
 
     // Replay any requests aborted by a previous disconnect as terminal errors
     // now that the connection is back, so the browser exits its loading state

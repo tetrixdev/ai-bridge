@@ -852,9 +852,9 @@ The bridge runs **locally on the user's machine** using **their own CLI tools** 
 
 ### Connection Token
 
-- Short-lived JWT (default: 24 hours)
+- Long-lived JWT (default: 30 days) topped up by the server before it expires — see [Token lifetime](#token-lifetime)
 - Scoped to `ai-bridge` (cannot be used for other API calls)
-- User can revoke and regenerate at any time via the web UI
+- User can revoke and regenerate at any time via the web UI; regenerating actively disconnects the previous bridge
 - One active bridge connection per user (new connection supersedes old)
 
 ### Data in Transit
