@@ -75,7 +75,18 @@ The `connection_token` is a short-lived JWT obtained by the user through the web
 }
 ```
 
-The server validates the token on connection. If invalid or expired, the server closes the WebSocket with code `4001` and reason `"invalid_token"`.
+The server validates the token on connection. If invalid or expired, the server closes the WebSocket with code `4001` and reason `"invalid_token"`, and sends a `connection_error` message just before closing. Code `4001` is fatal — the bridge must not reconnect.
+
+CLI bridge tokens also carry a `cid` claim (the bridge connection's database id). On connection the server confirms that connection still exists and its key has not been rotated; a token for a deleted or regenerated bridge is rejected with code `4001` even though its signature is still valid.
+
+### Token lifetime
+
+CLI bridge tokens are long-lived (default 30 days) — a bridge is a semi-permanent connection. Rather than re-mint a token on every request, the server tops it up once it is past half its life. A fresh token is delivered either:
+
+- in the `welcome` message (`refreshed_token` field) — at the handshake, covering bridges that reconnect; or
+- in a `token_refresh` message — pushed by a slow background timer, covering a bridge that stays connected without ever reconnecting.
+
+The bridge adopts the new token for subsequent reconnects, so a bridge used at least once per token lifetime never expires.
 
 ### Reconnection
 
@@ -160,6 +171,25 @@ If a CLI is not installed, `available` is `false` and the server won't route req
 
 **`supports_session_resume`** indicates whether the provider supports resuming conversations by session ID. All three currently supported providers support this.
 
+### Bridge → Server: `providers_update`
+
+Sent mid-connection when the bridge's set of available provider CLIs changes after the `hello` — for example, the user installs or removes a CLI while the bridge stays connected.
+
+```json
+{
+  "type": "providers_update",
+  "providers": [
+    { "name": "claude", "version": "1.2.3", "available": true, "supports_streaming": true, "supports_tools": true, "supports_thinking": true, "supports_session_resume": true }
+  ]
+}
+```
+
+**`providers`**: The currently available providers, in the same shape as the `hello` `providers` array, but containing only providers whose CLI is present (`available: true`).
+
+The server refreshes the connection's advertised providers from this message, so the host application's provider list reflects what the bridge can currently run. No response is sent.
+
+The bridge re-probes its CLIs after every handshake and after a provider spawn failure (a request routed to a since-removed CLI), and emits this message only when the available set actually changed.
+
 ### Server → Bridge: `welcome`
 
 ```json
@@ -199,7 +229,8 @@ If a CLI is not installed, `available` is `false` and the server won't route req
   "config": {
     "heartbeat_interval": 30,
     "request_timeout": 300
-  }
+  },
+  "refreshed_token": "<new JWT>"
 }
 ```
 
@@ -208,6 +239,21 @@ If a CLI is not installed, `available` is `false` and the server won't route req
 **`config.heartbeat_interval`**: Seconds between heartbeat pings. See [Heartbeat](#heartbeat).
 
 **`config.request_timeout`**: Maximum seconds for a single AI request before timeout.
+
+**`refreshed_token`** *(optional)*: Present when the server topped up an aging connection token at the handshake. The bridge replaces its current token with this value for future reconnects. See [Token lifetime](#token-lifetime).
+
+### Server → Bridge: `token_refresh`
+
+Sent at any time after the handshake to hand the bridge a fresh connection token — used for a long-lived bridge that stays connected without reconnecting, so it never picks up a `refreshed_token` via `welcome`.
+
+```json
+{
+  "type": "token_refresh",
+  "token": "<new JWT>"
+}
+```
+
+The bridge replaces its current token with this value and uses it for subsequent reconnects. It does **not** reconnect in response to this message.
 
 ---
 
@@ -672,6 +718,8 @@ For request-level errors (not streaming):
 ### CLI Invocation
 
 How the bridge invokes each provider:
+
+**Working directory**: every provider CLI is spawned in a dedicated empty directory, not the bridge process's own working directory. This prevents the CLIs from auto-loading project context files (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`) from whatever directory the bridge happened to be started in. User-level context files (e.g. `~/.claude/CLAUDE.md`) are unaffected — they load regardless of working directory.
 
 #### Codex
 

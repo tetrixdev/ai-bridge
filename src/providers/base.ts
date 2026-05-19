@@ -5,8 +5,9 @@
  * normalizes its output into the Bridge protocol's stream event format.
  */
 
-import { ChildProcess } from 'node:child_process';
+import { ChildProcess, ChildProcessByStdio, spawn } from 'node:child_process';
 import { Interface as ReadlineInterface } from 'node:readline';
+import type { Readable } from 'node:stream';
 import type {
   ModelInfo,
   AiRequestMessage,
@@ -14,7 +15,7 @@ import type {
   StreamEventType,
   StreamEventData,
 } from '../protocol/types.js';
-import { formatStderrMessage } from './env.js';
+import { formatStderrMessage, getBridgeWorkingDir } from './env.js';
 
 /** A stream event emitted by the adapter. */
 export interface AdapterStreamEvent {
@@ -163,4 +164,39 @@ export abstract class ProviderAdapter {
    * or known model aliases as a fallback.
    */
   abstract listModels(): Promise<ModelInfo[]>;
+
+  /**
+   * Spawn a provider CLI subprocess with the bridge's standard launch options.
+   *
+   * Centralizes the two settings every adapter must get right:
+   *   - `cwd` is pinned to a dedicated empty directory so the CLI cannot
+   *     auto-load CLAUDE.md / AGENTS.md / GEMINI.md from the bridge's own
+   *     working tree (see getBridgeWorkingDir()).
+   *   - `stdio` keeps stdin closed — every CLI hangs if stdin is a live pipe —
+   *     with stdout/stderr piped for streaming.
+   *
+   * The caller still builds its own `env` (provider-specific quirks like
+   * Claude's CLAUDECODE deletion or Codex's conditional PATH belong with the
+   * adapter), but routing every spawn through here means no adapter can
+   * forget the cwd sandbox.
+   *
+   * @param command  CLI binary name (e.g. "claude").
+   * @param args     CLI arguments.
+   * @param env      Fully-built environment for the child process.
+   * @returns The spawned ChildProcess.
+   */
+  protected spawnCli(
+    command: string,
+    args: string[],
+    env: NodeJS.ProcessEnv,
+  ): ChildProcessByStdio<null, Readable, Readable> {
+    // stdio is fixed as ['ignore', 'pipe', 'pipe'], so stdin is null and
+    // stdout/stderr are always readable streams — assert that shape so callers
+    // keep the non-null stdout/stderr the inline spawn() overload gave them.
+    return spawn(command, args, {
+      env,
+      cwd: getBridgeWorkingDir(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }) as ChildProcessByStdio<null, Readable, Readable>;
+  }
 }

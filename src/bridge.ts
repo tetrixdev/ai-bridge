@@ -24,6 +24,7 @@ import type {
   BridgeToServerMessage,
   ServerToBridgeMessage,
   AiRequestMessage,
+  ConnectionErrorMessage,
   ConversationEntry,
   WelcomeMessage,
   ToolDefinition,
@@ -34,6 +35,7 @@ import type {
 } from './protocol/types.js';
 import { PROTOCOL_VERSION, BRIDGE_VERSION } from './protocol/version.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './providers/base.js';
+import { detectProviders } from './providers/detector.js';
 import { ToolManager } from './tools/manager.js';
 import { ToolResolver } from './tools/resolver.js';
 import { ToolCallbackServer } from './tools/callback-server.js';
@@ -147,8 +149,14 @@ function foldHistoryIntoSystemPrompt(
 export class Bridge extends EventEmitter<BridgeEvents> {
   private ws: WebSocket | null = null;
   private readonly serverUrl: string;
-  private readonly token: string;
-  private readonly providers: ProviderCapability[];
+  // Not readonly: the server tops up long-lived tokens, and the bridge adopts
+  // the fresh token (via welcome.refreshed_token or a token_refresh message)
+  // for subsequent reconnects.
+  private token: string;
+  // Not readonly: re-detected at each handshake and after a provider spawn
+  // failure, so a CLI installed or removed mid-life is picked up without a
+  // bridge restart. See refreshProviders().
+  private providers: ProviderCapability[];
   private readonly adapters: Map<string, ProviderAdapter>;
   private readonly toolManager = new ToolManager();
   private readonly toolResolver = new ToolResolver();
@@ -302,6 +310,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.reconnectAttempts = 0;
     this.emit('connected');
     this.sendHello();
+    // Re-probe the local CLIs after every handshake. The hello above already
+    // advertised the last-known set; if detection now finds a different set
+    // (a CLI installed or removed since), refreshProviders() pushes a
+    // providers_update. Runs in the background so it never delays the hello.
+    void this.refreshProviders();
   }
 
   private onMessage(data: WebSocket.RawData): void {
@@ -341,6 +354,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         break;
       case 'error':
         this.handleServerError(message);
+        break;
+      case 'connection_error':
+        this.handleConnectionError(message);
+        break;
+      case 'token_refresh':
+        this.adoptRefreshedToken(message.token, 'token_refresh message');
         break;
       default:
         log.warn('Unknown message type received', { type: (message as { type: string }).type });
@@ -420,16 +439,19 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * NO id field on providers — just name.
    */
   private sendHello(): void {
+    // Advertise only providers whose CLI was actually detected — the server
+    // should never offer the user a provider this machine cannot run.
+    const availableProviders = this.providers.filter((p) => p.available);
     const hello: BridgeToServerMessage = {
       type: 'hello',
       version: PROTOCOL_VERSION,
       bridge_version: BRIDGE_VERSION,
-      providers: this.providers,
+      providers: availableProviders,
     };
     this.send(hello);
     log.info('Hello sent', {
       protocol: PROTOCOL_VERSION,
-      providers: this.providers.filter((p) => p.available).map((p) => p.name),
+      providers: availableProviders.map((p) => p.name),
     });
 
     // If no welcome arrives within 15s the server silently dropped our hello;
@@ -443,6 +465,55 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }, 15_000);
   }
 
+  /**
+   * Re-probe the local provider CLIs and, if the available set changed since
+   * what was last advertised, push a `providers_update` to the server.
+   *
+   * Called after each handshake (catches a CLI installed or removed while the
+   * bridge was offline or before a reconnect) and after a provider spawn
+   * failure (catches a CLI removed mid-session — the next request's ENOENT
+   * triggers a re-probe so the UI's provider list self-heals).
+   *
+   * Best-effort: a detection failure is logged and swallowed — it must never
+   * disrupt an active connection.
+   */
+  private async refreshProviders(): Promise<void> {
+    let detected: ProviderCapability[];
+    try {
+      detected = await detectProviders();
+    } catch (err) {
+      log.warn('Provider re-detection failed — keeping current provider list', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+
+    const signature = (list: ProviderCapability[]): string =>
+      list
+        .filter((p) => p.available)
+        .map((p) => p.name)
+        .sort()
+        .join(',');
+
+    const before = signature(this.providers);
+    const after = signature(detected);
+    this.providers = detected;
+
+    if (before === after) {
+      return;
+    }
+
+    log.info('Available providers changed', { before: before || '(none)', after: after || '(none)' });
+
+    if (this.isConnected()) {
+      this.send({
+        type: 'providers_update',
+        providers: detected.filter((p) => p.available),
+      });
+      log.info('Sent providers_update to server');
+    }
+  }
+
   private async handleWelcome(message: WelcomeMessage): Promise<void> {
     // Cancel the welcome-timeout now that we've received the welcome.
     if (this.welcomeTimeoutTimer) {
@@ -451,6 +522,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
     this.sessionId = message.session_id;
     this.serverConfig = message.config;
+
+    // The server tops up long-lived tokens — adopt a fresh one if offered.
+    if (message.refreshed_token) {
+      this.adoptRefreshedToken(message.refreshed_token, 'welcome message');
+    }
 
     // Check protocol version compatibility if the server provides one
     if (message.protocol_version) {
@@ -754,8 +830,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         doneData = event.data as DoneData;
         return;
       }
-      if (event.event === 'error' && (event.data as { code?: string }).code === 'session_lost') {
-        sessionLost = true;
+      if (event.event === 'error') {
+        const errorCode = (event.data as { code?: string }).code;
+        if (errorCode === 'session_lost') {
+          sessionLost = true;
+        }
+        // A spawn failure (most often ENOENT — the CLI is no longer on PATH)
+        // means the local provider set may have changed. Re-probe so the
+        // server's advertised provider list self-heals without a restart.
+        if (errorCode === 'provider_spawn_error') {
+          void this.refreshProviders();
+        }
       }
       this.sendStreamEvent(request_id, event.event, event.data);
     });
@@ -785,6 +870,40 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       });
       this.ws?.close(1000, 'Fatal server error');
     }
+  }
+
+  /**
+   * Handle a connection_error message — the server rejected this connection
+   * (bad / expired / revoked token, protocol mismatch, …). Always fatal: the
+   * bridge stops instead of reconnecting. Setting isShuttingDown also
+   * suppresses the duplicate fatal error the accompanying 4001 close frame
+   * would otherwise raise in onClose().
+   */
+  private handleConnectionError(message: ConnectionErrorMessage): void {
+    log.error('Connection rejected by server', {
+      error: message.error,
+      message: message.message,
+    });
+    this.isShuttingDown = true;
+    // Best-effort cleanup before surfacing the fatal error.
+    this.toolManager.cleanupScripts();
+    this.callbackServer.stop().catch(() => {
+      // Best-effort cleanup; ignore errors during shutdown
+    });
+    this.emit('error', new FatalBridgeError(`Connection rejected: ${message.message}`));
+  }
+
+  /**
+   * Adopt a server-issued replacement token. Bridge tokens are long-lived but
+   * still expire; the server hands over a fresh one before the current token
+   * ages out, so subsequent reconnects keep working without operator action.
+   */
+  private adoptRefreshedToken(token: string, source: string): void {
+    if (!token || token === this.token) {
+      return;
+    }
+    this.token = token;
+    log.info('Adopted refreshed connection token', { source });
   }
 
   // -------------------------------------------------------------------------

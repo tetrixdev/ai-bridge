@@ -17,7 +17,6 @@
  *   {"type":"result","status":"success|error","stats":{...},"timestamp":"..."}
  */
 
-import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
@@ -120,10 +119,7 @@ export class GeminiAdapter extends ProviderAdapter {
       // Build env with tool scripts on PATH and request ID for correlation
       const env = buildSpawnEnv(context.toolScriptDir, context.requestId);
 
-      const child = spawn('gemini', args, {
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'], // stdin must be 'ignore' to prevent hanging
-      });
+      const child = this.spawnCli('gemini', args, env);
 
       // Set up abort handling
       const onAbort = () => {

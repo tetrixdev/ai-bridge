@@ -117,6 +117,18 @@ export interface BridgeErrorMessage {
   fatal: boolean;
 }
 
+/**
+ * Sent mid-connection when the set of locally available provider CLIs has
+ * changed since the `hello` handshake — e.g. the user installed or removed a
+ * CLI while the bridge stayed connected. Carries the same provider shape as
+ * `hello`, but only the providers that are currently available. The server
+ * treats it as a refresh of the connection's advertised providers.
+ */
+export interface ProvidersUpdateMessage {
+  type: 'providers_update';
+  providers: ProviderCapability[];
+}
+
 /** Union of all messages the bridge sends to the server. */
 export type BridgeToServerMessage =
   | HelloMessage
@@ -124,7 +136,8 @@ export type BridgeToServerMessage =
   | StreamMessage
   | PingMessage
   | ToolCallMessage
-  | BridgeErrorMessage;
+  | BridgeErrorMessage
+  | ProvidersUpdateMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Bridge Messages
@@ -138,6 +151,11 @@ export interface WelcomeMessage {
   config: ServerConfig;
   /** Optional protocol version from the server for compatibility checking. */
   protocol_version?: string;
+  /**
+   * A fresh connection token, present when the server topped up an aging
+   * token at the handshake. The bridge adopts it for subsequent reconnects.
+   */
+  refreshed_token?: string;
 }
 
 /** Server-provided configuration values. */
@@ -222,6 +240,22 @@ export interface ErrorMessage {
   fatal: boolean;
 }
 
+/**
+ * Server rejected the connection (bad/expired/revoked token, protocol
+ * mismatch, …). Always fatal — the bridge must not reconnect.
+ */
+export interface ConnectionErrorMessage {
+  type: 'connection_error';
+  error: string;
+  message: string;
+}
+
+/** Server hands the bridge a fresh connection token (see WelcomeMessage). */
+export interface TokenRefreshMessage {
+  type: 'token_refresh';
+  token: string;
+}
+
 /** Union of all messages the server sends to the bridge. */
 export type ServerToBridgeMessage =
   | WelcomeMessage
@@ -229,7 +263,9 @@ export type ServerToBridgeMessage =
   | ToolResolveMessage
   | ToolErrorMessage
   | PongMessage
-  | ErrorMessage;
+  | ErrorMessage
+  | ConnectionErrorMessage
+  | TokenRefreshMessage;
 
 // ---------------------------------------------------------------------------
 // Stream Event Types and Data
