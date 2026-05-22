@@ -160,13 +160,30 @@ describe('tool manifest injection — Codex', () => {
     expect(prompt).not.toContain('# Available Tools');
   });
 
-  it('uses the danger-full-access sandbox when tools are present', async () => {
+  it('uses the danger-full-access sandbox via a -c override when tools are present', async () => {
     const adapter = new CodexAdapter();
     await adapter.execute(makeContext(TOOLS), () => {});
 
-    const idx = lastSpawnArgs.indexOf('-s');
+    const idx = lastSpawnArgs.indexOf('sandbox_mode=danger-full-access');
     expect(idx).toBeGreaterThan(-1);
-    expect(lastSpawnArgs[idx + 1]).toBe('danger-full-access');
+    expect(lastSpawnArgs[idx - 1]).toBe('-c');
+    // The -s/--sandbox flag must not be used — `codex exec resume` rejects it.
+    expect(lastSpawnArgs).not.toContain('-s');
+  });
+
+  it('passes the sandbox override on resumed sessions too, without the -s flag', async () => {
+    const adapter = new CodexAdapter();
+    await adapter.execute(makeContext(TOOLS, { cliSessionId: 'sess-abc' }), () => {});
+
+    expect(lastSpawnArgs).toContain('resume');
+    // codex refuses to run outside a trusted directory without this flag.
+    expect(lastSpawnArgs).toContain('--skip-git-repo-check');
+    const idx = lastSpawnArgs.indexOf('sandbox_mode=danger-full-access');
+    expect(idx).toBeGreaterThan(-1);
+    expect(lastSpawnArgs[idx - 1]).toBe('-c');
+    // Regression: `-s` on `codex exec resume` fails arg parsing with
+    // "unexpected argument '-s' found".
+    expect(lastSpawnArgs).not.toContain('-s');
   });
 });
 

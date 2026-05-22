@@ -4,8 +4,8 @@
  * Wraps the OpenAI Codex CLI to produce normalized stream events.
  *
  * CLI invocation:
- *   New session:    codex exec --json --skip-git-repo-check --ephemeral -m <model> "<user message>"
- *   Resume session: codex exec resume <SESSION_ID> --json "<user message>"
+ *   New session:    codex exec --json --skip-git-repo-check -m <model> "<user message>"
+ *   Resume session: codex exec resume <SESSION_ID> --json --skip-git-repo-check "<user message>"
  *
  * Output format (NDJSON):
  *   {"type":"thread.started","thread_id":"..."}
@@ -56,10 +56,15 @@ export class CodexAdapter extends ProviderAdapter {
     const model = request.options?.model ?? DEFAULT_MODEL;
 
     if (cliSessionId) {
-      // Resume an existing session
+      // Resume an existing session.
+      // --skip-git-repo-check is required here just as on a new session:
+      // without it codex refuses to run outside a trusted/git directory
+      // ("Not inside a trusted directory and --skip-git-repo-check was not
+      // specified."). `codex exec resume` accepts the flag.
       args = [
         'exec', 'resume', cliSessionId,
         '--json',
+        '--skip-git-repo-check',
       ];
       // Pass model flag on resume if specified in request options
       if (request.options?.model) {
@@ -67,12 +72,16 @@ export class CodexAdapter extends ProviderAdapter {
       }
       log.debug('Resuming session', { cliSessionId });
     } else {
-      // New session
+      // New session.
+      // NOTE: do NOT pass --ephemeral here. --ephemeral runs codex "without
+      // persisting session files to disk", so no rollout is written and a
+      // later `codex exec resume <id>` fails with "no rollout found for
+      // thread id". The bridge persists cli_session_id and resumes it on the
+      // next turn, so the session MUST be persisted.
       args = [
         'exec',
         '--json',
         '--skip-git-repo-check',
-        '--ephemeral',
         '-m', model,
       ];
     }
@@ -90,8 +99,13 @@ export class CodexAdapter extends ProviderAdapter {
     // keep Codex's safer default sandbox.
     const hasTools = context.tools.length > 0;
     if (hasTools) {
+      // Pass the sandbox mode as a `-c` config override rather than the
+      // `-s/--sandbox` flag: `-s` is only accepted by `codex exec`, not by
+      // `codex exec resume`, so using the flag breaks every follow-up turn
+      // ("unexpected argument '-s' found"). `-c key=value` is accepted by
+      // both subcommands and is equivalent.
       args.push(
-        '-s', 'danger-full-access',
+        '-c', 'sandbox_mode=danger-full-access',
         '-c', 'approval_policy=never',
       );
     }

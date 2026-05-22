@@ -487,6 +487,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return;
     }
 
+    // detectProviders() probes CLI presence and version only — it does NOT
+    // populate `models`. Without re-listing them here, every re-detection
+    // advertises model-less providers to the server and empties the chat
+    // UI's model dropdowns. Mirror the startup model-population in cli.ts.
+    await this.populateModels(detected);
+
     const signature = (list: ProviderCapability[]): string =>
       list
         .filter((p) => p.available)
@@ -511,6 +517,35 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       });
       log.info('Sent providers_update to server');
     }
+  }
+
+  /**
+   * Populate each available provider's `models` list via its adapter.
+   *
+   * detectProviders() only probes CLI presence/version; model enumeration is
+   * a separate per-adapter call. Used by the post-detection refresh path so a
+   * re-detection never strips models from the advertised capabilities.
+   * Best-effort per provider: a listModels() failure leaves that provider
+   * without models rather than aborting the whole refresh.
+   */
+  private async populateModels(capabilities: ProviderCapability[]): Promise<void> {
+    await Promise.all(
+      capabilities
+        .filter((capability) => capability.available)
+        .map(async (capability) => {
+          const adapter = this.adapters.get(capability.name);
+          if (!adapter) {
+            return;
+          }
+          try {
+            capability.models = await adapter.listModels();
+          } catch (err) {
+            log.warn(`Failed to list models for ${capability.name}`, {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }),
+    );
   }
 
   private async handleWelcome(message: WelcomeMessage): Promise<void> {
