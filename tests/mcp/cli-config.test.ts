@@ -46,12 +46,23 @@ describe('writeClaudeMcpConfig', () => {
 });
 
 describe('buildCodexMcpArgs', () => {
-  it('returns the two -c override pairs Codex expects', () => {
+  it('returns the three -c override pairs Codex expects', () => {
     const args = buildCodexMcpArgs(conn);
     expect(args).toEqual([
       '-c', `mcp_servers.${BRIDGE_MCP_SERVER_NAME}.url="${conn.url}"`,
       '-c', `mcp_servers.${BRIDGE_MCP_SERVER_NAME}.bearer_token_env_var="${CODEX_BEARER_ENV_VAR}"`,
+      '-c', `mcp_servers.${BRIDGE_MCP_SERVER_NAME}.default_tools_approval_mode="approve"`,
     ]);
+  });
+
+  it('sets default_tools_approval_mode="approve" so MCP calls do not stall in headless mode', () => {
+    // The global `approval_policy=never` does NOT auto-approve MCP calls in
+    // codex 0.131; only the per-server `default_tools_approval_mode="approve"`
+    // pre-approval does. Without it, codex emits "user cancelled MCP tool
+    // call" for every call.
+    const args = buildCodexMcpArgs(conn);
+    expect(args).toContain('-c');
+    expect(args.some((a) => a.includes('default_tools_approval_mode="approve"'))).toBe(true);
   });
 
   it('points Codex at the well-known env var name, not the literal token', () => {

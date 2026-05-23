@@ -66,16 +66,28 @@ export function writeClaudeMcpConfig(conn: McpConnection): string {
 /**
  * Build the `-c` config-override args for codex.
  *
- * Codex reads `mcp_servers.<name>.url` and `mcp_servers.<name>.bearer_token_env_var`
- * from its TOML config; we keep the user's existing config intact by injecting
- * only these two keys via `-c <key>=<value>`. The bearer token is read from
- * AI_BRIDGE_MCP_TOKEN at runtime, so the caller must put `conn.bearerToken`
- * in the spawn env under that name.
+ * Codex reads `mcp_servers.<name>.url`, `mcp_servers.<name>.bearer_token_env_var`,
+ * and `mcp_servers.<name>.default_tools_approval_mode` from its TOML config;
+ * we keep the user's existing config intact by injecting only these keys via
+ * `-c <key>=<value>`.
+ *
+ * `default_tools_approval_mode = "approve"` is the headless-friendly setting:
+ * the codex `exec --json` flow has no way to surface an interactive approval
+ * prompt, and the global `approval_policy = never` does NOT auto-approve MCP
+ * tool calls — verified empirically with codex-cli 0.131.0, both `auto` and
+ * `prompt` produce `"user cancelled MCP tool call"` in headless mode. Only
+ * `approve` (which counter-intuitively means "pre-approved", not "must
+ * approve manually") lets MCP calls go through. The other values codex
+ * accepts here are `auto` and `prompt`.
+ *
+ * The bearer token is read from AI_BRIDGE_MCP_TOKEN at runtime, so the
+ * caller must put `conn.bearerToken` in the spawn env under that name.
  */
 export function buildCodexMcpArgs(conn: McpConnection): string[] {
   return [
     '-c', `mcp_servers.${BRIDGE_MCP_SERVER_NAME}.url="${conn.url}"`,
     '-c', `mcp_servers.${BRIDGE_MCP_SERVER_NAME}.bearer_token_env_var="${CODEX_BEARER_ENV_VAR}"`,
+    '-c', `mcp_servers.${BRIDGE_MCP_SERVER_NAME}.default_tools_approval_mode="approve"`,
   ];
 }
 
