@@ -41,7 +41,8 @@ import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from './env.js';
-import { buildToolInstructions } from '../tools/prompt.js';
+import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
+import { BRIDGE_MCP_SERVER_NAME, writeGeminiSettings } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
@@ -72,19 +73,30 @@ export class GeminiAdapter extends ProviderAdapter {
     log.info('Executing Gemini request', { requestId });
 
     // Build the prompt — prepend system prompt if provided (Gemini CLI
-    // has no dedicated --system-instruction flag, so we concatenate)
+    // has no dedicated --system-instruction flag, so we concatenate). No tool
+    // manifest is appended — Gemini discovers server-declared tools through
+    // the MCP server registered in .gemini/settings.json (see below).
     let prompt = userMessage;
     if (request.system_prompt && !cliSessionId) {
       prompt = buildCombinedPrompt(request.system_prompt, userMessage);
     }
 
-    // When server-defined tools are present, append the tool manifest so the
-    // model knows the tools exist and how to call them — appended every turn
-    // (new and resumed sessions) since Gemini has no protocol-level concept of
-    // these external tools.
-    const hasTools = context.tools.length > 0;
-    if (hasTools) {
-      prompt += '\n\n' + buildToolInstructions(context.tools, context.toolScriptDir);
+    // Wire up MCP by writing .gemini/settings.json in the CLI's working
+    // directory — Gemini reads it as project-scope settings. The bridge's
+    // working directory is dedicated and process-local (see
+    // getBridgeWorkingDir()), so this file is invisible to the operator's
+    // real ~/.gemini config.
+    //
+    // The server entry sets `trust: true` so MCP tool calls auto-approve in
+    // non-interactive --prompt mode (otherwise they would stall waiting for
+    // a user confirmation the headless mode can never deliver).
+    //
+    // In restricted mode we deliberately do NOT pass `--yolo`. Gemini's
+    // built-in shell / edit / web tools therefore stall on approval if the
+    // model tries to use them — which is the safe outcome. `trusted` mode
+    // adds --yolo as the legacy operator opt-in.
+    if (context.mcp) {
+      writeGeminiSettings(context.workingDir, context.mcp);
     }
 
     // Build CLI arguments
@@ -94,14 +106,16 @@ export class GeminiAdapter extends ProviderAdapter {
       '--skip-trust',                   // Required for headless/non-interactive mode
     ];
 
-    // Server-defined bridge tools are invoked as shell commands.  --skip-trust
-    // only trusts the workspace folder; it does NOT auto-approve tool/shell
-    // execution.  In non-interactive --prompt mode Gemini's default approval
-    // mode would block on an approval prompt the model cannot answer, stalling
-    // the request.  --yolo (approval-mode "yolo") auto-approves all tool calls
-    // so the wrapper scripts can run.  Only enabled when tools are present so
-    // tool-less requests keep Gemini's safer default approval behavior.
-    if (hasTools) {
+    if (context.mcp) {
+      // Limit the visible MCP server set to ours, regardless of what the
+      // operator's user/project settings might contain elsewhere.
+      args.push('--allowed-mcp-server-names', BRIDGE_MCP_SERVER_NAME);
+    }
+
+    if (context.cliAutonomy === 'trusted') {
+      // Legacy operator opt-in: auto-approve everything, including built-in
+      // shell/edit. Matches the pre-MCP posture and is unsafe with untrusted
+      // end-user input.
       args.push('--yolo');
     }
 
@@ -136,13 +150,25 @@ export class GeminiAdapter extends ProviderAdapter {
       let settled = false;
       let inTextBlock = false;
 
-      // Build env with tool scripts on PATH and request ID for correlation
-      const env = buildSpawnEnv(context.toolScriptDir, context.requestId);
+      const env = buildSpawnEnv(context.requestId);
 
       const child = this.spawnCli('gemini', args, env);
 
+      // Enforce the server-configured request_timeout (ai-bridge#2).
+      const timeoutTimer = startRequestTimeout(
+        context.requestTimeoutSeconds,
+        () => {
+          log.warn('Request timeout — killing gemini process', {
+            requestId,
+            timeoutSeconds: context.requestTimeoutSeconds,
+          });
+          child.kill('SIGTERM');
+        },
+      );
+
       // Set up abort handling
       const onAbort = () => {
+        clearRequestTimeout(timeoutTimer);
         log.info('Request aborted — killing gemini process', { requestId });
         child.kill('SIGTERM');
       };
@@ -414,6 +440,7 @@ export class GeminiAdapter extends ProviderAdapter {
           ? 'gemini CLI not found. Install it or ensure it is on your PATH.'
           : `Failed to spawn gemini: ${err.message}`;
         signal.removeEventListener('abort', onAbort);
+        clearRequestTimeout(timeoutTimer);
 
         if (!settled) {
           settled = true;
@@ -431,6 +458,7 @@ export class GeminiAdapter extends ProviderAdapter {
 
       child.on('close', (code) => {
         log.debug('Gemini process closed', { code, sessionId });
+        clearRequestTimeout(timeoutTimer);
         finalizer.onChildClose(code);
       });
     });

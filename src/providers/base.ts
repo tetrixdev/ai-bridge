@@ -11,10 +11,12 @@ import type { Readable } from 'node:stream';
 import type {
   ModelInfo,
   AiRequestMessage,
+  CliAutonomy,
   ToolDefinition,
   StreamEventType,
   StreamEventData,
 } from '../protocol/types.js';
+import type { McpConnection } from '../mcp/cli-config.js';
 import { formatStderrMessage, getBridgeWorkingDir } from './env.js';
 
 /** A stream event emitted by the adapter. */
@@ -31,12 +33,28 @@ export interface ExecutionContext {
   requestId: string;
   /** Tool definitions that should be made available to the CLI. */
   tools: ToolDefinition[];
-  /** Path to directory containing generated tool wrapper scripts. */
-  toolScriptDir: string | null;
-  /** Callback to resolve a tool call through the server. */
-  onToolCall: (toolCallId: string, toolName: string, args: Record<string, unknown>) => Promise<unknown>;
+  /**
+   * Connection details for the bridge's local MCP server, when one is
+   * running. `null` when no tools are registered — adapters skip MCP wiring
+   * in that case and pass no MCP config to the CLI.
+   */
+  mcp: McpConnection | null;
+  /**
+   * Server-supplied CLI autonomy posture. `restricted` (default) keeps the
+   * legacy "autonomous full-disk" flags off; `trusted` re-enables them as an
+   * operator opt-in.
+   */
+  cliAutonomy: CliAutonomy;
+  /**
+   * Per-process working directory the CLI is spawned in. Used by adapters
+   * (Gemini) that read MCP config from a file in cwd. Pre-populated by the
+   * bridge with whatever config the CLI needs.
+   */
+  workingDir: string;
   /** Abort signal for cancellation. */
   signal: AbortSignal;
+  /** Maximum seconds the request may run before being aborted (server-configured). */
+  requestTimeoutSeconds: number;
   /** CLI session ID if resuming, or null for new session. */
   cliSessionId: string | null;
 }

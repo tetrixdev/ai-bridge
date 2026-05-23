@@ -46,20 +46,28 @@ export function getBridgeWorkingDir(): string {
 /**
  * Build the environment variables for spawning a CLI subprocess.
  *
- * @param toolScriptDir  Directory containing tool wrapper scripts to prepend
- *                       to PATH, or null to skip PATH modification (e.g. for
- *                       Codex which handles tools internally).
- * @param requestId      Optional request ID to pass as AI_BRIDGE_REQUEST_ID
- *                       env var for concurrent-request correlation.
+ * The legacy `toolScriptDir` parameter (prepended to PATH for the Bash-wrapper
+ * tool plumbing) was removed when tool exposure moved to the bridge-side MCP
+ * server. Callers now pass extra env entries directly when they need them
+ * (e.g. AI_BRIDGE_MCP_TOKEN for codex's bearer-token-env-var integration).
+ *
+ * @param requestId  Optional request ID to pass as AI_BRIDGE_REQUEST_ID env
+ *                   var for concurrent-request correlation.
+ * @param extra      Additional env vars to merge in (overrides process.env).
  * @returns A copy of process.env with the requested modifications applied.
  */
-export function buildSpawnEnv(toolScriptDir: string | null, requestId?: string): NodeJS.ProcessEnv {
+export function buildSpawnEnv(
+  requestId?: string,
+  extra?: Record<string, string>,
+): NodeJS.ProcessEnv {
   const env = { ...process.env };
-  if (toolScriptDir) {
-    env['PATH'] = `${toolScriptDir}:${env['PATH'] ?? ''}`;
-  }
   if (requestId) {
     env['AI_BRIDGE_REQUEST_ID'] = requestId;
+  }
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) {
+      env[key] = value;
+    }
   }
   // Remove bridge credential variables from the child process environment so
   // the token does not leak into /proc/<pid>/environ or the CLI's own logging.

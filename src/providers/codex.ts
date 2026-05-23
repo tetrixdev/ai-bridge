@@ -24,7 +24,8 @@ import { join } from 'node:path';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from './env.js';
-import { buildToolInstructions } from '../tools/prompt.js';
+import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
+import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
@@ -96,44 +97,33 @@ export class CodexAdapter extends ProviderAdapter {
     // and `codex exec resume`, so this applies to new and resumed sessions.
     args.push('-c', 'model_reasoning_summary=detailed');
 
-    // Server-defined bridge tools support.  Codex's `exec` sandbox defaults to
-    // read-only with no network access, which blocks the wrapper script's
-    // loopback callback.  When tools are present we run with danger-full-access
-    // and approval_policy=never: the wrapper scripts execute directly (no
-    // network restriction) and exec never stalls on an approval prompt.
-    // workspace-write was not used because its bubblewrap sandbox requires
-    // unprivileged user namespaces, which are unavailable in many container and
-    // hardened-kernel environments — there the tool callback fails entirely.
-    // This matches Claude (bypassPermissions) and Gemini (--yolo): the bridge
-    // runs the CLI in the user's own trusted environment.  Tool-less requests
-    // keep Codex's safer default sandbox.
-    const hasTools = context.tools.length > 0;
-    if (hasTools) {
-      // Pass the sandbox mode as a `-c` config override rather than the
-      // `-s/--sandbox` flag: `-s` is only accepted by `codex exec`, not by
-      // `codex exec resume`, so using the flag breaks every follow-up turn
-      // ("unexpected argument '-s' found"). `-c key=value` is accepted by
-      // both subcommands and is equivalent.
-      args.push(
-        '-c', 'sandbox_mode=danger-full-access',
-        '-c', 'approval_policy=never',
-      );
+    // Wire up the bridge's MCP server. Server-declared tools are reached
+    // through that channel only — Codex's own built-in `shell` tool is left
+    // at its default sandbox (read-only, no network) unless the operator
+    // opted into `trusted` mode. With sandbox_mode=read-only and no
+    // approval_policy override the model cannot run arbitrary shell against
+    // the bridge operator's machine even with a creatively-worded prompt.
+    if (context.mcp) {
+      args.push(...buildCodexMcpArgs(context.mcp));
+      if (context.cliAutonomy === 'trusted') {
+        // Legacy escape hatch for developers running the bridge against their
+        // own machine. Matches the pre-MCP behaviour: the model can run
+        // shell, edit files, and execute the wrapper scripts that used to
+        // back the tool plumbing. Not safe when end users can send chat
+        // messages.
+        args.push(
+          '-c', 'sandbox_mode=danger-full-access',
+          '-c', 'approval_policy=never',
+        );
+      }
     }
 
     // Build the prompt positional argument. The prompt is appended LAST, after
     // every option flag, so Codex's argument parser never mistakes it for a
-    // flag value.
-    //
-    // When server tools are present we append a note listing the available
-    // tool command names so Codex knows it may run them as shell commands.
-    // On a fresh session the system prompt is also prepended; on a resumed
-    // session the original system prompt was already consumed by the first
-    // turn, so the tool note is appended to the user message directly.
-    const toolNote = hasTools ? '\n\n' + buildToolInstructions(context.tools, context.toolScriptDir) : '';
+    // flag value. No tool manifest is appended — Codex discovers
+    // server-declared tools through the MCP server.
     if (!cliSessionId && request.system_prompt) {
-      args.push('--', buildCombinedPrompt(request.system_prompt, userMessage) + toolNote);
-    } else if (toolNote) {
-      args.push('--', userMessage + toolNote);
+      args.push('--', buildCombinedPrompt(request.system_prompt, userMessage));
     } else {
       args.push(userMessage);
     }
@@ -157,20 +147,36 @@ export class CodexAdapter extends ProviderAdapter {
       let blockIndex = 0;
       let settled = false;
 
-      // Prepend the tool-script directory to PATH so the wrapper commands are
-      // invocable by Codex's model-generated shell commands; pass null when
-      // there are no tools so PATH is left untouched.
-      if (hasTools) {
-        log.info('Server-defined tools enabled for Codex request', {
+      if (context.mcp) {
+        log.info('Bridge MCP server registered for Codex request', {
           toolCount: context.tools.length,
         });
       }
-      const env = buildSpawnEnv(hasTools ? context.toolScriptDir : null, context.requestId);
+      // Codex reads the MCP bearer token from this env var (configured by
+      // buildCodexMcpArgs as bearer_token_env_var). The env var name must
+      // match between the codex config and the spawn env.
+      const env = buildSpawnEnv(
+        context.requestId,
+        context.mcp ? { [CODEX_BEARER_ENV_VAR]: context.mcp.bearerToken } : undefined,
+      );
 
       const child = this.spawnCli('codex', args, env);
 
+      // Enforce the server-configured request_timeout (ai-bridge#2).
+      const timeoutTimer = startRequestTimeout(
+        context.requestTimeoutSeconds,
+        () => {
+          log.warn('Request timeout — killing codex process', {
+            requestId,
+            timeoutSeconds: context.requestTimeoutSeconds,
+          });
+          child.kill('SIGTERM');
+        },
+      );
+
       // Set up abort handling
       const onAbort = () => {
+        clearRequestTimeout(timeoutTimer);
         log.info('Request aborted — killing codex process', { requestId });
         child.kill('SIGTERM');
       };
@@ -362,6 +368,7 @@ export class CodexAdapter extends ProviderAdapter {
           ? 'codex CLI not found. Install it or ensure it is on your PATH.'
           : `Failed to spawn codex: ${err.message}`;
         signal.removeEventListener('abort', onAbort);
+        clearRequestTimeout(timeoutTimer);
 
         if (!settled) {
           settled = true;
@@ -379,6 +386,7 @@ export class CodexAdapter extends ProviderAdapter {
 
       child.on('close', (code) => {
         log.debug('Codex process closed', { code, sessionId });
+        clearRequestTimeout(timeoutTimer);
         finalizer.onChildClose(code);
       });
     });

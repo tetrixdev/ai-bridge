@@ -143,6 +143,22 @@ export type BridgeToServerMessage =
 // Server -> Bridge Messages
 // ---------------------------------------------------------------------------
 
+/**
+ * CLI sandbox posture passed by the server.
+ *
+ * - `restricted` (default): provider CLIs are spawned WITHOUT their
+ *   "autonomous full-disk" flags (no `bypassPermissions`, no
+ *   `danger-full-access`, no `--yolo`). The model reaches server-declared
+ *   tools through the bridge's MCP server only; built-in shell / edit tools
+ *   on the CLI itself are not callable.
+ * - `trusted`: the legacy posture, kept as an operator opt-in for the
+ *   developer-runs-bridge-against-own-machine case. The MCP server is still
+ *   registered, but the CLI's bypass flags are also passed so its built-in
+ *   tools work too. Never the right choice when the bridge is reachable by
+ *   untrusted end users.
+ */
+export type CliAutonomy = 'trusted' | 'restricted';
+
 /** Server acknowledges the hello and provides configuration. */
 export interface WelcomeMessage {
   type: 'welcome';
@@ -156,6 +172,11 @@ export interface WelcomeMessage {
    * token at the handshake. The bridge adopts it for subsequent reconnects.
    */
   refreshed_token?: string;
+  /**
+   * CLI sandbox posture. Defaults to `restricted` when absent — older servers
+   * that don't send the field get the safe default, never the legacy bypass.
+   */
+  cli_autonomy?: CliAutonomy;
 }
 
 /** Server-provided configuration values. */
