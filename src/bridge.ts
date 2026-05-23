@@ -23,7 +23,7 @@ import type {
   BridgeToServerMessage,
   ServerToBridgeMessage,
   AiRequestMessage,
-  CliAutonomy,
+  CliIsolation,
   ConnectionErrorMessage,
   ConversationEntry,
   WelcomeMessage,
@@ -165,10 +165,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    */
   private readonly mcpServer: BridgeMcpServer;
   /**
-   * The server-supplied CLI autonomy posture. Defaults to `restricted` for
+   * The server-supplied CLI isolation posture. Defaults to `isolated` for
    * older servers that don't send the field — the safe default.
    */
-  private cliAutonomy: CliAutonomy = 'restricted';
+  private cliIsolation: CliIsolation = 'isolated';
   /** Registered tools from the most recent welcome — passed to each adapter. */
   private currentTools: import('./protocol/types.js').ToolDefinition[] = [];
   private readonly testMode: boolean;
@@ -600,14 +600,15 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       this.serverConfig.request_timeout = clamped;
     }
 
-    // Adopt the server's CLI autonomy posture. Older servers that don't send
-    // the field get the safe default (`restricted`) — never the legacy bypass.
-    this.cliAutonomy = message.cli_autonomy ?? 'restricted';
+    // Adopt the server's CLI isolation posture. Older servers that don't
+    // send the field get the safe default (`isolated`) — never the legacy
+    // native behaviour.
+    this.cliIsolation = message.cli_isolation ?? 'isolated';
     this.currentTools = message.tools;
     this.mcpServer.setTools(message.tools);
     log.info('Welcome registered tools', {
       count: message.tools.length,
-      cliAutonomy: this.cliAutonomy,
+      cliIsolation: this.cliIsolation,
     });
 
     // Start the bridge-side MCP server once tools are present. Spawned CLIs
@@ -842,7 +843,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         requestId: request_id,
         tools: this.currentTools,
         mcp,
-        cliAutonomy: this.cliAutonomy,
+        cliIsolation: this.cliIsolation,
         workingDir: getBridgeWorkingDir(),
         signal,
         requestTimeoutSeconds: this.serverConfig.request_timeout,

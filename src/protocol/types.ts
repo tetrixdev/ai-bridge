@@ -144,20 +144,36 @@ export type BridgeToServerMessage =
 // ---------------------------------------------------------------------------
 
 /**
- * CLI sandbox posture passed by the server.
+ * How much the local CLI environment is allowed to influence behaviour.
  *
- * - `restricted` (default): provider CLIs are spawned WITHOUT their
- *   "autonomous full-disk" flags (no `bypassPermissions`, no
- *   `danger-full-access`, no `--yolo`). The model reaches server-declared
- *   tools through the bridge's MCP server only; built-in shell / edit tools
- *   on the CLI itself are not callable.
- * - `trusted`: the legacy posture, kept as an operator opt-in for the
+ * - `isolated` (default): the bridge isolates the spawned CLI from local
+ *   influence. Concretely:
+ *     • Built-in shell / edit / web tools are blocked (no `bypassPermissions`,
+ *       no `danger-full-access`, no `--yolo`). The model can reach
+ *       server-declared tools only, via the bridge's MCP server.
+ *     • Other MCP servers configured on the operator's machine are ignored
+ *       (`--strict-mcp-config` for Claude; per-CLI equivalents where
+ *       available).
+ *     • `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` auto-discovery is suppressed
+ *       (`cwd` is already pinned to an empty temp dir by the bridge; Claude
+ *       additionally runs with `--bare` so hooks, auto-memory, keychain
+ *       reads, and the user-level `CLAUDE.md` are also off).
+ *     • A neutral fallback system prompt is injected when the server didn't
+ *       send one, so the CLI's built-in default never seeps through.
+ *   This is the right posture when the bridge is reachable by end users.
+ *
+ * - `native`: the legacy posture, kept as an operator opt-in for the
  *   developer-runs-bridge-against-own-machine case. The MCP server is still
- *   registered, but the CLI's bypass flags are also passed so its built-in
- *   tools work too. Never the right choice when the bridge is reachable by
- *   untrusted end users.
+ *   registered, but the CLI runs with its bypass flags AND its local
+ *   environment (user CLAUDE.md, skills, hooks, configured MCP servers,
+ *   plugins, default system prompt) intact. Never the right choice when the
+ *   bridge is reachable by untrusted end users.
+ *
+ * Layer B (HOME / CODEX_HOME / GEMINI_HOME redirection with auth symlinks)
+ * would further close `isolated`'s residual user-level leakage for Codex and
+ * Gemini — see `tasks/open/cli-isolation-layer-b.md`.
  */
-export type CliAutonomy = 'trusted' | 'restricted';
+export type CliIsolation = 'native' | 'isolated';
 
 /** Server acknowledges the hello and provides configuration. */
 export interface WelcomeMessage {
@@ -173,10 +189,11 @@ export interface WelcomeMessage {
    */
   refreshed_token?: string;
   /**
-   * CLI sandbox posture. Defaults to `restricted` when absent — older servers
-   * that don't send the field get the safe default, never the legacy bypass.
+   * CLI isolation posture. Defaults to `isolated` when absent — older servers
+   * that don't send the field get the safe default, never the legacy native
+   * behaviour.
    */
-  cli_autonomy?: CliAutonomy;
+  cli_isolation?: CliIsolation;
 }
 
 /** Server-provided configuration values. */

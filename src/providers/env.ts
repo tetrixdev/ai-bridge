@@ -77,6 +77,37 @@ export function buildSpawnEnv(
 }
 
 /**
+ * Neutral fallback system prompt used in `isolated` mode when the server did
+ * not provide one. Without this the CLI would fall back to its built-in
+ * default — typically a coding-agent persona that leaks Claude-Code /
+ * Codex / Gemini-CLI conventions into a chat that should be governed by the
+ * server-side product. Kept intentionally generic.
+ */
+export const ISOLATED_FALLBACK_SYSTEM_PROMPT =
+  'You are an AI assistant. Use only the tools provided to you to fulfil the user\'s request, and reply in plain prose.';
+
+/**
+ * Resolve the system prompt to pass to the CLI for this turn.
+ *
+ * - If the server sent one, use it as-is (regardless of isolation).
+ * - In `isolated` mode with no server prompt, return the neutral fallback so
+ *   the CLI's built-in default never seeps through.
+ * - In `native` mode with no server prompt, return null — the CLI applies
+ *   whatever it normally would.
+ *
+ * Returns null only when the CLI should be left to its own default.
+ */
+export function resolveSystemPrompt(
+  serverPrompt: string | null,
+  isolation: 'isolated' | 'native',
+): string | null {
+  if (serverPrompt) {
+    return serverPrompt;
+  }
+  return isolation === 'isolated' ? ISOLATED_FALLBACK_SYSTEM_PROMPT : null;
+}
+
+/**
  * Build a combined prompt by prepending the system prompt to the user message.
  *
  * Used by providers (Gemini, Codex) whose CLIs lack a dedicated

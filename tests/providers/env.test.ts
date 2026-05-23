@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from '../../src/providers/env.js';
+import {
+  buildSpawnEnv,
+  buildCombinedPrompt,
+  appendStderr,
+  formatStderrMessage,
+  resolveSystemPrompt,
+  ISOLATED_FALLBACK_SYSTEM_PROMPT,
+} from '../../src/providers/env.js';
 
 describe('Environment Utilities', () => {
   describe('buildSpawnEnv()', () => {
@@ -59,6 +66,31 @@ describe('Environment Utilities', () => {
 
       env['MY_CUSTOM_VAR'] = 'test';
       expect(process.env['MY_CUSTOM_VAR']).toBeUndefined();
+    });
+  });
+
+  describe('resolveSystemPrompt()', () => {
+    it('returns the server-supplied prompt when present in isolated mode', () => {
+      expect(resolveSystemPrompt('be helpful', 'isolated')).toBe('be helpful');
+    });
+
+    it('returns the server-supplied prompt when present in native mode', () => {
+      expect(resolveSystemPrompt('be helpful', 'native')).toBe('be helpful');
+    });
+
+    it('returns the neutral fallback in isolated mode when the server did not send one', () => {
+      expect(resolveSystemPrompt(null, 'isolated')).toBe(ISOLATED_FALLBACK_SYSTEM_PROMPT);
+    });
+
+    it('returns null in native mode when the server did not send one (CLI uses its own default)', () => {
+      expect(resolveSystemPrompt(null, 'native')).toBeNull();
+    });
+
+    it('treats empty string the same as null (falsy → fallback)', () => {
+      // The bridge gets the server-side string verbatim — an empty value means
+      // "nothing supplied" from the model's point of view, so fall through.
+      expect(resolveSystemPrompt('', 'isolated')).toBe(ISOLATED_FALLBACK_SYSTEM_PROMPT);
+      expect(resolveSystemPrompt('', 'native')).toBeNull();
     });
   });
 

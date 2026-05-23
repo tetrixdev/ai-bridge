@@ -17,7 +17,7 @@
 import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv, appendStderr, formatStderrMessage } from './env.js';
+import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
@@ -64,9 +64,24 @@ export class ClaudeAdapter extends ProviderAdapter {
       log.debug('Resuming session', { cliSessionId });
     }
 
-    // Add system prompt if provided (only on new sessions)
-    if (request.system_prompt && !cliSessionId) {
-      args.push('--system-prompt', request.system_prompt);
+    // In `isolated` mode, run Claude with `--bare`: a minimal startup that
+    // skips hooks, LSP, plugin sync, auto-memory, background prefetches,
+    // keychain reads, and CLAUDE.md auto-discovery (per the CLI docs). All
+    // context must be supplied explicitly via the flags below, which is what
+    // we want — the bridge is the only context source.
+    if (context.cliIsolation === 'isolated') {
+      args.push('--bare');
+    }
+
+    // Add system prompt (only on new sessions). resolveSystemPrompt() returns
+    // the server-supplied prompt when present, the neutral isolated fallback
+    // when missing-and-isolated, or null when missing-and-native (let Claude
+    // use its own default).
+    const systemPrompt = !cliSessionId
+      ? resolveSystemPrompt(request.system_prompt, context.cliIsolation)
+      : null;
+    if (systemPrompt !== null) {
+      args.push('--system-prompt', systemPrompt);
     }
 
     // Add model if specified in request options
@@ -80,23 +95,24 @@ export class ClaudeAdapter extends ProviderAdapter {
     }
 
     // Wire up the bridge's MCP server so the model can call server-declared
-    // tools. `--strict-mcp-config` is critical: without it Claude would load
-    // MCP servers from the user's global ~/.claude config too, widening the
-    // tool surface beyond what the bridge intends.
+    // tools. `--strict-mcp-config` is critical in isolated mode: without it
+    // Claude would load MCP servers from the user's global ~/.claude config
+    // too, widening the tool surface beyond what the bridge intends.
     //
-    // In restricted mode (the default) we ALSO explicitly allow only our
-    // MCP tools via `--allowedTools mcp__bridge__*`. Claude's built-in
-    // Bash / Edit / Write / Read / Glob / Grep / WebFetch tools then deny
-    // by default in headless `-p` mode (no interactive approver), so the
-    // model can only reach our tools — not shell.
+    // In `isolated` mode we ALSO explicitly allow only our MCP tools via
+    // `--allowedTools mcp__bridge__*`. Claude's built-in Bash / Edit / Write
+    // / Read / Glob / Grep / WebFetch tools then deny by default in headless
+    // `-p` mode (no interactive approver), so the model can only reach our
+    // tools — not shell.
     //
-    // In trusted mode we additionally pass `--permission-mode bypassPermissions`,
-    // matching the legacy posture for the developer-runs-bridge-against-own-
-    // machine case.
+    // In `native` mode the operator's other MCP servers stay loadable and we
+    // pass `--permission-mode bypassPermissions`, matching the legacy posture
+    // for the developer-runs-bridge-against-own-machine case.
     if (context.mcp) {
       const configPath = writeClaudeMcpConfig(context.mcp);
-      args.push('--mcp-config', configPath, '--strict-mcp-config');
-      if (context.cliAutonomy === 'restricted') {
+      args.push('--mcp-config', configPath);
+      if (context.cliIsolation === 'isolated') {
+        args.push('--strict-mcp-config');
         // Glob is supported in --allowedTools matchers (per Claude CLI docs,
         // e.g. "Bash(git *)"). `mcp__<server>__*` is the standard MCP tool
         // namespace prefix Claude uses.

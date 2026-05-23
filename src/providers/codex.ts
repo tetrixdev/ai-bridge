@@ -23,7 +23,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from './env.js';
+import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
@@ -100,12 +100,17 @@ export class CodexAdapter extends ProviderAdapter {
     // Wire up the bridge's MCP server. Server-declared tools are reached
     // through that channel only — Codex's own built-in `shell` tool is left
     // at its default sandbox (read-only, no network) unless the operator
-    // opted into `trusted` mode. With sandbox_mode=read-only and no
+    // opted into `native` mode. With sandbox_mode=read-only and no
     // approval_policy override the model cannot run arbitrary shell against
     // the bridge operator's machine even with a creatively-worded prompt.
+    //
+    // Note: Codex's user-level `~/.codex/AGENTS.md`, skills, and plugins
+    // still load in `isolated` mode (cwd is pinned but $HOME is not). Closing
+    // that residual leakage requires CODEX_HOME redirection with auth file
+    // symlinking — tracked in tasks/open/cli-isolation-layer-b.md.
     if (context.mcp) {
       args.push(...buildCodexMcpArgs(context.mcp));
-      if (context.cliAutonomy === 'trusted') {
+      if (context.cliIsolation === 'native') {
         // Legacy escape hatch for developers running the bridge against their
         // own machine. Matches the pre-MCP behaviour: the model can run
         // shell, edit files, and execute the wrapper scripts that used to
@@ -122,8 +127,16 @@ export class CodexAdapter extends ProviderAdapter {
     // every option flag, so Codex's argument parser never mistakes it for a
     // flag value. No tool manifest is appended — Codex discovers
     // server-declared tools through the MCP server.
-    if (!cliSessionId && request.system_prompt) {
-      args.push('--', buildCombinedPrompt(request.system_prompt, userMessage));
+    //
+    // Codex has no dedicated --system-prompt flag, so the resolved system
+    // prompt is concatenated. In isolated mode resolveSystemPrompt() returns
+    // a neutral default when the server didn't send one, so Codex's own
+    // built-in default never seeps through.
+    const systemPrompt = !cliSessionId
+      ? resolveSystemPrompt(request.system_prompt, context.cliIsolation)
+      : null;
+    if (systemPrompt !== null) {
+      args.push('--', buildCombinedPrompt(systemPrompt, userMessage));
     } else {
       args.push(userMessage);
     }

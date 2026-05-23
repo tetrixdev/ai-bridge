@@ -11,7 +11,7 @@ import type { Readable } from 'node:stream';
 import type {
   ModelInfo,
   AiRequestMessage,
-  CliAutonomy,
+  CliIsolation,
   ToolDefinition,
   StreamEventType,
   StreamEventData,
@@ -40,11 +40,12 @@ export interface ExecutionContext {
    */
   mcp: McpConnection | null;
   /**
-   * Server-supplied CLI autonomy posture. `restricted` (default) keeps the
-   * legacy "autonomous full-disk" flags off; `trusted` re-enables them as an
-   * operator opt-in.
+   * Server-supplied CLI isolation posture. `isolated` (default) keeps the
+   * spawned CLI cut off from local influence — no built-in shell/edit, no
+   * user-level CLAUDE.md / skills / hooks, neutral fallback system prompt.
+   * `native` re-enables the legacy posture as an operator opt-in.
    */
-  cliAutonomy: CliAutonomy;
+  cliIsolation: CliIsolation;
   /**
    * Per-process working directory the CLI is spawned in. Used by adapters
    * (Gemini) that read MCP config from a file in cwd. Pre-populated by the

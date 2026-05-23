@@ -40,7 +40,7 @@
 import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from './env.js';
+import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeGeminiSettings } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
@@ -72,13 +72,18 @@ export class GeminiAdapter extends ProviderAdapter {
 
     log.info('Executing Gemini request', { requestId });
 
-    // Build the prompt — prepend system prompt if provided (Gemini CLI
-    // has no dedicated --system-instruction flag, so we concatenate). No tool
-    // manifest is appended — Gemini discovers server-declared tools through
-    // the MCP server registered in .gemini/settings.json (see below).
+    // Build the prompt — prepend system prompt if provided (Gemini CLI has no
+    // dedicated --system-instruction flag, so we concatenate). In isolated
+    // mode resolveSystemPrompt() returns a neutral default when the server
+    // didn't send one, so Gemini's own built-in default never seeps through.
+    // No tool manifest is appended — Gemini discovers server-declared tools
+    // through the MCP server registered in .gemini/settings.json (see below).
     let prompt = userMessage;
-    if (request.system_prompt && !cliSessionId) {
-      prompt = buildCombinedPrompt(request.system_prompt, userMessage);
+    if (!cliSessionId) {
+      const systemPrompt = resolveSystemPrompt(request.system_prompt, context.cliIsolation);
+      if (systemPrompt !== null) {
+        prompt = buildCombinedPrompt(systemPrompt, userMessage);
+      }
     }
 
     // Wire up MCP by writing .gemini/settings.json in the CLI's working
@@ -91,10 +96,15 @@ export class GeminiAdapter extends ProviderAdapter {
     // non-interactive --prompt mode (otherwise they would stall waiting for
     // a user confirmation the headless mode can never deliver).
     //
-    // In restricted mode we deliberately do NOT pass `--yolo`. Gemini's
+    // In `isolated` mode we deliberately do NOT pass `--yolo`. Gemini's
     // built-in shell / edit / web tools therefore stall on approval if the
-    // model tries to use them — which is the safe outcome. `trusted` mode
+    // model tries to use them — which is the safe outcome. `native` mode
     // adds --yolo as the legacy operator opt-in.
+    //
+    // Note: Gemini's user-level `~/.gemini/GEMINI.md` and skills/extensions
+    // still load in `isolated` mode (cwd is pinned but $HOME is not).
+    // Closing that residual leakage requires HOME/GEMINI_HOME redirection
+    // with auth symlinking — tracked in tasks/open/cli-isolation-layer-b.md.
     if (context.mcp) {
       writeGeminiSettings(context.workingDir, context.mcp);
     }
@@ -112,7 +122,7 @@ export class GeminiAdapter extends ProviderAdapter {
       args.push('--allowed-mcp-server-names', BRIDGE_MCP_SERVER_NAME);
     }
 
-    if (context.cliAutonomy === 'trusted') {
+    if (context.cliIsolation === 'native') {
       // Legacy operator opt-in: auto-approve everything, including built-in
       // shell/edit. Matches the pre-MCP posture and is unsafe with untrusted
       // end-user input.
