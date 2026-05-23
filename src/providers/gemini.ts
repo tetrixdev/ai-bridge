@@ -15,6 +15,26 @@
  *   {"type":"tool_result","tool_id":"...","status":"success|error","output":"...","timestamp":"..."}
  *   {"type":"error","severity":"warning|error","message":"...","timestamp":"..."}
  *   {"type":"result","status":"success|error","stats":{...},"timestamp":"..."}
+ *
+ * KNOWN LIMITATION — no `thinking` blocks for Gemini.
+ *
+ * This adapter emits no `thinking` block events (the Codex and Claude adapters
+ * do). This is an upstream Gemini CLI limitation, not something the bridge can
+ * fix: the `--output-format stream-json` event schema is a fixed enum —
+ * `init | message | tool_use | tool_result | error | result` — with no thought
+ * type. Internally the CLI has `GeminiEventType.Thought` and surfaces thoughts
+ * over its ACP interface (`agent_thought_chunk`), but the non-interactive
+ * stream-json code path only forwards `Content` events and drops `Thought`
+ * ones before the formatter. `ui.inlineThinkingMode` only affects the
+ * interactive TUI — it has no effect on stream-json output (verified against
+ * gemini-cli 0.42.0).
+ *
+ * Capturing Gemini thinking would require either the upstream CLI adding a
+ * thought event to stream-json, or this adapter being rewritten onto the ACP
+ * interface — a much larger change. See:
+ *   - docs: https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/headless.md
+ *   - upstream issue (broad): https://github.com/google-gemini/gemini-cli/issues/8473
+ *   - thinking summaries, closed not planned: https://github.com/google-gemini/gemini-cli/issues/15052
  */
 
 import { createInterface } from 'node:readline';

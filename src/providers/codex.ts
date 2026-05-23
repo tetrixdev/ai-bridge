@@ -86,6 +86,16 @@ export class CodexAdapter extends ProviderAdapter {
       ];
     }
 
+    // Surface the model's reasoning. Codex's `exec --json` stream only emits
+    // `item.completed` items of type `reasoning` when `model_reasoning_summary`
+    // is `detailed` (or `concise`). The CLI default is `auto`, which does NOT
+    // surface reasoning summaries in exec/json mode — verified even at
+    // `model_reasoning_effort=high` with hundreds of reasoning tokens, zero
+    // reasoning items were emitted. Without this override the bridge captures
+    // no `thinking` blocks for Codex. `-c` is accepted by both `codex exec`
+    // and `codex exec resume`, so this applies to new and resumed sessions.
+    args.push('-c', 'model_reasoning_summary=detailed');
+
     // Server-defined bridge tools support.  Codex's `exec` sandbox defaults to
     // read-only with no network access, which blocks the wrapper script's
     // loopback callback.  When tools are present we run with danger-full-access
