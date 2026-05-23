@@ -64,14 +64,23 @@ export class ClaudeAdapter extends ProviderAdapter {
       log.debug('Resuming session', { cliSessionId });
     }
 
-    // In `isolated` mode, run Claude with `--bare`: a minimal startup that
-    // skips hooks, LSP, plugin sync, auto-memory, background prefetches,
-    // keychain reads, and CLAUDE.md auto-discovery (per the CLI docs). All
-    // context must be supplied explicitly via the flags below, which is what
-    // we want — the bridge is the only context source.
-    if (context.cliIsolation === 'isolated') {
-      args.push('--bare');
-    }
+    // `--bare` would be the natural fit for `isolated` mode (skips hooks,
+    // LSP, plugin sync, auto-memory, background prefetches, keychain reads,
+    // and CLAUDE.md auto-discovery) — BUT its keychain-read suppression
+    // breaks OAuth: per Claude's own docs, "Anthropic auth is strictly
+    // ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain
+    // are never read)". For an operator logged in via subscription/OAuth
+    // (the common case for the bridge), `--bare` produces a hard
+    // "Not logged in — please run /login" error on every turn.
+    //
+    // Until Layer B routes auth via apiKeyHelper or ANTHROPIC_API_KEY
+    // passthrough, we DON'T pass `--bare`. The remaining isolation
+    // (--strict-mcp-config, --allowedTools, default permission mode in -p)
+    // still blocks built-in tools and other MCP servers; what leaks is
+    // hooks, auto-memory, plugin sync, and CLAUDE.md auto-discovery. The
+    // bridge's cwd-pinning (see env.ts:getBridgeWorkingDir) keeps cwd-walk
+    // CLAUDE.md out — only user-level ~/.claude/CLAUDE.md still applies.
+    // Tracked in tasks/open/cli-isolation-layer-b.md.
 
     // Add system prompt (only on new sessions). resolveSystemPrompt() returns
     // the server-supplied prompt when present, the neutral isolated fallback

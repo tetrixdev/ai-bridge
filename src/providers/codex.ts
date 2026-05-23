@@ -316,7 +316,7 @@ export class CodexAdapter extends ProviderAdapter {
             const args = item['arguments'] as unknown;
             const result = item['result'] as unknown;
             const status = item['status'] as string | undefined;
-            const errorMsg = item['error'] as string | undefined;
+            const errorField = item['error'];
             const toolCallId = (item['id'] as string) ?? `mcp_${Date.now()}`;
 
             // Argument payload — codex sometimes ships this pre-stringified,
@@ -345,6 +345,16 @@ export class CodexAdapter extends ProviderAdapter {
             });
             blockIndex++;
 
+            // Error → human-readable string. Codex's `error` field can be a
+            // plain string OR an object with nested fields; templating an
+            // object directly produced "Error: [object Object]" in the chat
+            // UI before this normalisation.
+            const errorMsg = typeof errorField === 'string'
+              ? errorField
+              : errorField != null
+                ? JSON.stringify(errorField)
+                : undefined;
+
             // Result. Codex emits a single combined item for begin+end of an
             // MCP call (unlike local_shell_call which is split), so the
             // tool_result follows immediately after the tool_call block.
@@ -357,7 +367,12 @@ export class CodexAdapter extends ProviderAdapter {
               data: { tool_call_id: toolCallId, result: resultText },
             });
 
-            log.debug('Surfaced Codex MCP tool call', { server, toolName, status });
+            log.info('Codex MCP tool call surfaced', {
+              server,
+              toolName,
+              status,
+              hasError: errorMsg !== undefined,
+            });
           }
           // function_call / function_call_output / local_shell_call items are
           // Codex's own internal tool execution and not relayed — in

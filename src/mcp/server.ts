@@ -105,6 +105,12 @@ export class BridgeMcpServer {
     );
 
     server.setRequestHandler(ListToolsRequestSchema, async (): Promise<ListToolsResult> => {
+      const ctx = this.callContext.getStore();
+      log.info('MCP tools/list', {
+        requestId: ctx?.requestId,
+        toolCount: this.tools.length,
+        tools: this.tools.map((t) => t.name),
+      });
       return {
         tools: this.tools.map((t) => ({
           name: t.name,
@@ -127,15 +133,22 @@ export class BridgeMcpServer {
         };
       }
 
-      log.debug('Tool call from CLI', { requestId: ctx.requestId, name });
+      // INFO (not debug) so it shows up without --debug — live tests need to
+      // see at-a-glance whether the CLI is actually reaching the MCP server.
+      log.info('MCP tools/call', { requestId: ctx.requestId, name });
 
       try {
         const result = await this.handleCall(ctx.requestId, name, args);
         const text = typeof result === 'string' ? result : JSON.stringify(result);
+        log.info('MCP tool resolved', {
+          requestId: ctx.requestId,
+          name,
+          resultBytes: text.length,
+        });
         return { content: [{ type: 'text', text }] };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        log.warn('Tool call failed', { requestId: ctx.requestId, name, error: message });
+        log.warn('MCP tool failed', { requestId: ctx.requestId, name, error: message });
         // isError: true tells the model the call failed without raising a
         // protocol-level error. The model can then recover (retry, ask the
         // user, give up gracefully) instead of seeing a hard JSON-RPC fault.
@@ -251,6 +264,7 @@ export class BridgeMcpServer {
     // Only the /mcp path is exposed.
     const url = req.url ?? '';
     if (!url.startsWith('/mcp')) {
+      log.warn('MCP HTTP 404', { method: req.method, url });
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'not_found' }));
       return;
@@ -264,6 +278,15 @@ export class BridgeMcpServer {
     const token = match ? match[1] : null;
     const requestId = token ? this.tokens.get(token) : undefined;
     if (!token || !requestId) {
+      // WARN (not debug) — a 401 here means either a CLI is misconfigured or
+      // a per-spawn token was revoked before the CLI finished its turn.
+      // Visible without --debug because it's actionable.
+      log.warn('MCP HTTP 401 unauthorized', {
+        method: req.method,
+        hasBearer: !!token,
+        tokenTail: token ? token.slice(-6) : null,
+        knownTokens: this.tokens.size,
+      });
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'unauthorized' }));
       return;

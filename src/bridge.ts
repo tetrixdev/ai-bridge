@@ -618,6 +618,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (message.tools.length > 0 && !this.mcpServer.isRunning()) {
       try {
         await this.mcpServer.start();
+        log.info('MCP tool channel ready', {
+          url: this.mcpServer.getBaseUrl(),
+          tools: message.tools.map((t) => t.name),
+          cliIsolation: this.cliIsolation,
+        });
       } catch (err) {
         log.error('Failed to start bridge MCP server', {
           error: err instanceof Error ? err.message : String(err),
@@ -835,6 +840,19 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     const mcp = mcpEnabled && mcpToken
       ? { url: this.mcpServer.getBaseUrl(), bearerToken: mcpToken }
       : null;
+    if (mcp) {
+      log.info('MCP token issued for request', {
+        requestId: request_id,
+        provider: request.provider,
+        tokenTail: mcp.bearerToken.slice(-6),
+      });
+    } else if (this.currentTools.length > 0) {
+      log.warn('MCP unavailable for request (no token issued)', {
+        requestId: request_id,
+        provider: request.provider,
+        mcpRunning: this.mcpServer.isRunning(),
+      });
+    }
 
     try {
       // Build execution context
