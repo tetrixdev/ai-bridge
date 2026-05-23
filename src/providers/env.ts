@@ -6,8 +6,8 @@
  * adapter implementations.
  */
 
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 /** Maximum stderr buffer size (10 KB). */
@@ -26,8 +26,19 @@ let cachedWorkingDir: string | null = null;
  * would silently absorb whatever happened to be there. Pinning every spawn
  * to a dedicated empty directory closes that leak.
  *
- * NOTE: user-level files (e.g. ~/.claude/CLAUDE.md) load regardless of cwd —
- * those are outside the working-directory mechanism and not affected here.
+ * The directory lives under `~/.cache/ai-bridge/` rather than `os.tmpdir()`
+ * because Gemini's "trusted folders" gate refuses to load project-scope
+ * MCP servers from untrusted paths — and `/tmp/...` is never trusted, even
+ * with `--skip-trust` (verified empirically: gemini-cli 0.42.0 reads the
+ * project `.gemini/settings.json` but skips MCP initialisation when the
+ * folder isn't trusted). Most operators already have `~` trusted via the
+ * Gemini interactive setup, and trust inherits to subpaths, so a workdir
+ * under HOME inherits trust without modifying `~/.gemini/trustedFolders.json`.
+ *
+ * NOTE: user-level files (e.g. `~/.claude/CLAUDE.md`) load regardless of
+ * cwd — those are outside the working-directory mechanism and not affected
+ * here. Closing that residual leakage requires HOME redirection — see
+ * `tasks/open/cli-isolation-layer-b.md` in the stack.
  *
  * @returns Absolute path to the empty working directory (created if absent).
  */
@@ -35,10 +46,12 @@ export function getBridgeWorkingDir(): string {
   if (cachedWorkingDir) {
     return cachedWorkingDir;
   }
-  // mkdtempSync gives us a per-process directory guaranteed to be empty —
-  // a fixed name like ai-bridge-workdir/ could carry over files from a
-  // previous run and quietly break the "empty cwd" guarantee.
-  const dir = mkdtempSync(join(tmpdir(), 'ai-bridge-workdir-'));
+  // Ensure the parent cache dir exists, then mkdtempSync inside it so the
+  // workdir name is unique per process. A fixed name would risk a previous
+  // run's leftover files breaking the "empty cwd" guarantee.
+  const cacheRoot = join(homedir(), '.cache', 'ai-bridge');
+  mkdirSync(cacheRoot, { recursive: true });
+  const dir = mkdtempSync(join(cacheRoot, 'workdir-'));
   cachedWorkingDir = dir;
   return dir;
 }

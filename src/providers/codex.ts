@@ -301,10 +301,68 @@ export class CodexAdapter extends ProviderAdapter {
             // Emit done after error so the server always gets a terminal event.
             onEvent({ event: 'done', data: {} });
             settled = true;
+          } else if (itemType === 'mcp_tool_call') {
+            // Codex invoked one of the bridge's MCP tools. Surface it as a
+            // `tool_call` block followed by a `tool_result` event so the chat
+            // UI shows the tool name, arguments, and result — mirroring how
+            // Claude and Gemini tool calls are rendered.
+            //
+            // Item shape (from codex >= 0.131 with MCP integration):
+            //   { id, type: 'mcp_tool_call', server, tool, arguments?, result?, status, error? }
+            // Field naming differs slightly across codex versions; we read
+            // defensively (server|server_name, tool|tool_name, etc.).
+            const server = (item['server'] as string) ?? (item['server_name'] as string) ?? '';
+            const toolName = (item['tool'] as string) ?? (item['tool_name'] as string) ?? '';
+            const args = item['arguments'] as unknown;
+            const result = item['result'] as unknown;
+            const status = item['status'] as string | undefined;
+            const errorMsg = item['error'] as string | undefined;
+            const toolCallId = (item['id'] as string) ?? `mcp_${Date.now()}`;
+
+            // Argument payload — codex sometimes ships this pre-stringified,
+            // sometimes as an object. Normalise to a JSON string so the chat
+            // UI doesn't have to special-case the shape.
+            const argsContent = typeof args === 'string'
+              ? args
+              : JSON.stringify(args ?? {});
+
+            onEvent({
+              event: 'block_start',
+              data: {
+                block_index: blockIndex,
+                block_type: 'tool_call',
+                tool_name: toolName,
+                tool_call_id: toolCallId,
+              },
+            });
+            onEvent({
+              event: 'block_delta',
+              data: { block_index: blockIndex, content: argsContent },
+            });
+            onEvent({
+              event: 'block_stop',
+              data: { block_index: blockIndex },
+            });
+            blockIndex++;
+
+            // Result. Codex emits a single combined item for begin+end of an
+            // MCP call (unlike local_shell_call which is split), so the
+            // tool_result follows immediately after the tool_call block.
+            const resultText = status === 'error' || errorMsg
+              ? `Error: ${errorMsg ?? 'tool call failed'}`
+              : (typeof result === 'string' ? result : JSON.stringify(result ?? null));
+
+            onEvent({
+              event: 'tool_result',
+              data: { tool_call_id: toolCallId, result: resultText },
+            });
+
+            log.debug('Surfaced Codex MCP tool call', { server, toolName, status });
           }
-          // function_call and function_call_output items are produced by
-          // Codex's own tool execution — we don't need to relay them as
-          // stream events since Codex handles tools internally.
+          // function_call / function_call_output / local_shell_call items are
+          // Codex's own internal tool execution and not relayed — in
+          // `isolated` mode local_shell_call is also blocked by the default
+          // read-only sandbox, so it should not produce useful output anyway.
           return;
         }
 

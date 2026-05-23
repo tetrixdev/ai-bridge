@@ -122,9 +122,19 @@ export class ClaudeAdapter extends ProviderAdapter {
       }
     }
 
-    // The user message is the final argument. We no longer append a tool
-    // manifest — Claude discovers server-declared tools through MCP.
-    args.push(userMessage);
+    // The user message is the final positional argument. We must insert `--`
+    // before it: Claude's `--allowedTools <tools...>` and `--mcp-config
+    // <configs...>` are BOTH variadic, and without the option-terminator the
+    // userMessage gets eaten as another tool name / config path, leaving
+    // Claude with no prompt and erroring with:
+    //   "Input must be provided either through stdin or as a prompt argument
+    //    when using --print"
+    // `--` is the standard end-of-options marker and commander (Claude's
+    // arg parser) honours it.
+    //
+    // We no longer append a tool manifest — Claude discovers server-declared
+    // tools through MCP.
+    args.push('--', userMessage);
 
     // Only build the truncated arg array when debug logging is active
     if (isDebugEnabled()) {
