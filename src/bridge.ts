@@ -17,17 +17,16 @@
  */
 
 import { EventEmitter } from 'node:events';
-import crypto from 'node:crypto';
 import WebSocket from 'ws';
 import type {
   ProviderCapability,
   BridgeToServerMessage,
   ServerToBridgeMessage,
   AiRequestMessage,
+  CliIsolation,
   ConnectionErrorMessage,
   ConversationEntry,
   WelcomeMessage,
-  ToolDefinition,
   ServerConfig,
   StreamEventType,
   StreamEventData,
@@ -36,9 +35,9 @@ import type {
 import { PROTOCOL_VERSION, BRIDGE_VERSION } from './protocol/version.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './providers/base.js';
 import { detectProviders } from './providers/detector.js';
-import { ToolManager } from './tools/manager.js';
+import { getBridgeWorkingDir } from './providers/env.js';
 import { ToolResolver } from './tools/resolver.js';
-import { ToolCallbackServer } from './tools/callback-server.js';
+import { BridgeMcpServer } from './mcp/server.js';
 import { createLogger } from './utils/logger.js';
 import { clampRequestTimeout, clampHeartbeat } from './utils/clamp.js';
 import { FatalBridgeError } from './errors.js';
@@ -158,9 +157,20 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   // bridge restart. See refreshProviders().
   private providers: ProviderCapability[];
   private readonly adapters: Map<string, ProviderAdapter>;
-  private readonly toolManager = new ToolManager();
   private readonly toolResolver = new ToolResolver();
-  private readonly callbackServer: ToolCallbackServer;
+  /**
+   * Bridge-side HTTP MCP server. Tools/list returns the welcome's registered
+   * tools; tools/call routes through the WebSocket via toolResolver. The
+   * server is started lazily on the first welcome that registers any tools.
+   */
+  private readonly mcpServer: BridgeMcpServer;
+  /**
+   * The server-supplied CLI isolation posture. Defaults to `isolated` for
+   * older servers that don't send the field — the safe default.
+   */
+  private cliIsolation: CliIsolation = 'isolated';
+  /** Registered tools from the most recent welcome — passed to each adapter. */
+  private currentTools: import('./protocol/types.js').ToolDefinition[] = [];
   private readonly testMode: boolean;
   private readonly onTestRequest?: BridgeOptions['onTestRequest'];
 
@@ -186,8 +196,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * browser's loading state.
    */
   private abortedRequestIds: string[] = [];
-  /** Random secret for authenticating tool callback HTTP requests. */
-  private readonly callbackSecret: string;
+  /** Monotonic counter for synthesizing tool_call_ids for MCP-originated calls. */
+  private mcpToolCallSeq = 0;
 
   constructor(options: BridgeOptions) {
     super();
@@ -198,26 +208,27 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.testMode = options.testMode ?? false;
     this.onTestRequest = options.onTestRequest;
 
-    // Generate a random secret for callback server authentication
-    this.callbackSecret = crypto.randomBytes(32).toString('hex');
-
-    // Forwards HTTP-based tool calls from scripts over the WebSocket.
-    const sendFn = (reqId: string, tcId: string, tName: string, tArgs: Record<string, unknown>) => {
-      this.send({
-        type: 'tool_call',
-        request_id: reqId,
-        tool_call_id: tcId,
-        tool_name: tName,
-        arguments: tArgs,
-      });
-    };
-
-    this.callbackServer = new ToolCallbackServer(
-      this.toolResolver,
-      sendFn,
-      new Set(this.toolManager.getAll().map((t) => t.name)),
-      this.callbackSecret,
-    );
+    // The MCP server's tool-call handler proxies through the existing
+    // toolResolver → WebSocket round-trip. The requestId comes from the
+    // per-spawn token the CLI presented, looked up by BridgeMcpServer.
+    this.mcpServer = new BridgeMcpServer(async (requestId, toolName, args) => {
+      const toolCallId = `mcp-${requestId}-${++this.mcpToolCallSeq}`;
+      return this.toolResolver.call(
+        (reqId, tcId, tName, tArgs) => {
+          this.send({
+            type: 'tool_call',
+            request_id: reqId,
+            tool_call_id: tcId,
+            tool_name: tName,
+            arguments: tArgs,
+          });
+        },
+        requestId,
+        toolCallId,
+        toolName,
+        args,
+      );
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -274,8 +285,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.stopHeartbeat();
     this.clearReconnectTimer();
     this.toolResolver.cancelAll();
-    this.toolManager.cleanupScripts();
-    await this.callbackServer.stop();
+    await this.mcpServer.stop();
 
     // Cancel active requests
     for (const [id, controller] of this.activeRequests) {
@@ -402,9 +412,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (!this.isShuttingDown) {
       // Check for authentication rejection — don't retry, exit immediately
       if (code === 4001) {
-        // Clean up tool scripts and callback server before emitting fatal error
-        this.toolManager.cleanupScripts();
-        this.callbackServer.stop().catch(() => {
+        // Stop the bridge MCP server before emitting the fatal error.
+        this.mcpServer.stop().catch(() => {
           // Best-effort cleanup; ignore errors during shutdown
         });
 
@@ -591,52 +600,40 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       this.serverConfig.request_timeout = clamped;
     }
 
-    // Register tools from the server
-    this.toolManager.register(message.tools);
+    // Adopt the server's CLI isolation posture. Older servers that don't
+    // send the field get the safe default (`isolated`) — never the legacy
+    // native behaviour.
+    this.cliIsolation = message.cli_isolation ?? 'isolated';
+    this.currentTools = message.tools;
+    this.mcpServer.setTools(message.tools);
+    log.info('Welcome registered tools', {
+      count: message.tools.length,
+      cliIsolation: this.cliIsolation,
+    });
 
-    // Update the callback server's validation set so it accepts tool calls
-    // for the tools we just registered.
-    this.callbackServer.setRegisteredToolNames(this.toolManager.getRegisteredNames());
-
-    // Notify the server about any tools rejected during registration (unsafe
-    // or reserved names) so it can surface a warning.
-    const rejectedTools = this.toolManager.getRejectedToolNames();
-    if (rejectedTools.length > 0) {
-      this.send({
-        type: 'error',
-        request_id: 'setup',
-        code: 'tool_rejected',
-        message: `The following tools were rejected by the bridge due to unsafe or reserved names and will be unavailable: ${rejectedTools.join(', ')}`,
-        fatal: false,
-      });
-    }
-
-    // Generate tool wrapper scripts and start the callback server
-    if (message.tools.length > 0) {
+    // Start the bridge-side MCP server once tools are present. Spawned CLIs
+    // talk to it via per-spawn bearer tokens (see executeAiRequestInternal).
+    // The server stays up across reconnects so an in-flight CLI never loses
+    // its tool channel mid-turn.
+    if (message.tools.length > 0 && !this.mcpServer.isRunning()) {
       try {
-        await this.callbackServer.start();
-        const port = this.callbackServer.getPort();
-        if (port) {
-          // Pass the server-configured request timeout so the bash script's
-          // HTTP timeout matches the bridge-side tool resolver timeout.
-          this.toolManager.generateScripts(port, this.callbackSecret, this.serverConfig.request_timeout * 1000);
-          log.info('Tool scripts generated', {
-            count: message.tools.length,
-            callbackPort: port,
-            scriptDir: this.toolManager.getScriptDir(),
-          });
-        }
+        await this.mcpServer.start();
+        log.info('MCP tool channel ready', {
+          url: this.mcpServer.getBaseUrl(),
+          tools: message.tools.map((t) => t.name),
+          cliIsolation: this.cliIsolation,
+        });
       } catch (err) {
-        log.error('Failed to set up tool callback server', {
+        log.error('Failed to start bridge MCP server', {
           error: err instanceof Error ? err.message : String(err),
         });
         // Notify the server so it can warn the user — all tool calls will fail
-        // for this session because the callback server could not start.
+        // for this session because the MCP server could not start.
         this.send({
           type: 'error',
           request_id: 'setup',
           code: 'tool_setup_failed',
-          message: `Tool callback server failed to start — tool calls will not work for this session: ${err instanceof Error ? err.message : String(err)}`,
+          message: `Bridge MCP server failed to start — tool calls will not work for this session: ${err instanceof Error ? err.message : String(err)}`,
           fatal: false,
         });
       }
@@ -834,70 +831,87 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   ): Promise<void> {
     const { request_id } = request;
 
-    // Build execution context
-    const context: ExecutionContext = {
-      request,
-      requestId: request_id,
-      tools: this.toolManager.getAll(),
-      toolScriptDir: this.toolManager.getScriptDir(),
-      onToolCall: async (toolCallId, toolName, args) => {
-        return this.toolResolver.call(
-          (reqId, tcId, tName, tArgs) => {
-            this.send({
-              type: 'tool_call',
-              request_id: reqId,
-              tool_call_id: tcId,
-              tool_name: tName,
-              arguments: tArgs,
-            });
-          },
-          request_id,
-          toolCallId,
-          toolName,
-          args,
-        );
-      },
-      signal,
-      cliSessionId,
-    };
-
-    // The adapter emits its own `done`, but the CLI session id is only known
-    // once execute() resolves. Capture the adapter's `done` data, withhold the
-    // event, and re-emit `done` after — with cli_session_id attached — so the
-    // server can persist the session for the next turn's resume.
-    let doneData: DoneData = {};
-    let sessionLost = false;
-    const newCliSessionId = await adapter.execute(context, (event: AdapterStreamEvent) => {
-      if (event.event === 'done') {
-        doneData = event.data as DoneData;
-        return;
-      }
-      if (event.event === 'error') {
-        const errorCode = (event.data as { code?: string }).code;
-        if (errorCode === 'session_lost') {
-          sessionLost = true;
-        }
-        // A spawn failure (most often ENOENT — the CLI is no longer on PATH)
-        // means the local provider set may have changed. Re-probe so the
-        // server's advertised provider list self-heals without a restart.
-        if (errorCode === 'provider_spawn_error') {
-          void this.refreshProviders();
-        }
-      }
-      this.sendStreamEvent(request_id, event.event, event.data);
-    });
-
-    // On session_lost the error was already forwarded and the server recovers
-    // by re-issuing the turn — withhold `done` so its in-flight request stays
-    // open for the re-issue.
-    if (sessionLost) {
-      return;
+    // Issue a per-spawn MCP bearer token if the MCP server is running. The
+    // token is mapped to this request_id so the MCP server can route
+    // tools/call from the spawned CLI to the right WebSocket request frame.
+    // Skipped when no tools are registered or the MCP server failed to start.
+    const mcpEnabled = this.currentTools.length > 0 && this.mcpServer.isRunning();
+    const mcpToken = mcpEnabled ? this.mcpServer.issueToken(request_id) : null;
+    const mcp = mcpEnabled && mcpToken
+      ? { url: this.mcpServer.getBaseUrl(), bearerToken: mcpToken }
+      : null;
+    if (mcp) {
+      log.info('MCP token issued for request', {
+        requestId: request_id,
+        provider: request.provider,
+        tokenTail: mcp.bearerToken.slice(-6),
+      });
+    } else if (this.currentTools.length > 0) {
+      log.warn('MCP unavailable for request (no token issued)', {
+        requestId: request_id,
+        provider: request.provider,
+        mcpRunning: this.mcpServer.isRunning(),
+      });
     }
 
-    this.sendStreamEvent(request_id, 'done', {
-      ...doneData,
-      cli_session_id: newCliSessionId,
-    });
+    try {
+      // Build execution context
+      const context: ExecutionContext = {
+        request,
+        requestId: request_id,
+        tools: this.currentTools,
+        mcp,
+        cliIsolation: this.cliIsolation,
+        workingDir: getBridgeWorkingDir(),
+        signal,
+        requestTimeoutSeconds: this.serverConfig.request_timeout,
+        cliSessionId,
+      };
+
+      // The adapter emits its own `done`, but the CLI session id is only known
+      // once execute() resolves. Capture the adapter's `done` data, withhold the
+      // event, and re-emit `done` after — with cli_session_id attached — so the
+      // server can persist the session for the next turn's resume.
+      let doneData: DoneData = {};
+      let sessionLost = false;
+      const newCliSessionId = await adapter.execute(context, (event: AdapterStreamEvent) => {
+        if (event.event === 'done') {
+          doneData = event.data as DoneData;
+          return;
+        }
+        if (event.event === 'error') {
+          const errorCode = (event.data as { code?: string }).code;
+          if (errorCode === 'session_lost') {
+            sessionLost = true;
+          }
+          // A spawn failure (most often ENOENT — the CLI is no longer on PATH)
+          // means the local provider set may have changed. Re-probe so the
+          // server's advertised provider list self-heals without a restart.
+          if (errorCode === 'provider_spawn_error') {
+            void this.refreshProviders();
+          }
+        }
+        this.sendStreamEvent(request_id, event.event, event.data);
+      });
+
+      // On session_lost the error was already forwarded and the server recovers
+      // by re-issuing the turn — withhold `done` so its in-flight request stays
+      // open for the re-issue.
+      if (sessionLost) {
+        return;
+      }
+
+      this.sendStreamEvent(request_id, 'done', {
+        ...doneData,
+        cli_session_id: newCliSessionId,
+      });
+    } finally {
+      // Revoke the per-spawn MCP token so a leftover CLI process cannot
+      // continue invoking tools on this request_id's behalf.
+      if (mcpToken) {
+        this.mcpServer.revokeToken(mcpToken);
+      }
+    }
   }
 
   private handleServerError(message: { type: 'error'; code: string; message: string; fatal: boolean }): void {
@@ -905,9 +919,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (message.fatal) {
       log.error('Fatal server error — disconnecting');
       this.isShuttingDown = true;
-      // Clean up tool scripts and callback server (best-effort) before closing.
-      this.toolManager.cleanupScripts();
-      this.callbackServer.stop().catch(() => {
+      // Stop the bridge MCP server (best-effort) before closing.
+      this.mcpServer.stop().catch(() => {
         // Best-effort cleanup; ignore errors during shutdown
       });
       this.ws?.close(1000, 'Fatal server error');
@@ -928,8 +941,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     });
     this.isShuttingDown = true;
     // Best-effort cleanup before surfacing the fatal error.
-    this.toolManager.cleanupScripts();
-    this.callbackServer.stop().catch(() => {
+    this.mcpServer.stop().catch(() => {
       // Best-effort cleanup; ignore errors during shutdown
     });
     this.emit('error', new FatalBridgeError(`Connection rejected: ${message.message}`));

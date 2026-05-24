@@ -6,8 +6,8 @@
  * adapter implementations.
  */
 
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 /** Maximum stderr buffer size (10 KB). */
@@ -26,8 +26,19 @@ let cachedWorkingDir: string | null = null;
  * would silently absorb whatever happened to be there. Pinning every spawn
  * to a dedicated empty directory closes that leak.
  *
- * NOTE: user-level files (e.g. ~/.claude/CLAUDE.md) load regardless of cwd —
- * those are outside the working-directory mechanism and not affected here.
+ * The directory lives under `~/.cache/ai-bridge/` rather than `os.tmpdir()`
+ * because Gemini's "trusted folders" gate refuses to load project-scope
+ * MCP servers from untrusted paths — and `/tmp/...` is never trusted, even
+ * with `--skip-trust` (verified empirically: gemini-cli 0.42.0 reads the
+ * project `.gemini/settings.json` but skips MCP initialisation when the
+ * folder isn't trusted). Most operators already have `~` trusted via the
+ * Gemini interactive setup, and trust inherits to subpaths, so a workdir
+ * under HOME inherits trust without modifying `~/.gemini/trustedFolders.json`.
+ *
+ * NOTE: user-level files (e.g. `~/.claude/CLAUDE.md`) load regardless of
+ * cwd — those are outside the working-directory mechanism and not affected
+ * here. Closing that residual leakage requires HOME redirection — see
+ * `tasks/open/cli-isolation-layer-b.md` in the stack.
  *
  * @returns Absolute path to the empty working directory (created if absent).
  */
@@ -35,10 +46,12 @@ export function getBridgeWorkingDir(): string {
   if (cachedWorkingDir) {
     return cachedWorkingDir;
   }
-  // mkdtempSync gives us a per-process directory guaranteed to be empty —
-  // a fixed name like ai-bridge-workdir/ could carry over files from a
-  // previous run and quietly break the "empty cwd" guarantee.
-  const dir = mkdtempSync(join(tmpdir(), 'ai-bridge-workdir-'));
+  // Ensure the parent cache dir exists, then mkdtempSync inside it so the
+  // workdir name is unique per process. A fixed name would risk a previous
+  // run's leftover files breaking the "empty cwd" guarantee.
+  const cacheRoot = join(homedir(), '.cache', 'ai-bridge');
+  mkdirSync(cacheRoot, { recursive: true });
+  const dir = mkdtempSync(join(cacheRoot, 'workdir-'));
   cachedWorkingDir = dir;
   return dir;
 }
@@ -46,26 +59,65 @@ export function getBridgeWorkingDir(): string {
 /**
  * Build the environment variables for spawning a CLI subprocess.
  *
- * @param toolScriptDir  Directory containing tool wrapper scripts to prepend
- *                       to PATH, or null to skip PATH modification (e.g. for
- *                       Codex which handles tools internally).
- * @param requestId      Optional request ID to pass as AI_BRIDGE_REQUEST_ID
- *                       env var for concurrent-request correlation.
+ * The legacy `toolScriptDir` parameter (prepended to PATH for the Bash-wrapper
+ * tool plumbing) was removed when tool exposure moved to the bridge-side MCP
+ * server. Callers now pass extra env entries directly when they need them
+ * (e.g. AI_BRIDGE_MCP_TOKEN for codex's bearer-token-env-var integration).
+ *
+ * @param requestId  Optional request ID to pass as AI_BRIDGE_REQUEST_ID env
+ *                   var for concurrent-request correlation.
+ * @param extra      Additional env vars to merge in (overrides process.env).
  * @returns A copy of process.env with the requested modifications applied.
  */
-export function buildSpawnEnv(toolScriptDir: string | null, requestId?: string): NodeJS.ProcessEnv {
+export function buildSpawnEnv(
+  requestId?: string,
+  extra?: Record<string, string>,
+): NodeJS.ProcessEnv {
   const env = { ...process.env };
-  if (toolScriptDir) {
-    env['PATH'] = `${toolScriptDir}:${env['PATH'] ?? ''}`;
-  }
   if (requestId) {
     env['AI_BRIDGE_REQUEST_ID'] = requestId;
+  }
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) {
+      env[key] = value;
+    }
   }
   // Remove bridge credential variables from the child process environment so
   // the token does not leak into /proc/<pid>/environ or the CLI's own logging.
   delete env['AI_BRIDGE_TOKEN'];
   delete env['AI_BRIDGE_SERVER'];
   return env;
+}
+
+/**
+ * Neutral fallback system prompt used in `isolated` mode when the server did
+ * not provide one. Without this the CLI would fall back to its built-in
+ * default — typically a coding-agent persona that leaks Claude-Code /
+ * Codex / Gemini-CLI conventions into a chat that should be governed by the
+ * server-side product. Kept intentionally generic.
+ */
+export const ISOLATED_FALLBACK_SYSTEM_PROMPT =
+  'You are an AI assistant. Use only the tools provided to you to fulfil the user\'s request, and reply in plain prose.';
+
+/**
+ * Resolve the system prompt to pass to the CLI for this turn.
+ *
+ * - If the server sent one, use it as-is (regardless of isolation).
+ * - In `isolated` mode with no server prompt, return the neutral fallback so
+ *   the CLI's built-in default never seeps through.
+ * - In `native` mode with no server prompt, return null — the CLI applies
+ *   whatever it normally would.
+ *
+ * Returns null only when the CLI should be left to its own default.
+ */
+export function resolveSystemPrompt(
+  serverPrompt: string | null,
+  isolation: 'isolated' | 'native',
+): string | null {
+  if (serverPrompt) {
+    return serverPrompt;
+  }
+  return isolation === 'isolated' ? ISOLATED_FALLBACK_SYSTEM_PROMPT : null;
 }
 
 /**

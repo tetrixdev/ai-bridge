@@ -17,8 +17,9 @@
 import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv, appendStderr, formatStderrMessage } from './env.js';
-import { buildToolInstructions } from '../tools/prompt.js';
+import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
+import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
+import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
@@ -63,9 +64,33 @@ export class ClaudeAdapter extends ProviderAdapter {
       log.debug('Resuming session', { cliSessionId });
     }
 
-    // Add system prompt if provided (only on new sessions)
-    if (request.system_prompt && !cliSessionId) {
-      args.push('--system-prompt', request.system_prompt);
+    // `--bare` would be the natural fit for `isolated` mode (skips hooks,
+    // LSP, plugin sync, auto-memory, background prefetches, keychain reads,
+    // and CLAUDE.md auto-discovery) — BUT its keychain-read suppression
+    // breaks OAuth: per Claude's own docs, "Anthropic auth is strictly
+    // ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain
+    // are never read)". For an operator logged in via subscription/OAuth
+    // (the common case for the bridge), `--bare` produces a hard
+    // "Not logged in — please run /login" error on every turn.
+    //
+    // Until Layer B routes auth via apiKeyHelper or ANTHROPIC_API_KEY
+    // passthrough, we DON'T pass `--bare`. The remaining isolation
+    // (--strict-mcp-config, --allowedTools, default permission mode in -p)
+    // still blocks built-in tools and other MCP servers; what leaks is
+    // hooks, auto-memory, plugin sync, and CLAUDE.md auto-discovery. The
+    // bridge's cwd-pinning (see env.ts:getBridgeWorkingDir) keeps cwd-walk
+    // CLAUDE.md out — only user-level ~/.claude/CLAUDE.md still applies.
+    // Tracked in tasks/open/cli-isolation-layer-b.md.
+
+    // Add system prompt (only on new sessions). resolveSystemPrompt() returns
+    // the server-supplied prompt when present, the neutral isolated fallback
+    // when missing-and-isolated, or null when missing-and-native (let Claude
+    // use its own default).
+    const systemPrompt = !cliSessionId
+      ? resolveSystemPrompt(request.system_prompt, context.cliIsolation)
+      : null;
+    if (systemPrompt !== null) {
+      args.push('--system-prompt', systemPrompt);
     }
 
     // Add model if specified in request options
@@ -78,25 +103,47 @@ export class ClaudeAdapter extends ProviderAdapter {
       args.push('--max-tokens', String(request.options.max_tokens));
     }
 
-    // Enable tool execution when server-defined tools are available. The wrapper
-    // scripts are invoked through Claude's Bash tool; in headless (-p) mode every
-    // Bash command would otherwise be denied with "requires approval" since there
-    // is no interactive approver. bypassPermissions auto-approves tool use — the
-    // bridge runs in the user's own trusted environment, mirroring Codex
-    // (approval_policy=never) and Gemini (--yolo).
-    if (context.tools.length > 0 && context.toolScriptDir) {
-      args.push('--permission-mode', 'bypassPermissions');
+    // Wire up the bridge's MCP server so the model can call server-declared
+    // tools. `--strict-mcp-config` is critical in isolated mode: without it
+    // Claude would load MCP servers from the user's global ~/.claude config
+    // too, widening the tool surface beyond what the bridge intends.
+    //
+    // In `isolated` mode we ALSO explicitly allow only our MCP tools via
+    // `--allowedTools mcp__bridge__*`. Claude's built-in Bash / Edit / Write
+    // / Read / Glob / Grep / WebFetch tools then deny by default in headless
+    // `-p` mode (no interactive approver), so the model can only reach our
+    // tools — not shell.
+    //
+    // In `native` mode the operator's other MCP servers stay loadable and we
+    // pass `--permission-mode bypassPermissions`, matching the legacy posture
+    // for the developer-runs-bridge-against-own-machine case.
+    if (context.mcp) {
+      const configPath = writeClaudeMcpConfig(context.mcp);
+      args.push('--mcp-config', configPath);
+      if (context.cliIsolation === 'isolated') {
+        args.push('--strict-mcp-config');
+        // Glob is supported in --allowedTools matchers (per Claude CLI docs,
+        // e.g. "Bash(git *)"). `mcp__<server>__*` is the standard MCP tool
+        // namespace prefix Claude uses.
+        args.push('--allowedTools', `mcp__${BRIDGE_MCP_SERVER_NAME}__*`);
+      } else {
+        args.push('--permission-mode', 'bypassPermissions');
+      }
     }
 
-    // The user message is the final argument.  When server-defined tools are
-    // present, append the tool manifest so the model knows the tools exist and
-    // how to call them — appended every turn (new and resumed sessions) since
-    // Claude has no protocol-level concept of these external tools.
-    let promptArg = userMessage;
-    if (context.tools.length > 0) {
-      promptArg += '\n\n' + buildToolInstructions(context.tools, context.toolScriptDir);
-    }
-    args.push(promptArg);
+    // The user message is the final positional argument. We must insert `--`
+    // before it: Claude's `--allowedTools <tools...>` and `--mcp-config
+    // <configs...>` are BOTH variadic, and without the option-terminator the
+    // userMessage gets eaten as another tool name / config path, leaving
+    // Claude with no prompt and erroring with:
+    //   "Input must be provided either through stdin or as a prompt argument
+    //    when using --print"
+    // `--` is the standard end-of-options marker and commander (Claude's
+    // arg parser) honours it.
+    //
+    // We no longer append a tool manifest — Claude discovers server-declared
+    // tools through MCP.
+    args.push('--', userMessage);
 
     // Only build the truncated arg array when debug logging is active
     if (isDebugEnabled()) {
@@ -108,15 +155,28 @@ export class ClaudeAdapter extends ProviderAdapter {
       let blockIndex = 0;
       let settled = false;
 
-      // Build env with tool scripts on PATH and request ID for correlation
-      const env = buildSpawnEnv(context.toolScriptDir, context.requestId);
+      const env = buildSpawnEnv(context.requestId);
       // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
       delete env['CLAUDECODE'];
 
       const child = this.spawnCli('claude', args, env);
 
+      // Enforce the server-configured request_timeout. Without this a stuck
+      // CLI would run forever; with it the bridge bounds every turn.
+      const timeoutTimer = startRequestTimeout(
+        context.requestTimeoutSeconds,
+        () => {
+          log.warn('Request timeout — killing claude process', {
+            requestId,
+            timeoutSeconds: context.requestTimeoutSeconds,
+          });
+          child.kill('SIGTERM');
+        },
+      );
+
       // Set up abort handling
       const onAbort = () => {
+        clearRequestTimeout(timeoutTimer);
         log.info('Request aborted — killing claude process', { requestId });
         child.kill('SIGTERM');
       };
@@ -350,6 +410,7 @@ export class ClaudeAdapter extends ProviderAdapter {
           ? 'claude CLI not found. Install it or ensure it is on your PATH.'
           : `Failed to spawn claude: ${err.message}`;
         signal.removeEventListener('abort', onAbort);
+        clearRequestTimeout(timeoutTimer);
 
         if (!settled) {
           settled = true;
@@ -367,6 +428,7 @@ export class ClaudeAdapter extends ProviderAdapter {
 
       child.on('close', (code) => {
         log.debug('Claude process closed', { code, sessionId });
+        clearRequestTimeout(timeoutTimer);
         finalizer.onChildClose(code);
       });
     });

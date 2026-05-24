@@ -23,8 +23,9 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from './env.js';
-import { buildToolInstructions } from '../tools/prompt.js';
+import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
+import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
+import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
@@ -96,44 +97,46 @@ export class CodexAdapter extends ProviderAdapter {
     // and `codex exec resume`, so this applies to new and resumed sessions.
     args.push('-c', 'model_reasoning_summary=detailed');
 
-    // Server-defined bridge tools support.  Codex's `exec` sandbox defaults to
-    // read-only with no network access, which blocks the wrapper script's
-    // loopback callback.  When tools are present we run with danger-full-access
-    // and approval_policy=never: the wrapper scripts execute directly (no
-    // network restriction) and exec never stalls on an approval prompt.
-    // workspace-write was not used because its bubblewrap sandbox requires
-    // unprivileged user namespaces, which are unavailable in many container and
-    // hardened-kernel environments — there the tool callback fails entirely.
-    // This matches Claude (bypassPermissions) and Gemini (--yolo): the bridge
-    // runs the CLI in the user's own trusted environment.  Tool-less requests
-    // keep Codex's safer default sandbox.
-    const hasTools = context.tools.length > 0;
-    if (hasTools) {
-      // Pass the sandbox mode as a `-c` config override rather than the
-      // `-s/--sandbox` flag: `-s` is only accepted by `codex exec`, not by
-      // `codex exec resume`, so using the flag breaks every follow-up turn
-      // ("unexpected argument '-s' found"). `-c key=value` is accepted by
-      // both subcommands and is equivalent.
-      args.push(
-        '-c', 'sandbox_mode=danger-full-access',
-        '-c', 'approval_policy=never',
-      );
+    // Wire up the bridge's MCP server. Server-declared tools are reached
+    // through that channel only — Codex's own built-in `shell` tool is left
+    // at its default sandbox (read-only, no network) unless the operator
+    // opted into `native` mode. With sandbox_mode=read-only and no
+    // approval_policy override the model cannot run arbitrary shell against
+    // the bridge operator's machine even with a creatively-worded prompt.
+    //
+    // Note: Codex's user-level `~/.codex/AGENTS.md`, skills, and plugins
+    // still load in `isolated` mode (cwd is pinned but $HOME is not). Closing
+    // that residual leakage requires CODEX_HOME redirection with auth file
+    // symlinking — tracked in tasks/open/cli-isolation-layer-b.md.
+    if (context.mcp) {
+      args.push(...buildCodexMcpArgs(context.mcp));
+      if (context.cliIsolation === 'native') {
+        // Legacy escape hatch for developers running the bridge against their
+        // own machine. Matches the pre-MCP behaviour: the model can run
+        // shell, edit files, and execute the wrapper scripts that used to
+        // back the tool plumbing. Not safe when end users can send chat
+        // messages.
+        args.push(
+          '-c', 'sandbox_mode=danger-full-access',
+          '-c', 'approval_policy=never',
+        );
+      }
     }
 
     // Build the prompt positional argument. The prompt is appended LAST, after
     // every option flag, so Codex's argument parser never mistakes it for a
-    // flag value.
+    // flag value. No tool manifest is appended — Codex discovers
+    // server-declared tools through the MCP server.
     //
-    // When server tools are present we append a note listing the available
-    // tool command names so Codex knows it may run them as shell commands.
-    // On a fresh session the system prompt is also prepended; on a resumed
-    // session the original system prompt was already consumed by the first
-    // turn, so the tool note is appended to the user message directly.
-    const toolNote = hasTools ? '\n\n' + buildToolInstructions(context.tools, context.toolScriptDir) : '';
-    if (!cliSessionId && request.system_prompt) {
-      args.push('--', buildCombinedPrompt(request.system_prompt, userMessage) + toolNote);
-    } else if (toolNote) {
-      args.push('--', userMessage + toolNote);
+    // Codex has no dedicated --system-prompt flag, so the resolved system
+    // prompt is concatenated. In isolated mode resolveSystemPrompt() returns
+    // a neutral default when the server didn't send one, so Codex's own
+    // built-in default never seeps through.
+    const systemPrompt = !cliSessionId
+      ? resolveSystemPrompt(request.system_prompt, context.cliIsolation)
+      : null;
+    if (systemPrompt !== null) {
+      args.push('--', buildCombinedPrompt(systemPrompt, userMessage));
     } else {
       args.push(userMessage);
     }
@@ -157,20 +160,36 @@ export class CodexAdapter extends ProviderAdapter {
       let blockIndex = 0;
       let settled = false;
 
-      // Prepend the tool-script directory to PATH so the wrapper commands are
-      // invocable by Codex's model-generated shell commands; pass null when
-      // there are no tools so PATH is left untouched.
-      if (hasTools) {
-        log.info('Server-defined tools enabled for Codex request', {
+      if (context.mcp) {
+        log.info('Bridge MCP server registered for Codex request', {
           toolCount: context.tools.length,
         });
       }
-      const env = buildSpawnEnv(hasTools ? context.toolScriptDir : null, context.requestId);
+      // Codex reads the MCP bearer token from this env var (configured by
+      // buildCodexMcpArgs as bearer_token_env_var). The env var name must
+      // match between the codex config and the spawn env.
+      const env = buildSpawnEnv(
+        context.requestId,
+        context.mcp ? { [CODEX_BEARER_ENV_VAR]: context.mcp.bearerToken } : undefined,
+      );
 
       const child = this.spawnCli('codex', args, env);
 
+      // Enforce the server-configured request_timeout (ai-bridge#2).
+      const timeoutTimer = startRequestTimeout(
+        context.requestTimeoutSeconds,
+        () => {
+          log.warn('Request timeout — killing codex process', {
+            requestId,
+            timeoutSeconds: context.requestTimeoutSeconds,
+          });
+          child.kill('SIGTERM');
+        },
+      );
+
       // Set up abort handling
       const onAbort = () => {
+        clearRequestTimeout(timeoutTimer);
         log.info('Request aborted — killing codex process', { requestId });
         child.kill('SIGTERM');
       };
@@ -282,10 +301,83 @@ export class CodexAdapter extends ProviderAdapter {
             // Emit done after error so the server always gets a terminal event.
             onEvent({ event: 'done', data: {} });
             settled = true;
+          } else if (itemType === 'mcp_tool_call') {
+            // Codex invoked one of the bridge's MCP tools. Surface it as a
+            // `tool_call` block followed by a `tool_result` event so the chat
+            // UI shows the tool name, arguments, and result — mirroring how
+            // Claude and Gemini tool calls are rendered.
+            //
+            // Item shape (from codex >= 0.131 with MCP integration):
+            //   { id, type: 'mcp_tool_call', server, tool, arguments?, result?, status, error? }
+            // Field naming differs slightly across codex versions; we read
+            // defensively (server|server_name, tool|tool_name, etc.).
+            const server = (item['server'] as string) ?? (item['server_name'] as string) ?? '';
+            const toolName = (item['tool'] as string) ?? (item['tool_name'] as string) ?? '';
+            const args = item['arguments'] as unknown;
+            const result = item['result'] as unknown;
+            const status = item['status'] as string | undefined;
+            const errorField = item['error'];
+            const toolCallId = (item['id'] as string) ?? `mcp_${Date.now()}`;
+
+            // Argument payload — codex sometimes ships this pre-stringified,
+            // sometimes as an object. Normalise to a JSON string so the chat
+            // UI doesn't have to special-case the shape.
+            const argsContent = typeof args === 'string'
+              ? args
+              : JSON.stringify(args ?? {});
+
+            onEvent({
+              event: 'block_start',
+              data: {
+                block_index: blockIndex,
+                block_type: 'tool_call',
+                tool_name: toolName,
+                tool_call_id: toolCallId,
+              },
+            });
+            onEvent({
+              event: 'block_delta',
+              data: { block_index: blockIndex, content: argsContent },
+            });
+            onEvent({
+              event: 'block_stop',
+              data: { block_index: blockIndex },
+            });
+            blockIndex++;
+
+            // Error → human-readable string. Codex's `error` field can be a
+            // plain string OR an object with nested fields; templating an
+            // object directly produced "Error: [object Object]" in the chat
+            // UI before this normalisation.
+            const errorMsg = typeof errorField === 'string'
+              ? errorField
+              : errorField != null
+                ? JSON.stringify(errorField)
+                : undefined;
+
+            // Result. Codex emits a single combined item for begin+end of an
+            // MCP call (unlike local_shell_call which is split), so the
+            // tool_result follows immediately after the tool_call block.
+            const resultText = status === 'error' || errorMsg
+              ? `Error: ${errorMsg ?? 'tool call failed'}`
+              : (typeof result === 'string' ? result : JSON.stringify(result ?? null));
+
+            onEvent({
+              event: 'tool_result',
+              data: { tool_call_id: toolCallId, result: resultText },
+            });
+
+            log.info('Codex MCP tool call surfaced', {
+              server,
+              toolName,
+              status,
+              hasError: errorMsg !== undefined,
+            });
           }
-          // function_call and function_call_output items are produced by
-          // Codex's own tool execution — we don't need to relay them as
-          // stream events since Codex handles tools internally.
+          // function_call / function_call_output / local_shell_call items are
+          // Codex's own internal tool execution and not relayed — in
+          // `isolated` mode local_shell_call is also blocked by the default
+          // read-only sandbox, so it should not produce useful output anyway.
           return;
         }
 
@@ -362,6 +454,7 @@ export class CodexAdapter extends ProviderAdapter {
           ? 'codex CLI not found. Install it or ensure it is on your PATH.'
           : `Failed to spawn codex: ${err.message}`;
         signal.removeEventListener('abort', onAbort);
+        clearRequestTimeout(timeoutTimer);
 
         if (!settled) {
           settled = true;
@@ -379,6 +472,7 @@ export class CodexAdapter extends ProviderAdapter {
 
       child.on('close', (code) => {
         log.debug('Codex process closed', { code, sessionId });
+        clearRequestTimeout(timeoutTimer);
         finalizer.onChildClose(code);
       });
     });

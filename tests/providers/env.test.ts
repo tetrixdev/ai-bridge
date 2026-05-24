@@ -1,31 +1,24 @@
 import { describe, it, expect } from 'vitest';
-import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage } from '../../src/providers/env.js';
+import {
+  buildSpawnEnv,
+  buildCombinedPrompt,
+  appendStderr,
+  formatStderrMessage,
+  resolveSystemPrompt,
+  ISOLATED_FALLBACK_SYSTEM_PROMPT,
+} from '../../src/providers/env.js';
 
 describe('Environment Utilities', () => {
   describe('buildSpawnEnv()', () => {
-    it('includes toolScriptDir at the beginning of PATH', () => {
-      const env = buildSpawnEnv('/tmp/my-tools');
-
-      expect(env['PATH']).toBeDefined();
-      expect(env['PATH']!.startsWith('/tmp/my-tools:')).toBe(true);
-    });
-
-    it('preserves existing PATH when prepending toolScriptDir', () => {
+    it('does not modify PATH (the legacy toolScriptDir PATH-prepend was removed in favour of MCP)', () => {
       const originalPath = process.env['PATH'];
-      const env = buildSpawnEnv('/tmp/tools');
-
-      expect(env['PATH']).toBe(`/tmp/tools:${originalPath}`);
-    });
-
-    it('does not modify PATH when toolScriptDir is null', () => {
-      const originalPath = process.env['PATH'];
-      const env = buildSpawnEnv(null);
+      const env = buildSpawnEnv();
 
       expect(env['PATH']).toBe(originalPath);
     });
 
     it('sets AI_BRIDGE_REQUEST_ID when requestId is provided', () => {
-      const env = buildSpawnEnv(null, 'req-abc-123');
+      const env = buildSpawnEnv('req-abc-123');
 
       expect(env['AI_BRIDGE_REQUEST_ID']).toBe('req-abc-123');
     });
@@ -35,7 +28,7 @@ describe('Environment Utilities', () => {
       const originalReqId = process.env['AI_BRIDGE_REQUEST_ID'];
       delete process.env['AI_BRIDGE_REQUEST_ID'];
 
-      const env = buildSpawnEnv(null);
+      const env = buildSpawnEnv();
       expect(env['AI_BRIDGE_REQUEST_ID']).toBeUndefined();
 
       // Restore
@@ -44,18 +37,60 @@ describe('Environment Utilities', () => {
       }
     });
 
-    it('sets both PATH and AI_BRIDGE_REQUEST_ID together', () => {
-      const env = buildSpawnEnv('/tmp/tools', 'req-xyz');
+    it('merges extra env entries on top of process.env', () => {
+      const env = buildSpawnEnv('req-xyz', { AI_BRIDGE_MCP_TOKEN: 'tok' });
 
-      expect(env['PATH']!.startsWith('/tmp/tools:')).toBe(true);
       expect(env['AI_BRIDGE_REQUEST_ID']).toBe('req-xyz');
+      expect(env['AI_BRIDGE_MCP_TOKEN']).toBe('tok');
+    });
+
+    it('strips bridge credential vars (AI_BRIDGE_TOKEN, AI_BRIDGE_SERVER) from child env', () => {
+      const originalToken = process.env['AI_BRIDGE_TOKEN'];
+      const originalServer = process.env['AI_BRIDGE_SERVER'];
+      process.env['AI_BRIDGE_TOKEN'] = 'parent-secret';
+      process.env['AI_BRIDGE_SERVER'] = 'wss://example';
+
+      const env = buildSpawnEnv();
+      expect(env['AI_BRIDGE_TOKEN']).toBeUndefined();
+      expect(env['AI_BRIDGE_SERVER']).toBeUndefined();
+
+      // Restore
+      if (originalToken !== undefined) process.env['AI_BRIDGE_TOKEN'] = originalToken;
+      else delete process.env['AI_BRIDGE_TOKEN'];
+      if (originalServer !== undefined) process.env['AI_BRIDGE_SERVER'] = originalServer;
+      else delete process.env['AI_BRIDGE_SERVER'];
     });
 
     it('returns a copy of process.env, not the original', () => {
-      const env = buildSpawnEnv(null);
+      const env = buildSpawnEnv();
 
       env['MY_CUSTOM_VAR'] = 'test';
       expect(process.env['MY_CUSTOM_VAR']).toBeUndefined();
+    });
+  });
+
+  describe('resolveSystemPrompt()', () => {
+    it('returns the server-supplied prompt when present in isolated mode', () => {
+      expect(resolveSystemPrompt('be helpful', 'isolated')).toBe('be helpful');
+    });
+
+    it('returns the server-supplied prompt when present in native mode', () => {
+      expect(resolveSystemPrompt('be helpful', 'native')).toBe('be helpful');
+    });
+
+    it('returns the neutral fallback in isolated mode when the server did not send one', () => {
+      expect(resolveSystemPrompt(null, 'isolated')).toBe(ISOLATED_FALLBACK_SYSTEM_PROMPT);
+    });
+
+    it('returns null in native mode when the server did not send one (CLI uses its own default)', () => {
+      expect(resolveSystemPrompt(null, 'native')).toBeNull();
+    });
+
+    it('treats empty string the same as null (falsy → fallback)', () => {
+      // The bridge gets the server-side string verbatim — an empty value means
+      // "nothing supplied" from the model's point of view, so fall through.
+      expect(resolveSystemPrompt('', 'isolated')).toBe(ISOLATED_FALLBACK_SYSTEM_PROMPT);
+      expect(resolveSystemPrompt('', 'native')).toBeNull();
     });
   });
 
