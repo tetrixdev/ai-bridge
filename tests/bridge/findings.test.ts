@@ -66,23 +66,23 @@ describe('SEC-009: buildSpawnEnv — bridge credential stripping', () => {
   });
 
   it('strips AI_BRIDGE_TOKEN from the child environment', () => {
-    const env = buildSpawnEnv(null);
+    const env = buildSpawnEnv();
     expect(env['AI_BRIDGE_TOKEN']).toBeUndefined();
   });
 
   it('strips AI_BRIDGE_SERVER from the child environment', () => {
-    const env = buildSpawnEnv(null);
+    const env = buildSpawnEnv();
     expect(env['AI_BRIDGE_SERVER']).toBeUndefined();
   });
 
   it('does not strip other environment variables', () => {
     const originalPath = process.env['PATH'];
-    const env = buildSpawnEnv(null);
+    const env = buildSpawnEnv();
     expect(env['PATH']).toBe(originalPath);
   });
 
   it('does not modify the parent process.env', () => {
-    buildSpawnEnv(null);
+    buildSpawnEnv();
     expect(process.env['AI_BRIDGE_TOKEN']).toBe('secret-token-12345');
     expect(process.env['AI_BRIDGE_SERVER']).toBe('wss://example.com/ws');
   });
