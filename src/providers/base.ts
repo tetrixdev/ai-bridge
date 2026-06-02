@@ -7,7 +7,7 @@
 
 import { ChildProcess, ChildProcessByStdio, spawn } from 'node:child_process';
 import { Interface as ReadlineInterface } from 'node:readline';
-import type { Readable } from 'node:stream';
+import type { Readable, Writable } from 'node:stream';
 import type {
   ModelInfo,
   AiRequestMessage,
@@ -208,14 +208,25 @@ export abstract class ProviderAdapter {
     command: string,
     args: string[],
     env: NodeJS.ProcessEnv,
-  ): ChildProcessByStdio<null, Readable, Readable> {
-    // stdio is fixed as ['ignore', 'pipe', 'pipe'], so stdin is null and
-    // stdout/stderr are always readable streams — assert that shape so callers
-    // keep the non-null stdout/stderr the inline spawn() overload gave them.
-    return spawn(command, args, {
+    stdinInput?: string,
+  ): ChildProcessByStdio<Writable | null, Readable, Readable> {
+    // stdin defaults to 'ignore' (null) — a live stdin pipe hangs most CLIs.
+    // When stdinInput is given we pipe it, write it, and immediately end() so
+    // the child receives its prompt via stdin without ever blocking. This is
+    // how Claude is fed: a large prompt as a positional argv entry exceeds the
+    // OS per-argument size limit and the spawn dies with `spawn E2BIG`.
+    // stdout/stderr stay piped for streaming.
+    const child = spawn(command, args, {
       env,
       cwd: getBridgeWorkingDir(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }) as ChildProcessByStdio<null, Readable, Readable>;
+      stdio: [stdinInput !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+    }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
+
+    if (stdinInput !== undefined && child.stdin) {
+      child.stdin.write(stdinInput);
+      child.stdin.end();
+    }
+
+    return child;
   }
 }

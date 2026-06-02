@@ -133,19 +133,14 @@ export class ClaudeAdapter extends ProviderAdapter {
       }
     }
 
-    // The user message is the final positional argument. We must insert `--`
-    // before it: Claude's `--allowedTools <tools...>` and `--mcp-config
-    // <configs...>` are BOTH variadic, and without the option-terminator the
-    // userMessage gets eaten as another tool name / config path, leaving
-    // Claude with no prompt and erroring with:
-    //   "Input must be provided either through stdin or as a prompt argument
-    //    when using --print"
-    // `--` is the standard end-of-options marker and commander (Claude's
-    // arg parser) honours it.
-    //
-    // We no longer append a tool manifest — Claude discovers server-declared
-    // tools through MCP.
-    args.push('--', userMessage);
+    // The user message is delivered via STDIN, not as a positional argument.
+    // On a fresh session it carries the full prior conversation, and a large
+    // prompt as an argv entry exceeds the OS per-argument size limit — the
+    // spawn then dies with `spawn E2BIG`. In `--print` mode Claude reads its
+    // prompt from stdin when no positional prompt is given; spawnCli writes it
+    // and closes stdin so the child never blocks. (This also sidesteps the
+    // variadic `--allowedTools` / `--mcp-config` arg-eating that previously
+    // required a `--` terminator.)
 
     // Only build the truncated arg array when debug logging is active
     if (isDebugEnabled()) {
@@ -161,7 +156,7 @@ export class ClaudeAdapter extends ProviderAdapter {
       // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
       delete env['CLAUDECODE'];
 
-      const child = this.spawnCli('claude', args, env);
+      const child = this.spawnCli('claude', args, env, userMessage);
 
       // Enforce the server-configured request_timeout. Without this a stuck
       // CLI would run forever; with it the bridge bounds every turn.
