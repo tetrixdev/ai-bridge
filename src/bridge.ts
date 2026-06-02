@@ -110,10 +110,7 @@ function escapeXml(text: string): string {
  *
  * Returns the system prompt unchanged when there is no history to fold in.
  */
-function foldHistoryIntoSystemPrompt(
-  history: ConversationEntry[],
-  systemPrompt: string | null,
-): string | null {
+function buildHistoryBlock(history: ConversationEntry[]): string | null {
   const validRoles = new Set(['user', 'assistant', 'system']);
 
   const unexpectedRoles = history
@@ -129,16 +126,48 @@ function foldHistoryIntoSystemPrompt(
   // surface (an unknown role could be treated as authoritative instructions).
   const priorHistory = history.filter((h) => validRoles.has(h.role));
   if (priorHistory.length === 0) {
-    return systemPrompt;
+    return null;
   }
 
   const historyXml = priorHistory
     .map((h) => `<message role="${escapeXml(h.role)}">${escapeXml(h.content)}</message>`)
     .join('\n');
-  const historyBlock = `<conversation_history>\n${historyXml}\n</conversation_history>`;
 
-  // If system_prompt is null/empty, use only the history context.
+  return `<conversation_history>\n${historyXml}\n</conversation_history>`;
+}
+
+/**
+ * Fold history into the system prompt — for CLIs that take their prompt as a
+ * command-line argument. Returns the system prompt unchanged when there is no
+ * history. NOTE: a large history makes the resulting `--system-prompt` argument
+ * exceed the OS arg-size limit (`spawn E2BIG`); use {@link foldHistoryIntoMessage}
+ * for stdin-fed CLIs (Claude) instead.
+ */
+function foldHistoryIntoSystemPrompt(
+  history: ConversationEntry[],
+  systemPrompt: string | null,
+): string | null {
+  const historyBlock = buildHistoryBlock(history);
+  if (historyBlock === null) {
+    return systemPrompt;
+  }
+
   return systemPrompt ? `${systemPrompt}\n\n${historyBlock}` : historyBlock;
+}
+
+/**
+ * Fold history into the user message — for Claude, which reads its prompt from
+ * STDIN (no argv size limit). The history precedes the current turn. Keeping
+ * the (possibly huge) history out of the `--system-prompt` argument is what
+ * avoids `spawn E2BIG` on large conversations.
+ */
+function foldHistoryIntoMessage(
+  history: ConversationEntry[],
+  message: string,
+): string {
+  const historyBlock = buildHistoryBlock(history);
+
+  return historyBlock ? `${historyBlock}\n\n${message}` : message;
 }
 
 // ---------------------------------------------------------------------------
@@ -709,17 +738,28 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     });
 
     // Fresh session: seed the new CLI session with any prior history the
-    // server sent. A resumed session already holds its own context.
+    // server sent. A resumed session already holds its own context. WHERE the
+    // history goes depends on how the provider delivers its prompt: Claude
+    // reads the user prompt from STDIN (no size limit), so fold history into
+    // the message — folding a large history into the `--system-prompt` argument
+    // would blow the OS arg-size limit (`spawn E2BIG`). Argument-fed CLIs
+    // (Codex/Gemini) keep history in the system prompt as before.
     let effectiveMessage = message;
     if (cliSessionId === null && message.history && message.history.length > 0) {
       log.debug('Seeding fresh CLI session with prior history', {
         conversationId: message.conversation_id,
         historyLength: message.history.length,
+        provider: message.provider,
       });
-      effectiveMessage = {
-        ...message,
-        system_prompt: foldHistoryIntoSystemPrompt(message.history, message.system_prompt),
-      };
+      effectiveMessage = message.provider === 'claude'
+        ? {
+            ...message,
+            message: foldHistoryIntoMessage(message.history, message.message),
+          }
+        : {
+            ...message,
+            system_prompt: foldHistoryIntoSystemPrompt(message.history, message.system_prompt),
+          };
     }
 
     this.executeAiRequestInternal(effectiveMessage, cliSessionId);
