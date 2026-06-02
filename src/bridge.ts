@@ -83,7 +83,7 @@ export interface BridgeEvents {
   disconnected: [code: number, reason: string];
   welcome: [sessionId: string];
   error: [error: Error];
-  request_start: [requestId: string, provider: string];
+  request_start: [requestId: string, provider: string, model?: string | null];
   request_end: [requestId: string];
 }
 
@@ -737,7 +737,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
     // Test mode: use mock handler
     if (this.testMode && this.onTestRequest) {
-      this.emit('request_start', request_id, provider);
+      this.emit('request_start', request_id, provider, message.options?.model);
       const sendEvent = (event: StreamEventType, data: StreamEventData) => {
         this.sendStreamEvent(request_id, event, data);
       };
@@ -778,7 +778,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return;
     }
 
-    this.emit('request_start', request_id, provider);
+    this.emit('request_start', request_id, provider, message.options?.model);
 
     // Execute asynchronously
     const controller = new AbortController();
