@@ -82,13 +82,15 @@ export class ClaudeAdapter extends ProviderAdapter {
     // CLAUDE.md out — only user-level ~/.claude/CLAUDE.md still applies.
     // Tracked in tasks/open/cli-isolation-layer-b.md.
 
-    // Add system prompt (only on new sessions). resolveSystemPrompt() returns
-    // the server-supplied prompt when present, the neutral isolated fallback
-    // when missing-and-isolated, or null when missing-and-native (let Claude
-    // use its own default).
-    const systemPrompt = !cliSessionId
-      ? resolveSystemPrompt(request.system_prompt, context.cliIsolation)
-      : null;
+    // Add the system prompt on EVERY invocation, including resumes. Claude's
+    // `--system-prompt` is per-invocation and is NOT retained across `--resume`
+    // (Anthropic CLI docs) — a resumed turn that omits it runs with no system
+    // prompt, so the model loses its instructions after the first turn. We
+    // therefore re-send it each turn (matching the working pocket-dev pattern).
+    // resolveSystemPrompt() returns the server-supplied prompt when present, the
+    // neutral isolated fallback when missing-and-isolated, or null when
+    // missing-and-native (let Claude use its own default).
+    const systemPrompt = resolveSystemPrompt(request.system_prompt, context.cliIsolation);
     if (systemPrompt !== null) {
       args.push('--system-prompt', systemPrompt);
     }
