@@ -32,9 +32,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Fail CI on any moderate or higher severity vulnerability.
+      # Fail CI on any moderate or higher severity vulnerability in the deps we
+      # actually ship. Dev-only tooling (e.g. vitest) is excluded: it never
+      # reaches a consumer of the published package, so its advisories must not
+      # gate releases — audit it via `npm audit` locally when bumping tooling.
       - name: Audit dependencies
-        run: npm audit --audit-level=moderate
+        run: npm audit --omit=dev --audit-level=moderate
 
       - name: Run tests
         run: npm test -- --reporter=verbose
