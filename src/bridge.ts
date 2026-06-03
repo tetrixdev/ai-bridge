@@ -108,7 +108,7 @@ function escapeXml(text: string): string {
  * wrapped in XML tags with escaped content so prior turns cannot be
  * interpreted as authoritative instructions (prompt-injection hardening).
  *
- * Returns the system prompt unchanged when there is no history to fold in.
+ * Returns null when there is no valid history to fold in.
  */
 function buildHistoryBlock(history: ConversationEntry[]): string | null {
   const validRoles = new Set(['user', 'assistant', 'system']);

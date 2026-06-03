@@ -191,8 +191,10 @@ export abstract class ProviderAdapter {
    *   - `cwd` is pinned to a dedicated empty directory so the CLI cannot
    *     auto-load CLAUDE.md / AGENTS.md / GEMINI.md from the bridge's own
    *     working tree (see getBridgeWorkingDir()).
-   *   - `stdio` keeps stdin closed — every CLI hangs if stdin is a live pipe —
-   *     with stdout/stderr piped for streaming.
+   *   - `stdio` keeps stdin closed by default — every CLI hangs if stdin is a
+   *     live pipe — unless `stdinInput` is given, in which case stdin is piped,
+   *     the input written, and the pipe immediately closed. stdout/stderr stay
+   *     piped for streaming.
    *
    * The caller still builds its own `env` (provider-specific quirks like
    * Claude's CLAUDECODE deletion or Codex's conditional PATH belong with the
@@ -223,8 +225,16 @@ export abstract class ProviderAdapter {
     }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
 
     if (stdinInput !== undefined && child.stdin) {
-      child.stdin.write(stdinInput);
-      child.stdin.end();
+      // Guard against EPIPE: if the child exits or closes stdin before it has
+      // consumed the whole prompt (fast non-zero exit, crash, or a CLI that
+      // stops reading), the async write emits an 'error' on the stdin stream.
+      // With no listener that becomes an uncaughtException and kills the whole
+      // bridge — the very crash class this stdin path exists to avoid. Swallow
+      // it here; the child's own exit/close is handled by the caller.
+      child.stdin.on('error', () => {});
+      // write + close in one call — also respects backpressure better than a
+      // bare write() followed by end().
+      child.stdin.end(stdinInput);
     }
 
     return child;
