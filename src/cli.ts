@@ -209,8 +209,9 @@ program
       }
     });
 
-    bridge.on('request_start', (requestId, provider) => {
-      log.info(`Processing request ${requestId} with ${provider}${opts.test ? ' (test mode)' : ''}`);
+    bridge.on('request_start', (requestId, provider, model) => {
+      const target = model ? `${provider}/${model}` : `${provider} (provider default model)`;
+      log.info(`Processing request ${requestId} with ${target}${opts.test ? ' (test mode)' : ''}`);
     });
 
     bridge.on('request_end', (requestId) => {

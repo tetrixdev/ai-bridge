@@ -7,7 +7,7 @@
 
 import { ChildProcess, ChildProcessByStdio, spawn } from 'node:child_process';
 import { Interface as ReadlineInterface } from 'node:readline';
-import type { Readable } from 'node:stream';
+import type { Readable, Writable } from 'node:stream';
 import type {
   ModelInfo,
   AiRequestMessage,
@@ -191,8 +191,10 @@ export abstract class ProviderAdapter {
    *   - `cwd` is pinned to a dedicated empty directory so the CLI cannot
    *     auto-load CLAUDE.md / AGENTS.md / GEMINI.md from the bridge's own
    *     working tree (see getBridgeWorkingDir()).
-   *   - `stdio` keeps stdin closed — every CLI hangs if stdin is a live pipe —
-   *     with stdout/stderr piped for streaming.
+   *   - `stdio` keeps stdin closed by default — every CLI hangs if stdin is a
+   *     live pipe — unless `stdinInput` is given, in which case stdin is piped,
+   *     the input written, and the pipe immediately closed. stdout/stderr stay
+   *     piped for streaming.
    *
    * The caller still builds its own `env` (provider-specific quirks like
    * Claude's CLAUDECODE deletion or Codex's conditional PATH belong with the
@@ -208,14 +210,33 @@ export abstract class ProviderAdapter {
     command: string,
     args: string[],
     env: NodeJS.ProcessEnv,
-  ): ChildProcessByStdio<null, Readable, Readable> {
-    // stdio is fixed as ['ignore', 'pipe', 'pipe'], so stdin is null and
-    // stdout/stderr are always readable streams — assert that shape so callers
-    // keep the non-null stdout/stderr the inline spawn() overload gave them.
-    return spawn(command, args, {
+    stdinInput?: string,
+  ): ChildProcessByStdio<Writable | null, Readable, Readable> {
+    // stdin defaults to 'ignore' (null) — a live stdin pipe hangs most CLIs.
+    // When stdinInput is given we pipe it, write it, and immediately end() so
+    // the child receives its prompt via stdin without ever blocking. This is
+    // how Claude is fed: a large prompt as a positional argv entry exceeds the
+    // OS per-argument size limit and the spawn dies with `spawn E2BIG`.
+    // stdout/stderr stay piped for streaming.
+    const child = spawn(command, args, {
       env,
       cwd: getBridgeWorkingDir(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }) as ChildProcessByStdio<null, Readable, Readable>;
+      stdio: [stdinInput !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+    }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
+
+    if (stdinInput !== undefined && child.stdin) {
+      // Guard against EPIPE: if the child exits or closes stdin before it has
+      // consumed the whole prompt (fast non-zero exit, crash, or a CLI that
+      // stops reading), the async write emits an 'error' on the stdin stream.
+      // With no listener that becomes an uncaughtException and kills the whole
+      // bridge — the very crash class this stdin path exists to avoid. Swallow
+      // it here; the child's own exit/close is handled by the caller.
+      child.stdin.on('error', () => {});
+      // write + close in one call — also respects backpressure better than a
+      // bare write() followed by end().
+      child.stdin.end(stdinInput);
+    }
+
+    return child;
   }
 }
