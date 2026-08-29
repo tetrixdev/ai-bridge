@@ -234,6 +234,40 @@ The bridge re-probes its CLIs after every handshake and after a provider spawn f
 }
 ```
 
+#### Local tools (optional)
+
+A tool may carry `execute`, `secrets` and `run`, which move execution from the
+server to the bridge:
+
+```json
+{
+  "name": "deploy",
+  "description": "Deploy the current branch",
+  "parameters": { "type": "object", "properties": {} },
+  "execute": "local",
+  "secrets": ["deploy-key"],
+  "run": { "command": "/usr/local/bin/deploy.sh" }
+}
+```
+
+`execute` absent means `"server"`, so a server that never sends the field is
+unaffected. `"local"` means the bridge runs the command on the operator's
+machine and **never emits a `tool_call` frame** for it, which is the point once
+the arguments include a decrypted secret: the plaintext must not reach the
+network.
+
+**A server cannot enable this.** The bridge honours `"local"` only when its
+operator started it with `--local-tools`. Otherwise the tool is refused and the
+refusal logged. This is deliberate: a local tool lets a server run commands on
+someone else's machine, as them, and that has to be chosen rather than sent.
+
+`secrets` names what the bridge may inject as environment variables. A tool
+receives those and nothing else. `run.command` is executed with an argv array
+and no shell; the model's arguments arrive as `ENGRAM_ARG_*` environment
+variables rather than on a command line, so a value containing shell
+metacharacters is a string a program received, not something the system
+interpreted.
+
 **`tools`**: Dynamic tool definitions sent from the server. These are the tools the AI can call during a conversation. The bridge injects these into the CLI's context (see [Tool Calls](#tool-calls)).
 
 **`config.heartbeat_interval`**: Seconds between heartbeat pings. See [Heartbeat](#heartbeat).
