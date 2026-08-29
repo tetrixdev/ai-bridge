@@ -37,6 +37,11 @@ import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from 
 import { detectProviders } from './providers/detector.js';
 import { getBridgeWorkingDir } from './providers/env.js';
 import { ToolResolver } from './tools/resolver.js';
+import { LOCAL_EXECUTION_OFF, refusalReason, runsLocally, type LocalExecutionConfig } from './local/gate.js';
+import { runLocalTool } from './local/executor.js';
+import { grantedTo, loadSecrets, type EngramConfig } from './local/engram.js';
+import type { Identity } from './local/identity.js';
+import type { Redaction } from './local/scrub.js';
 import { BridgeMcpServer } from './mcp/server.js';
 import { createLogger } from './utils/logger.js';
 import { clampRequestTimeout, clampHeartbeat } from './utils/clamp.js';
@@ -63,6 +68,15 @@ export interface BridgeOptions {
   testMode?: boolean;
   /** Mock response handler for test mode */
   onTestRequest?: (request: AiRequestMessage, sendEvent: (event: StreamEventType, data: StreamEventData) => void) => Promise<void>;
+  /**
+   * Local execution posture. Absent means off, which is the DungeonMeister
+   * shape: a server can mark a tool `local` and the bridge will not run it.
+   */
+  localExecution?: LocalExecutionConfig;
+  /** Where to resolve secrets from. Only consulted when local execution is on. */
+  engram?: EngramConfig;
+  /** This device's keypair and its id at Engram. */
+  identity?: Identity;
 }
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
@@ -158,6 +172,16 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private providers: ProviderCapability[];
   private readonly adapters: Map<string, ProviderAdapter>;
   private readonly toolResolver = new ToolResolver();
+  private readonly localExecution: LocalExecutionConfig;
+  private readonly engram?: EngramConfig;
+  private readonly identity?: Identity;
+  /**
+   * Secrets are fetched once, on the first local tool call, rather than at
+   * startup: a bridge that never runs a local tool should never ask Engram for
+   * a credential, and a bridge started before its device was approved should
+   * pick them up without a restart.
+   */
+  private secrets?: Map<string, Redaction>;
   /**
    * Bridge-side HTTP MCP server. Tools/list returns the welcome's registered
    * tools; tools/call routes through the WebSocket via toolResolver. The
@@ -205,6 +229,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.token = options.token;
     this.providers = options.providers;
     this.adapters = options.adapters;
+    // Absent means off. A server cannot turn this on by sending a field.
+    this.localExecution = options.localExecution ?? LOCAL_EXECUTION_OFF;
+    this.engram = options.engram;
+    this.identity = options.identity;
     this.testMode = options.testMode ?? false;
     this.onTestRequest = options.onTestRequest;
 
@@ -212,6 +240,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // toolResolver → WebSocket round-trip. The requestId comes from the
     // per-spawn token the CLI presented, looked up by BridgeMcpServer.
     this.mcpServer = new BridgeMcpServer(async (requestId, toolName, args) => {
+      const tool = this.currentTools.find((t) => t.name === toolName);
+
+      // The one place local execution is decided. A tool the server marked
+      // `local` on a bridge that never opted in falls through to the server
+      // path, where it fails as any unknown tool does.
+      if (runsLocally(this.localExecution, tool)) {
+        return this.runToolHere(tool!, args);
+      }
+      const refused = refusalReason(this.localExecution, tool);
+      if (refused) log.warn('refusing a local tool', { name: toolName, reason: refused });
+
       const toolCallId = `mcp-${requestId}-${++this.mcpToolCallSeq}`;
       return this.toolResolver.call(
         (reqId, tcId, tName, tArgs) => {
@@ -229,6 +268,44 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         args,
       );
     });
+  }
+
+  /**
+   * Run a tool on this machine, with the secrets it declared and no others.
+   *
+   * The secret values never enter a tool_call frame, which is the whole reason
+   * this path exists. What goes back to the model is the tool's output with
+   * those values redacted, which stops the accidental echo and does not pretend
+   * to stop a deliberate one.
+   */
+  private async runToolHere(
+    tool: import('./protocol/types.js').ToolDefinition,
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    if (!tool.run?.command) {
+      throw new Error(`local tool "${tool.name}" has no command to run`);
+    }
+
+    if (!this.secrets && this.engram && this.identity?.deviceId) {
+      this.secrets = await loadSecrets(this.engram, this.identity, this.identity.deviceId);
+    }
+    const granted = grantedTo(this.secrets ?? new Map(), tool.secrets);
+
+    const result = await runLocalTool({
+      name: tool.name,
+      command: tool.run.command,
+      args: tool.run.args ?? [],
+      toolArgs: args,
+      secrets: granted,
+      cwd: this.localExecution.workdir,
+    });
+
+    return {
+      exit_code: result.exitCode,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      ...(result.timedOut ? { timed_out: true } : {}),
+    };
   }
 
   // -------------------------------------------------------------------------

@@ -51,6 +51,31 @@ export interface ToolDefinition {
   description: string;
   /** JSON Schema describing the tool's input parameters */
   parameters: Record<string, unknown>;
+  /**
+   * Where this tool runs.
+   *
+   * Absent means `server`, so every existing server keeps the behaviour it has:
+   * the call round-trips over the WebSocket and the server executes it. Same
+   * convention as `isolation` elsewhere in this file, where absent is the safe
+   * legacy default and never the new behaviour.
+   *
+   * `local` means the bridge runs it on this machine and never emits a
+   * tool_call frame, which is the entire point once the arguments include a
+   * decrypted secret: the plaintext must not reach the network.
+   *
+   * Honoured ONLY when the operator enabled local execution. A server cannot
+   * turn it on by sending this field. See src/local/gate.ts.
+   */
+  execute?: 'server' | 'local';
+  /**
+   * local only. Names of the secrets this tool may be given, which the bridge
+   * resolves and injects as environment variables. A tool receives these and
+   * nothing else, so one client's credentials cannot reach a tool written for
+   * another.
+   */
+  secrets?: string[];
+  /** local only. The command to run, and any arguments before the tool's own. */
+  run?: { command: string; args?: string[] };
 }
 
 // ---------------------------------------------------------------------------

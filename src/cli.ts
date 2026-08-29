@@ -11,6 +11,8 @@
  */
 
 import { realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { Bridge, FatalBridgeError } from './bridge.js';
@@ -22,6 +24,8 @@ import type { ProviderAdapter } from './providers/base.js';
 import { handleTestRequest } from './test-mode.js';
 import { setDebug, setLogFile, closeLogFile, createLogger } from './utils/logger.js';
 import { BRIDGE_VERSION, PROTOCOL_VERSION } from './protocol/version.js';
+import { loadOrCreateIdentity, saveIdentity, fingerprint, type Identity } from './local/identity.js';
+import { enrol, type EngramConfig } from './local/engram.js';
 
 const log = createLogger('CLI');
 
@@ -56,11 +60,45 @@ program
     false,
   )
   .option(
+    '--local-tools',
+    'Allow this server to run tools on THIS MACHINE, as you. Off unless you pass it: without it a tool marked execute:"local" is refused, whatever the server sends. Needed for Engram secrets.',
+    false,
+  )
+  .option(
+    '--engram <url>',
+    'Engram base URL, for resolving secrets into local tools (or set ENGRAM_URL). Only used with --local-tools.',
+    process.env['ENGRAM_URL'],
+  )
+  .option(
+    '--engram-token <token>',
+    'Bearer credential for Engram (or set ENGRAM_TOKEN). Defaults to --token.',
+    process.env['ENGRAM_TOKEN'],
+  )
+  .option(
+    '--device-label <label>',
+    'How this machine appears when you approve it in the browser.',
+    'A bridge',
+  )
+  .option(
+    '--device-mode <mode>',
+    'transcript | isolated. Self-reported and recorded as such: no server can verify it. Say what is true.',
+    'transcript',
+  )
+  .option(
+    '--identity-file <path>',
+    'Where this device keeps its keypair. The private half never leaves this machine.',
+    process.env['ENGRAM_IDENTITY'] ?? join(homedir(), '.engram', 'device.json'),
+  )
+  .option(
     '--log-file <path>',
     'Also append logs to this file (or set AI_BRIDGE_LOG_FILE env var). Rotates once past 5 MB, keeping one previous copy.',
     process.env['AI_BRIDGE_LOG_FILE'],
   )
-  .action(async (opts: { token?: string; server?: string; debug: boolean; test: boolean; logFile?: string }) => {
+  .action(async (opts: {
+    token?: string; server?: string; debug: boolean; test: boolean; logFile?: string;
+    localTools: boolean; engram?: string; engramToken?: string;
+    deviceLabel: string; deviceMode: string; identityFile: string;
+  }) => {
     // Enable debug logging if requested
     if (opts.debug) {
       setDebug(true);
@@ -176,6 +214,45 @@ program
     // Token goes in the URL query param (?token=...), NOT in the hello body
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Local tools, off unless asked for
+    // -----------------------------------------------------------------------
+    //
+    // This is the one place the posture is decided. Nothing a server sends can
+    // reach it, which is what keeps a bridge that never passed --local-tools
+    // exactly as safe as it was before this feature existed.
+
+    let identity: Identity | undefined;
+    let engram: EngramConfig | undefined;
+
+    if (opts.localTools) {
+      log.warn('local tools are ENABLED: this server can run commands on this machine, as you');
+      identity = await loadOrCreateIdentity(opts.identityFile);
+
+      if (opts.engram) {
+        engram = { baseUrl: opts.engram, token: opts.engramToken ?? token };
+        if (!identity.deviceId) {
+          const mode = opts.deviceMode === 'isolated' ? 'isolated' : 'transcript';
+          const result = await enrol(engram, identity, opts.deviceLabel, mode);
+          identity.deviceId = result.deviceId;
+          await saveIdentity(opts.identityFile, identity);
+          log.info('enrolled with Engram; approve this device in the browser');
+          // Printed rather than logged: a person has to read this aloud and
+          // compare it against what the browser shows, and a log line scrolls.
+          process.stdout.write(
+            `\n  This device is waiting to be approved.\n` +
+            `  Open Engram, go to Vault, and check these five groups match:\n\n` +
+            `      ${result.fingerprint}\n\n` +
+            `  If they differ, do not approve it.\n\n`,
+          );
+        } else {
+          log.info('device already enrolled', { fingerprint: await fingerprint(identity.publicKey) });
+        }
+      } else {
+        log.warn('--local-tools without --engram: tools will run, but no secrets can be resolved');
+      }
+    }
+
     const bridge = new Bridge({
       serverUrl,
       token,
@@ -183,6 +260,9 @@ program
       adapters,
       testMode: opts.test,
       onTestRequest: opts.test ? handleTestRequest : undefined,
+      localExecution: { enabled: opts.localTools },
+      engram,
+      identity,
     });
 
     // Lifecycle logging
