@@ -268,6 +268,11 @@ variables rather than on a command line, so a value containing shell
 metacharacters is a string a program received, not something the system
 interpreted.
 
+A declared secret the device does not hold **fails the call**; the tool is not
+run without it. A tool that runs without a credential it declared does not fail
+cleanly, it connects as nobody or writes an empty value, and the model reads
+whatever comes back as the tool having worked.
+
 **`tools`**: Dynamic tool definitions sent from the server. These are the tools the AI can call during a conversation. The bridge injects these into the CLI's context (see [Tool Calls](#tool-calls)).
 
 **`config.heartbeat_interval`**: Seconds between heartbeat pings. See [Heartbeat](#heartbeat).

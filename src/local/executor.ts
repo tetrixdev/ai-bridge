@@ -8,6 +8,18 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_BYTES = 256 * 1024;
 
 /**
+ * How long to keep reading after the child has exited.
+ *
+ * `close` fires only once every writer on the stdio pipes is gone, and a tool
+ * that leaves a background process holding stdout never gets there: settling on
+ * `close` alone means this promise never resolves and the model's tool call
+ * hangs for the rest of the session, with nothing in the log saying so.
+ * Settling on `exit` alone would drop output still sitting in the pipe. So the
+ * exit starts a deadline, and whichever comes first ends the run.
+ */
+const STDIO_FLUSH_MS = 500;
+
+/**
  * What a tool inherits from the bridge's own environment.
  *
  * An allowlist rather than `{...process.env}`, because the bridge's environment
@@ -91,6 +103,11 @@ export async function runLocalTool(run: LocalRun): Promise<LocalResult> {
       env,
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
+      // Its own process group, so the timeout can reach what the tool started
+      // as well as the tool itself. Without it a tool that backgrounds a worker
+      // survives its own kill: the worker keeps running as the user, still
+      // holding stdout, after the bridge has reported the tool killed.
+      detached: true,
     });
 
     let stdout = '';
@@ -104,15 +121,38 @@ export async function runLocalTool(run: LocalRun): Promise<LocalResult> {
     child.stdout.on('data', (c: Buffer) => { stdout = cap(stdout, c); });
     child.stderr.on('data', (c: Buffer) => { stderr = cap(stderr, c); });
 
+    /**
+     * Kill the tool and everything it started.
+     *
+     * A negative pid signals the whole process group, which is the group
+     * `detached` gave this child. `child.kill` reaches the direct child only,
+     * so a shell that backgrounded a long-running process left it alive.
+     * Windows has no process group to signal, so there the direct child is all
+     * that can be reached. A throw here means it is already gone.
+     */
+    const killTree = () => {
+      const pid = child.pid;
+      if (pid === undefined) return;
+      try {
+        if (process.platform === 'win32') child.kill('SIGKILL');
+        else process.kill(-pid, 'SIGKILL');
+      } catch {
+        // Already exited, or never started. Nothing left to signal.
+      }
+    };
+
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGKILL');
+      killTree();
     }, run.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
     const finish = (exitCode: number | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (flushTimer) clearTimeout(flushTimer);
       // Scrubbing happens here, at the one place output leaves this process,
       // rather than at each caller. A caller that forgot would leak silently.
       resolve({
@@ -127,6 +167,11 @@ export async function runLocalTool(run: LocalRun): Promise<LocalResult> {
       stderr += `\n${err.message}`;
       finish(null);
     });
+    // The tool is over once it exits; the pipes may not be, because anything it
+    // left behind still holds them. Give the pipes STDIO_FLUSH_MS to drain and
+    // settle regardless, so a leaked grandchild costs half a second of output
+    // rather than a tool call that never returns.
+    child.on('exit', (code) => { flushTimer = setTimeout(() => finish(code), STDIO_FLUSH_MS); });
     child.on('close', (code) => finish(code));
   });
 }

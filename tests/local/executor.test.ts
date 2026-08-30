@@ -1,3 +1,6 @@
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { runLocalTool } from '../../src/local/executor.js';
 
@@ -78,4 +81,48 @@ describe('what a tool inherits', () => {
     });
     expect(res.stdout).not.toBe('/attacker/bin');
   });
+});
+
+describe('a tool that outlives its own kill', () => {
+  it('kills what the tool started, not only the tool', async () => {
+    // child.kill signals the direct child alone. The shell below backgrounds a
+    // process that touches a marker a second after the timeout has already
+    // fired: without a process group to signal, that process survived the
+    // timeout and kept running as the user, long after the bridge reported the
+    // tool killed. The marker is what it running looks like from here.
+    const dir = mkdtempSync(join(tmpdir(), 'engram-exec-'));
+    const marker = join(dir, 'survived-the-kill');
+    try {
+      const res = await runLocalTool({
+        ...base,
+        command: 'sh',
+        args: ['-c', `sh -c "sleep 1; : > ${marker}" & sleep 30`],
+        timeoutMs: 300,
+      });
+      expect(res.timedOut).toBe(true);
+      await new Promise((r) => setTimeout(r, 2_000));
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it('settles when something it left behind holds stdout open', async () => {
+    // `close` fires only once every writer on the pipes is gone. This tool
+    // exits at once but leaves a background process holding stdout, so waiting
+    // for `close` meant waiting for that process: runLocalTool stayed pending
+    // and the model's tool call hung, here for five seconds and in the real
+    // case for as long as the leaked process lives.
+    const started = Date.now();
+    const res = await runLocalTool({
+      ...base,
+      command: 'sh',
+      args: ['-c', 'sleep 5 & echo done'],
+      timeoutMs: 30_000,
+    });
+    expect(res.stdout.trim()).toBe('done');
+    expect(res.exitCode).toBe(0);
+    expect(res.timedOut).toBe(false);
+    expect(Date.now() - started).toBeLessThan(3_000);
+  }, 15_000);
 });

@@ -78,6 +78,9 @@ const envName = (name: string): string => name.toUpperCase().replace(/[^A-Z0-9]/
  * `db-password`, neither is reachable as `db-password` and a tool must ask for
  * `space-id/db-password`, because silently picking one would hand a tool the
  * wrong client's credential and look like it worked.
+ *
+ * Both forms share one map, which only works while `/` cannot appear in a bare
+ * name, so a name containing one is dropped rather than stored. See below.
  */
 export async function loadSecrets(
   cfg: EngramConfig,
@@ -112,6 +115,19 @@ export async function loadSecrets(
   for (const s of secrets) {
     const key = spaceKeys.get(s.space_id);
     if (!key) continue;
+    if (s.name.includes('/')) {
+      // `/` is what separates a space from a name here, so a secret NAMED
+      // `alpha/db-password` produces a bare key identical to space `alpha`'s
+      // qualified key for `db-password`. The ambiguity sweep below then deletes
+      // that entry, and the tool that asked for `alpha/db-password` runs with
+      // no credential at all rather than the wrong one. Dropping the name keeps
+      // the two forms disjoint: a bare key never contains `/`, a qualified key
+      // always does.
+      log.warn('ignoring a secret whose name contains "/"; rename it in the vault', {
+        space: s.space_id, name: s.name,
+      });
+      continue;
+    }
     let value: string;
     try {
       value = await openEnvelope(key, s.envelope);
@@ -135,14 +151,28 @@ export async function loadSecrets(
   return out;
 }
 
-/** The secrets a tool declared, and nothing else. */
+/**
+ * The secrets a tool declared, and nothing else.
+ *
+ * A missing one throws rather than warning and running on. A tool that declared
+ * a credential and runs without it does not fail cleanly: it connects as
+ * nobody, writes an empty value into whatever it configures, or acts on the
+ * wrong target, and the model reads whatever comes back as the tool having
+ * worked. Missing means not granted, not yet approved, or ambiguous across
+ * spaces, and every one of those is for a person to fix in the vault rather
+ * than for the bridge to paper over.
+ */
 export function grantedTo(available: Map<string, Redaction>, wanted: string[] | undefined): Redaction[] {
   const out: Redaction[] = [];
   for (const name of wanted ?? []) {
     const found = available.get(name);
     if (!found) {
       log.warn('a tool asked for a secret this device does not hold', { name });
-      continue;
+      throw new Error(
+        `this device does not hold the secret "${name}" that the tool declared. ` +
+        `Approve the device in the vault and grant it the space key, or ask for ` +
+        `"space-id/${name}" if that name exists in more than one space.`,
+      );
     }
     out.push(found);
   }

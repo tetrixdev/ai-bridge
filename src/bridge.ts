@@ -88,6 +88,11 @@ const MAX_RECONNECT_ATTEMPTS = 100;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 15_000; // Cap at 15s per PROTOCOL.md
 
+// How long a fetched set of secrets is trusted. Short because it bounds how
+// long a revoked device or a rotated value keeps working; not zero because
+// every local tool call would otherwise depend on Engram being reachable.
+const SECRETS_TTL_MS = 60_000;
+
 // ---------------------------------------------------------------------------
 // Bridge Events
 // ---------------------------------------------------------------------------
@@ -205,12 +210,19 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly engram?: EngramConfig;
   private readonly identity?: Identity;
   /**
-   * Secrets are fetched once, on the first local tool call, rather than at
-   * startup: a bridge that never runs a local tool should never ask Engram for
-   * a credential, and a bridge started before its device was approved should
-   * pick them up without a restart.
+   * Secrets are fetched on the first local tool call that needs one, rather
+   * than at startup: a bridge that never runs a local tool should never ask
+   * Engram for a credential.
+   *
+   * Cached with a TTL, and re-fetched early whenever a declared secret is not
+   * in the cache. Caching until restart broke the promise this comment used to
+   * make: the first call before the device was approved cached an empty map,
+   * and the secrets then never appeared, however long the bridge ran and
+   * whoever approved it. See secretsFor().
    */
   private secrets?: Map<string, Redaction>;
+  /** When this.secrets was fetched, for the TTL in secretsFor(). */
+  private secretsFetchedAt = 0;
   /**
    * Bridge-side HTTP MCP server. Tools/list returns the welcome's registered
    * tools; tools/call routes through the WebSocket via toolResolver. The
@@ -315,10 +327,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       throw new Error(`local tool "${tool.name}" has no command to run`);
     }
 
-    if (!this.secrets && this.engram && this.identity?.deviceId) {
-      this.secrets = await loadSecrets(this.engram, this.identity, this.identity.deviceId);
-    }
-    const granted = grantedTo(this.secrets ?? new Map(), tool.secrets);
+    const granted = grantedTo(await this.secretsFor(tool.secrets), tool.secrets);
 
     const result = await runLocalTool({
       name: tool.name,
@@ -335,6 +344,44 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       stderr: result.stderr,
       ...(result.timedOut ? { timed_out: true } : {}),
     };
+  }
+
+  /**
+   * The secrets available to a tool that declared `wanted`.
+   *
+   * Three rules, each fixing something a fetch-once cache got wrong:
+   *
+   * 1. A tool that declares nothing never triggers a fetch, so a bridge whose
+   *    local tools need no credential still never asks Engram for one.
+   * 2. A declared secret that is not in the cache re-fetches before giving up.
+   *    This is the case the old comment claimed and the code did not do: the
+   *    first local tool call made before anyone approved the device cached an
+   *    empty map, and no approval afterwards could ever be seen without a
+   *    restart. It also covers a secret granted to an already-approved device.
+   * 3. Anything cached longer than the TTL is re-fetched. A revoked device or a
+   *    rotated value is otherwise honoured for the life of the process.
+   *
+   * What this does NOT cover, deliberately: a revocation is still served from
+   * cache for up to the TTL, because the alternative is a network round trip on
+   * every tool call and Engram being briefly unreachable would then break tools
+   * that have a perfectly good credential in hand. And nothing can recall a
+   * value already handed to a running tool. A short window, not zero.
+   *
+   * A fetch that fails fails the tool call rather than falling back to the
+   * cache. From here an unreachable Engram and a revoked device look the same,
+   * and the one that must not run is the revoked one.
+   */
+  private async secretsFor(wanted: string[] | undefined): Promise<Map<string, Redaction>> {
+    if (!wanted || wanted.length === 0) return new Map();
+    if (!this.engram || !this.identity?.deviceId) return this.secrets ?? new Map();
+
+    const fresh = this.secrets !== undefined && Date.now() - this.secretsFetchedAt < SECRETS_TTL_MS;
+    const complete = wanted.every((name) => this.secrets?.has(name));
+    if (fresh && complete) return this.secrets!;
+
+    this.secrets = await loadSecrets(this.engram, this.identity, this.identity.deviceId);
+    this.secretsFetchedAt = Date.now();
+    return this.secrets;
   }
 
   // -------------------------------------------------------------------------
