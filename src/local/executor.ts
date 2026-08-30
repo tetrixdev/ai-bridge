@@ -7,6 +7,27 @@ const log = createLogger('LocalTool');
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_BYTES = 256 * 1024;
 
+/**
+ * What a tool inherits from the bridge's own environment.
+ *
+ * An allowlist rather than `{...process.env}`, because the bridge's environment
+ * holds ENGRAM_TOKEN and AI_BRIDGE_TOKEN and those are NOT in the redaction
+ * set: a tool that dumps its environment, or an error message that includes it,
+ * would hand the model the bridge's own credentials in the clear. That is
+ * exactly the accident scrubbing exists to catch, and scrubbing cannot catch it
+ * because it only knows the secrets the tool was granted.
+ *
+ * A tool that needs something else gets it as a declared secret, which is
+ * visible in the manifest a person approved.
+ */
+const INHERITED = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR', 'TERM', 'SHELL', 'USER'];
+
+/** Names a secret may not take, because the child resolves its binary with them. */
+const PROTECTED = new Set([
+  'PATH', 'HOME', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'NODE_OPTIONS', 'DYLD_INSERT_LIBRARIES',
+  'IFS', 'BASH_ENV', 'ENV', 'PYTHONPATH', 'PYTHONSTARTUP', 'PERL5OPT',
+]);
+
 export interface LocalRun {
   /** Tool name, for logs and for naming a redaction. */
   name: string;
@@ -39,8 +60,20 @@ export interface LocalResult {
  * the shape of the API is what prevents it rather than a rule someone follows.
  */
 export async function runLocalTool(run: LocalRun): Promise<LocalResult> {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const s of run.secrets) env[s.name] = s.value;
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of INHERITED) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  for (const s of run.secrets) {
+    if (PROTECTED.has(s.name)) {
+      // A space member choosing a secret's name must not get to decide which
+      // binary the child actually runs.
+      log.warn('refusing to inject a secret over a protected variable', { name: s.name });
+      continue;
+    }
+    env[s.name] = s.value;
+  }
   for (const [k, v] of Object.entries(run.toolArgs)) {
     env[`ENGRAM_ARG_${k.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`] =
       typeof v === 'string' ? v : JSON.stringify(v);

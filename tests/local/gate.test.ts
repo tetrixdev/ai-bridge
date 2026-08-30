@@ -40,3 +40,19 @@ describe('the local execution gate', () => {
     expect(refusalReason({ enabled: true }, undefined)).toBeNull();
   });
 });
+
+describe('the off posture cannot be edited from inside the process', () => {
+  it('is frozen, so nothing can flip it for every default bridge at once', () => {
+    expect(Object.isFrozen(LOCAL_EXECUTION_OFF)).toBe(true);
+    // Silent in sloppy mode, throws under the module's strictness; either way
+    // the value must not change.
+    try { (LOCAL_EXECUTION_OFF as { enabled: boolean }).enabled = true; } catch { /* expected */ }
+    expect(LOCAL_EXECUTION_OFF.enabled).toBe(false);
+    expect(runsLocally(LOCAL_EXECUTION_OFF, localTool)).toBe(false);
+  });
+
+  it('needs exactly true, not merely truthy', () => {
+    expect(runsLocally({ enabled: 1 as unknown as boolean }, localTool)).toBe(false);
+    expect(runsLocally({ enabled: 'yes' as unknown as boolean }, localTool)).toBe(false);
+  });
+});

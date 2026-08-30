@@ -51,3 +51,31 @@ describe('running a tool locally', () => {
     expect(res.stderr).toContain('ENOENT');
   });
 });
+
+describe('what a tool inherits', () => {
+  it('does not hand the bridge its own credentials', async () => {
+    // The bridge's environment holds ENGRAM_TOKEN and AI_BRIDGE_TOKEN, and
+    // scrubbing cannot protect them: it only knows the secrets the tool was
+    // granted. An `env` dump would have leaked them in the clear.
+    process.env['ENGRAM_TOKEN'] = 'eng_should_never_be_visible';
+    process.env['AI_BRIDGE_TOKEN'] = 'aib_should_never_be_visible';
+    try {
+      const res = await runLocalTool({ ...base, command: 'sh', args: ['-c', 'env'] });
+      expect(res.stdout).not.toContain('should_never_be_visible');
+      expect(res.stdout).toContain('PATH=');
+    } finally {
+      delete process.env['ENGRAM_TOKEN'];
+      delete process.env['AI_BRIDGE_TOKEN'];
+    }
+  });
+
+  it('refuses a secret named after a variable that picks the binary', async () => {
+    const res = await runLocalTool({
+      ...base,
+      command: 'sh',
+      args: ['-c', 'printf %s "$PATH"'],
+      secrets: [{ name: 'PATH', value: '/attacker/bin' }],
+    });
+    expect(res.stdout).not.toBe('/attacker/bin');
+  });
+});

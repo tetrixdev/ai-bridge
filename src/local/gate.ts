@@ -21,8 +21,17 @@ export interface LocalExecutionConfig {
   workdir?: string;
 }
 
-/** The posture of a bridge that was never configured for local execution. */
-export const LOCAL_EXECUTION_OFF: LocalExecutionConfig = { enabled: false };
+/**
+ * The posture of a bridge that was never configured for local execution.
+ *
+ * Frozen: every default-constructed Bridge aliases this one object, and
+ * `readonly` is a compile-time promise only. Without the freeze any code in the
+ * process, a dependency or an embedding application, could set
+ * `LOCAL_EXECUTION_OFF.enabled = true` and turn local execution on for every
+ * default bridge at once. Not reachable from a server, but this file's whole
+ * argument is that the guarantee should be structural.
+ */
+export const LOCAL_EXECUTION_OFF: LocalExecutionConfig = Object.freeze({ enabled: false });
 
 /**
  * Whether this tool should run here rather than round-trip to the server.
@@ -33,7 +42,9 @@ export const LOCAL_EXECUTION_OFF: LocalExecutionConfig = { enabled: false };
  * path, where an unknown tool fails the way any other unknown tool does.
  */
 export function runsLocally(config: LocalExecutionConfig, tool: ToolDefinition | undefined): boolean {
-  if (!config.enabled) return false;
+  // === true, not truthy: a consumer passing a non-boolean should not enable
+  // execution by accident.
+  if (config.enabled !== true) return false;
   return tool?.execute === 'local';
 }
 
