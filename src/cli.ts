@@ -85,6 +85,11 @@ program
     'transcript',
   )
   .option(
+    '--local-data-dir <path>',
+    'Where the bridge installs the npm packages local tools live in, one directory per space (default ~/.ai-bridge).',
+    process.env['AI_BRIDGE_DATA_DIR'] ?? join(homedir(), '.ai-bridge'),
+  )
+  .option(
     '--identity-file <path>',
     'Where this device keeps its keypair. The private half never leaves this machine.',
     process.env['ENGRAM_IDENTITY'] ?? join(homedir(), '.engram', 'device.json'),
@@ -97,7 +102,7 @@ program
   .action(async (opts: {
     token?: string; server?: string; debug: boolean; test: boolean; logFile?: string;
     localTools: boolean; engram?: string; engramToken?: string;
-    deviceLabel: string; deviceMode: string; identityFile: string;
+    deviceLabel: string; deviceMode: string; identityFile: string; localDataDir: string;
   }) => {
     // Enable debug logging if requested
     if (opts.debug) {
@@ -260,7 +265,7 @@ program
       adapters,
       testMode: opts.test,
       onTestRequest: opts.test ? handleTestRequest : undefined,
-      localExecution: { enabled: opts.localTools },
+      localExecution: { enabled: opts.localTools, dataDir: opts.localDataDir },
       engram,
       identity,
     });

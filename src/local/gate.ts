@@ -7,9 +7,10 @@
  * has to be chosen rather than inherited, and a server must never be able to
  * turn it on by sending a field.
  *
- * So: one function, consulted in one place, with a test asserting that a
- * DungeonMeister-shaped config refuses a local tool outright. Not a flag read
- * in three places that can drift.
+ * So: one predicate, consulted by every way in, with tests asserting that a
+ * DungeonMeister-shaped config refuses both a `welcome`-registered local tool
+ * and a `local_call` frame outright. Not a flag read in three places that can
+ * drift, and not a new message type that quietly brings its own door.
  */
 
 import type { ToolDefinition } from '../protocol/types.js';
@@ -19,6 +20,11 @@ export interface LocalExecutionConfig {
   enabled: boolean;
   /** Where local tools run. Absent means the bridge's own working directory. */
   workdir?: string;
+  /**
+   * Where the bridge keeps what it installs for local tools, one directory per
+   * space. Absent means `~/.ai-bridge`.
+   */
+  dataDir?: string;
 }
 
 /**
@@ -42,10 +48,38 @@ export const LOCAL_EXECUTION_OFF: LocalExecutionConfig = Object.freeze({ enabled
  * path, where an unknown tool fails the way any other unknown tool does.
  */
 export function runsLocally(config: LocalExecutionConfig, tool: ToolDefinition | undefined): boolean {
+  return enabled(config) && tool?.execute === 'local';
+}
+
+/**
+ * Whether this bridge runs anything at all on this machine.
+ *
+ * The one predicate underneath both entry points. A `local_call` frame is a
+ * second way into the same capability, and a second way in that consults a
+ * second flag is how a gate stops being a gate: this file's whole argument is
+ * that there is one answer to "may this server run code here", not one per
+ * message type.
+ */
+function enabled(config: LocalExecutionConfig): boolean {
   // === true, not truthy: a consumer passing a non-boolean should not enable
   // execution by accident.
-  if (config.enabled !== true) return false;
-  return tool?.execute === 'local';
+  return config.enabled === true;
+}
+
+/**
+ * Why a `local_call` was refused, or null when it may proceed.
+ *
+ * Unlike a `welcome`-registered tool, a local_call is a direct instruction and
+ * deserves a direct answer: it is refused outright and the refusal is sent
+ * back as `ok: false`, rather than falling through to some other path. There
+ * is no other path.
+ */
+export function localCallRefusal(config: LocalExecutionConfig): string | null {
+  if (!enabled(config)) {
+    return 'this bridge was not started with local execution enabled (--local-tools), ' +
+      'so it will not run anything on this machine';
+  }
+  return null;
 }
 
 /**
@@ -54,7 +88,7 @@ export function runsLocally(config: LocalExecutionConfig, tool: ToolDefinition |
  */
 export function refusalReason(config: LocalExecutionConfig, tool: ToolDefinition | undefined): string | null {
   if (tool?.execute !== 'local') return null;
-  if (!config.enabled) {
+  if (!enabled(config)) {
     return 'this bridge was not started with local execution enabled, so the tool was not run here';
   }
   return null;

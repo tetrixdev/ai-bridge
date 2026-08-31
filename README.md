@@ -33,6 +33,7 @@ npx @tetrixdev/ai-bridge
 | `--device-label <label>` | | How this machine appears when you approve it |
 | `--device-mode <mode>` | | `transcript` or `isolated`. Self-reported |
 | `--identity-file <path>` | `ENGRAM_IDENTITY` | Where the device keypair lives (default `~/.engram/device.json`) |
+| `--local-data-dir <path>` | `AI_BRIDGE_DATA_DIR` | Where npm packages for local tools are installed, one directory per space (default `~/.ai-bridge`) |
 
 ## Local tools
 
@@ -49,8 +50,44 @@ inherited, so:
 
 - without `--local-tools`, a tool marked `local` is **refused**, whatever the
   server sends, and the refusal is logged rather than silent
+- a `local_call` frame, which is a server asking the bridge to run a tool
+  directly rather than a model calling one, goes through the same gate and is
+  refused outright by the same flag. There is one way in, not one per message
+  type
 - a server cannot turn it on by sending a field
 - an absent `execute` field means `server`, so existing servers are unchanged
+
+### Every credential belongs to one space
+
+A local tool is defined in a space, and it can reach that space's credentials
+and nothing else. That is enforced at the lookup, not by convention: the bridge
+keeps decrypted secrets space by space, and every resolution names the space it
+is allowed to look in. A tool from a shared space asking for a credential that
+lives in your private space is refused, whether it asks by name or by resolved
+id, and whether or not the name happens to be unique.
+
+This is worth stating plainly because the earlier design got it wrong in a way
+that looked fine: everything the device could decrypt went into one flat map,
+names were exposed bare, and a bare name resolved against all of it. The only
+thing standing between a shared tool and a private credential was a name
+collision, and colliding names were dropped, so the reachable credentials were
+exactly the uniquely named ones.
+
+### Roles, not credential names
+
+A tool does not name credentials. It declares roles:
+
+```json
+{
+  "name": "fetch_mail",
+  "needs": [{ "role": "mailbox", "kind": "azure-app" }]
+}
+```
+
+and the caller says which credential fills each role. The tool reads
+`ENGRAM_SECRET_MAILBOX` and never learns what the credential is called, so one
+`fetch_mail` serves three Azure app registrations instead of being written three
+times. The bridge receives resolved secret IDs, never names.
 
 ### Why the secret never reaches the server
 
@@ -77,13 +114,79 @@ On first run this generates a keypair, enrols it, and prints a fingerprint:
 substituted a key of its own during enrolment. Without it the encryption still
 runs, every screen still looks right, and the server can read everything.
 
+### What the sandbox covers, and what it does not
+
+Two mechanisms, verified on this machine rather than assumed, and neither
+covers what the other does.
+
+**Filesystem: Node's permission model.** When the command is `node`, the tool
+runs with `--permission`, may read only its own package directory, may not
+write anywhere unless a writable directory was declared, and may not spawn
+child processes, load native addons or use WASI. `--allow-child-process` is
+never passed, because a child of a permissioned process runs with no permission
+model at all and would hand back every restriction in one flag.
+
+**Network: a namespace.** The permission model does **not** cover the network:
+a permissioned process still fetches `https://example.com` perfectly well. So a
+tool that declares `"network": false` is run under `unshare -rn`, which works
+rootless on an ordinary Linux box and leaves the tool with no resolver and no
+route.
+
+What that adds up to, per platform:
+
+| Tool runs | Linux | macOS / Windows |
+|-----------|-------|-----------------|
+| `node`, `network: false` | filesystem confined, network blocked | filesystem confined, **network open** |
+| `node`, network unspecified | filesystem confined, network open | filesystem confined, network open |
+| anything else (`python`, a shell script, a binary), `network: false` | **filesystem open**, network blocked | **no sandbox at all** |
+| anything else, network unspecified | **no sandbox at all** | **no sandbox at all** |
+
+Where a row says the sandbox did not apply, the bridge says so too: every
+`local_result` carries a `sandbox` object naming what was and was not enforced,
+and the bridge logs a warning when a tool that asked for no network gets one
+anyway. Declaring a **host list** rather than `false` is recorded as *not
+enforced*: per-host filtering is not implemented, and a tool that declares hosts
+gets the whole network.
+
+None of this is a substitute for approving the tool. It bounds an ordinary bug;
+it does not contain code that is trying to get out.
+
+### Packages
+
+A tool can name an npm package, pinned exactly:
+
+```json
+{ "package": "@scope/fetch-mail@1.2.3" }
+```
+
+It is installed with `--ignore-scripts`, into a directory of its own per space,
+under `~/.ai-bridge` (see `--local-data-dir`). Ranges, dist-tags, `file:` specs
+and git URLs are refused: what runs here has to be the same bytes every time,
+and the approval a person gave was for the code they looked at. The integrity
+hash npm resolved is recorded, and a later install of the same spec that
+resolves to **different bytes** is refused rather than installed quietly.
+
+### Rate limits
+
+Per space, at most 2 local tools run at once, and starts are spaced at least
+250ms apart. A third concurrent call is refused rather than queued. This exists
+because a panel with a render-loop bug would otherwise spawn processes at UI
+speed, each one holding a decrypted credential, and a queue would be the same
+thing with a delay.
+
 ### What redaction does and does not do
 
 Secrets reach a tool as environment variables, and the bridge removes those
 exact values from stdout and stderr before the model sees them. That turns an
-accidental `echo $DB_PASSWORD` from a leak into `[redacted: DB_PASSWORD]`, and
-catches the likelier accident, which is a tool printing a connection string in
-an error message.
+accidental `echo $ENGRAM_SECRET_MAILBOX` from a leak into
+`[redacted: ENGRAM_SECRET_MAILBOX]`, and catches the likelier accident, which is
+a tool printing a connection string in an error message.
+
+Scrubbing happens **before** the output is parsed, so a credential cannot
+survive inside a JSON string on its way to the model. A tool's stdout must be
+exactly one JSON document; anything else fails the call loudly rather than being
+passed back as text, because raw text arriving where a result belongs reads to a
+model exactly like a tool that worked.
 
 It is hygiene, not containment. `| base64` defeats it in one word, as does
 writing the value to a file. A tool you approved can always use a secret it was

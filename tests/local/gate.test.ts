@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { LOCAL_EXECUTION_OFF, refusalReason, runsLocally } from '../../src/local/gate.js';
+import { LOCAL_EXECUTION_OFF, localCallRefusal, refusalReason, runsLocally } from '../../src/local/gate.js';
 import type { ToolDefinition } from '../../src/protocol/types.js';
 
 const serverTool: ToolDefinition = { name: 'roll_dice', description: '', parameters: {} };
@@ -38,6 +38,25 @@ describe('the local execution gate', () => {
   it('says nothing about an unknown tool', () => {
     expect(runsLocally({ enabled: true }, undefined)).toBe(false);
     expect(refusalReason({ enabled: true }, undefined)).toBeNull();
+  });
+});
+
+describe('the same gate, on the local_call path', () => {
+  it('refuses a local_call outright when local execution was never enabled', () => {
+    // A local_call is a second way into the same capability. A second way in
+    // that consults a second flag is how a gate stops being a gate, so this
+    // asserts the same posture from the other door.
+    expect(localCallRefusal(LOCAL_EXECUTION_OFF)).toMatch(/not started with local execution enabled/);
+    expect(localCallRefusal({ enabled: false })).toBeTruthy();
+  });
+
+  it('lets one through only when the operator turned it on', () => {
+    expect(localCallRefusal({ enabled: true })).toBeNull();
+  });
+
+  it('needs exactly true here too, not merely truthy', () => {
+    expect(localCallRefusal({ enabled: 1 as unknown as boolean })).toBeTruthy();
+    expect(localCallRefusal({ enabled: 'yes' as unknown as boolean })).toBeTruthy();
   });
 });
 

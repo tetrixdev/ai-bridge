@@ -45,7 +45,7 @@ describe.skipIf(!process.env['ENGRAM_URL'])('a secret from a browser vault reach
     await saveIdentity(identityPath, identity);
 
     // 2. Before a human approves, it holds nothing.
-    expect([...(await loadSecrets(cfg, identity, deviceId)).keys()]).toHaveLength(0);
+    expect((await loadSecrets(cfg, identity, deviceId)).size).toBe(0);
 
     // 3. A person does the browser half: vault, secret, approve, grant.
     writeFileSync(join(dir, 'approve.spec.js'), browserHalf(BASE, deviceId, SECRET));
@@ -58,9 +58,13 @@ describe.skipIf(!process.env['ENGRAM_URL'])('a secret from a browser vault reach
 
     // 4. The device opens what was wrapped for it.
     const available = await loadSecrets(cfg, identity, deviceId);
-    const granted = grantedTo(available, ['deploy-key']);
+    const [space] = available.spaceIds();
+    const granted = grantedTo(available, space, ['deploy-key']);
     expect(granted).toHaveLength(1);
     expect(granted[0]!.name).toBe('DEPLOY_KEY');
+    // The same name, asked for from a space that does not hold it, is refused
+    // rather than served: the boundary is the space, not the spelling.
+    expect(() => grantedTo(available, 'a-space-this-device-does-not-hold', ['deploy-key'])).toThrow();
 
     // 5. The tool sees the real value; the model does not. Both halves in one
     //    run, because either alone would pass while the other was broken.

@@ -9,6 +9,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Modes of Operation](#modes-of-operation)
 - [Connection](#connection)
 - [Handshake](#handshake)
+- [Local Calls](#local-calls)
 - [AI Requests](#ai-requests)
 - [Conversation Continuity](#conversation-continuity)
 - [Streaming Events](#streaming-events)
@@ -236,17 +237,20 @@ The bridge re-probes its CLIs after every handshake and after a provider spawn f
 
 #### Local tools (optional)
 
-A tool may carry `execute`, `secrets` and `run`, which move execution from the
-server to the bridge:
+A tool may carry fields that move execution from the server to the bridge:
 
 ```json
 {
-  "name": "deploy",
-  "description": "Deploy the current branch",
+  "name": "fetch_mail",
+  "description": "Fetch mail since a date",
   "parameters": { "type": "object", "properties": {} },
   "execute": "local",
-  "secrets": ["deploy-key"],
-  "run": { "command": "/usr/local/bin/deploy.sh" }
+  "space_id": "1f2c...",
+  "needs": [{ "role": "mailbox", "kind": "azure-app" }],
+  "fill": [{ "role": "mailbox", "secret_id": "9ab3..." }],
+  "package": "@scope/fetch-mail@1.2.3",
+  "network": false,
+  "run": { "command": "node", "args": ["index.js"] }
 }
 ```
 
@@ -261,17 +265,39 @@ operator started it with `--local-tools`. Otherwise the tool is refused and the
 refusal logged. This is deliberate: a local tool lets a server run commands on
 someone else's machine, as them, and that has to be chosen rather than sent.
 
-`secrets` names what the bridge may inject as environment variables. A tool
-receives those and nothing else. `run.command` is executed with an argv array
-and no shell; the model's arguments arrive as `ENGRAM_ARG_*` environment
-variables rather than on a command line, so a value containing shell
-metacharacters is a string a program received, not something the system
-interpreted.
+**`space_id`** is required for any local tool that touches a credential. Every
+secret the bridge resolves is scoped to it, and a tool that names no space
+resolves nothing: there is no unscoped lookup to fall back to. A tool defined
+in a shared space cannot reach a credential that lives in a private space, by
+name or by resolved id, however uniquely that credential is named.
 
-A declared secret the device does not hold **fails the call**; the tool is not
-run without it. A tool that runs without a credential it declared does not fail
-cleanly, it connects as nobody or writes an empty value, and the model reads
-whatever comes back as the tool having worked.
+**`needs`** declares what the tool wants by ROLE. **`fill`** says which
+credential fills each role, as resolved secret IDs. The bridge injects each as
+`ENGRAM_SECRET_<ROLE UPPERCASED>` (`-` becomes `_`), so a tool reads the role it
+declared and never a credential name, and one `fetch_mail` serves three Azure
+app registrations. Two roles that would become the same variable fail the call
+rather than one silently overwriting the other.
+
+**`secrets`** is the older name-based form, still honoured, and now resolved
+strictly within `space_id`. A name a tool declared that its own space does not
+hold **fails the call**; the tool is not run without it. A tool that runs
+without a credential it declared does not fail cleanly, it connects as nobody or
+writes an empty value, and the model reads whatever comes back as the tool
+having worked.
+
+**`package`** names an npm package, pinned exactly (`@scope/name@1.2.3`).
+Installed with `--ignore-scripts`, into a directory of its own per space. A
+range, a dist-tag, a `file:` spec or a git URL is refused.
+
+**`network`** says what the tool needs from the network. `false` means none, and
+on Linux the bridge enforces it with `unshare -rn`. A host list is **not**
+enforced (per-host filtering is not implemented) and is reported as such.
+
+`run.command` is executed with an argv array and no shell; the model's arguments
+arrive as `ENGRAM_ARG_*` environment variables rather than on a command line, so
+a value containing shell metacharacters is a string a program received, not
+something the system interpreted. Two argument names that would become the same
+variable (`a-b` and `a.b`) fail the call rather than one overwriting the other.
 
 **`tools`**: Dynamic tool definitions sent from the server. These are the tools the AI can call during a conversation. The bridge injects these into the CLI's context (see [Tool Calls](#tool-calls)).
 
@@ -293,6 +319,118 @@ Sent at any time after the handshake to hand the bridge a fresh connection token
 ```
 
 The bridge replaces its current token with this value and uses it for subsequent reconnects. It does **not** reconnect in response to this message.
+
+---
+
+## Local Calls
+
+A `local_call` is the server asking the bridge to run one tool on the operator's
+machine, directly. Unlike a `welcome`-registered local tool it is not something
+a model decided to call: it is a panel, a job or a button invoking a tool a
+person configured.
+
+It goes through the **same gate**. A bridge started without `--local-tools`
+refuses every `local_call` outright and answers with `ok: false`. There is one
+way in, not one per message type.
+
+### Server → Bridge: `local_call`
+
+```json
+{
+  "type": "local_call",
+  "id": "<uuid>",
+  "space_id": "<uuid>",
+  "tool": {
+    "name": "fetch_mail",
+    "command": "node",
+    "args": ["/abs/path/index.js"],
+    "package": "@scope/name@1.2.3",
+    "network": false
+  },
+  "fill": [{ "role": "mailbox", "secret_id": "<uuid>" }],
+  "input": { "since": "2026-08-01" }
+}
+```
+
+- **`space_id`** scopes every credential this call can reach. Each `secret_id`
+  in `fill` must name a secret that lives in this space. One that lives in
+  another space is refused exactly as one that does not exist: a call cannot
+  reach across spaces, by name or by id.
+- **`fill`** carries resolved secret IDs, never names. The bridge does not turn
+  a name into an id.
+- **`input`** is passed to the tool as **one JSON document on stdin**. It is not
+  flattened into environment variables.
+- **`tool.package`**, when present, is installed before the run (pinned exactly,
+  `--ignore-scripts`, one directory per space) and the tool runs with the
+  package directory as its working directory. `ENGRAM_PACKAGE_DIR` points at it.
+- **`tool.network`**: `false` means the tool runs with no network. A host list is
+  not enforced. See the sandbox section below.
+
+Each role in `fill` reaches the tool as `ENGRAM_SECRET_<ROLE UPPERCASED>`, with
+`-` replaced by `_`. The tool reads the role it declared and never a credential
+name.
+
+### Bridge → Server: `local_result`
+
+```json
+{ "type": "local_result", "id": "<uuid>", "ok": true, "result": { } }
+```
+
+```json
+{ "type": "local_result", "id": "<uuid>", "ok": false, "error": "text" }
+```
+
+The bridge always answers, for every `local_call` carrying an id, including one
+it refuses before running anything. A server waiting forever on an id it will
+never hear about again is the one outcome with no diagnosis.
+
+**`result` is the tool's stdout, parsed.** A tool's stdout must be exactly one
+JSON document. Credential values are scrubbed out of it **before** it is parsed,
+so a credential cannot survive inside a JSON string. Stdout that is not one JSON
+document (a log line, a stack trace, two documents) produces `ok: false` and the
+text is **not** passed through: raw text arriving where a result belongs reads
+to a model exactly like a tool that worked. Anything a tool prints for a human
+belongs on stderr.
+
+**`error`** is a sentence, already scrubbed of every credential the call
+resolved. A non-zero exit, a timeout, a refused space, a rate limit and a parse
+failure all arrive this way.
+
+### Additive field: `sandbox`
+
+A `local_result` may carry a `sandbox` object. A server that ignores it loses
+nothing.
+
+```json
+{
+  "type": "local_result", "id": "<uuid>", "ok": true, "result": { },
+  "sandbox": {
+    "filesystem": "node-permissions",
+    "network": "open",
+    "notes": ["per-host network filtering is not implemented, so the declared hosts (graph.microsoft.com) are NOT enforced and the tool has the whole network"]
+  }
+}
+```
+
+It reports what the bridge actually enforced, which is not always what the tool
+asked for:
+
+- **`filesystem`**: `node-permissions` when Node's permission model applied
+  (only when the command is `node`), otherwise `none`.
+- **`network`**: `namespace` when the tool ran with no network at all,
+  otherwise `open`.
+- **`notes`**: plain sentences naming everything that was **not** covered.
+
+`unshare` is Linux only and `--permission` is Node only, so a non-Node command
+on a non-Linux machine gets **no sandbox at all**. That case is reported here
+rather than implied away.
+
+### Rate limits
+
+Per space: at most **2** local calls in flight, and starts spaced at least
+**250ms** apart. A third concurrent call for the same space is refused with
+`ok: false` rather than queued, because a queue is the same fork bomb with a
+delay. A caller that sees this is usually re-rendering or retrying in a loop.
 
 ---
 
@@ -865,6 +1003,7 @@ The bridge maps all of these to the unified `block_start` / `block_delta` / `blo
 | `stream` (done) | Response complete |
 | `stream` (error) | Error during streaming |
 | `tool_call` | CLI invoked a server-side tool (via callback) |
+| `local_result` | Answering a `local_call`, run or refused |
 | `error` | Request-level error (non-streaming) |
 
 ### Server → Bridge
@@ -876,6 +1015,7 @@ The bridge maps all of these to the unified `block_start` / `block_delta` / `blo
 | `ai_request` | New AI request for a conversation |
 | `tool_resolve` | Returning tool execution result |
 | `tool_error` | Tool execution failed |
+| `local_call` | Asking the bridge to run one tool on this machine |
 
 ---
 

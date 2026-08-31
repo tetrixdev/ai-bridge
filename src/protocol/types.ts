@@ -68,14 +68,86 @@ export interface ToolDefinition {
    */
   execute?: 'server' | 'local';
   /**
-   * local only. Names of the secrets this tool may be given, which the bridge
-   * resolves and injects as environment variables. A tool receives these and
-   * nothing else, so one client's credentials cannot reach a tool written for
-   * another.
+   * local only. The space this tool belongs to.
+   *
+   * Every secret this tool can reach must live in this space. Without it the
+   * bridge cannot scope a lookup, and an unscoped lookup is exactly the bug
+   * this field exists to close: a tool defined in a shared space naming a
+   * credential that only exists in someone's private space, and being handed
+   * it because the name happened not to collide. A local tool that arrives
+   * without a space is refused rather than resolved against everything the
+   * device holds.
+   */
+  space_id?: string;
+  /**
+   * local only, and superseded by `needs` + `fill`. Names of the secrets this
+   * tool may be given, resolved WITHIN `space_id` and nowhere else.
+   *
+   * Kept for servers that have not moved to roles yet. A name is a poor
+   * binding: it makes one tool per credential, so `fetch_mail` had to be
+   * written once per Azure app registration.
    */
   secrets?: string[];
+  /**
+   * local only. What the tool needs, by ROLE rather than by credential name.
+   *
+   * The tool reads ENGRAM_SECRET_<ROLE>, so one `fetch_mail` serves three
+   * app registrations: the caller decides which credential fills `mailbox`,
+   * and the tool never learns a credential's name.
+   *
+   * `kind` is advisory, for the vault's own picker (e.g. "azure-app").
+   */
+  needs?: { role: string; kind?: string }[];
+  /**
+   * local only. Which credential fills each role, as resolved secret IDs.
+   *
+   * The server resolves these, because the server is what knows the binding a
+   * person configured. The bridge never turns a name into an ID on its own.
+   */
+  fill?: SecretFill[];
+  /**
+   * local only. An npm package this tool lives in, pinned exactly
+   * (`@scope/name@1.2.3`).
+   *
+   * Installed with install scripts disabled, into a per-space directory under
+   * the bridge's own data dir. A range or a dist-tag is refused: what runs
+   * here has to be the same bytes every time.
+   */
+  package?: string;
+  /**
+   * local only. What the tool needs from the network.
+   *
+   * `false` means none, and on Linux the bridge enforces it with a network
+   * namespace. A host list means the bridge does NOT filter (per-host
+   * filtering is not implemented) and says so in the result's sandbox report.
+   * Absent means unrestricted.
+   */
+  network?: boolean | string[];
   /** local only. The command to run, and any arguments before the tool's own. */
   run?: { command: string; args?: string[] };
+}
+
+/**
+ * One role filled by one credential.
+ *
+ * A secret ID, never a name. The bridge resolves the ID inside the call's
+ * space and refuses if the secret lives anywhere else, so a caller cannot
+ * reach across spaces by knowing an ID.
+ */
+export interface SecretFill {
+  role: string;
+  secret_id: string;
+}
+
+/** What a `local_call` asks the bridge to run. */
+export interface LocalCallTool {
+  name: string;
+  command: string;
+  args?: string[];
+  /** Pinned npm package to install and run from. See ToolDefinition.package. */
+  package?: string;
+  /** See ToolDefinition.network. */
+  network?: boolean | string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +226,43 @@ export interface ProvidersUpdateMessage {
   providers: ProviderCapability[];
 }
 
+/**
+ * How a `local_call` turned out.
+ *
+ * Two shapes and no third: `ok: true` carries the one JSON document the tool
+ * wrote to stdout, `ok: false` carries a sentence saying what went wrong. A
+ * tool that printed something that is not JSON produces the second, never a
+ * `result` holding raw text, because raw text reaching the model as a result is
+ * indistinguishable from a tool that worked.
+ */
+export interface LocalResultMessage {
+  type: 'local_result';
+  /** Echoes the id of the local_call this answers. */
+  id: string;
+  ok: boolean;
+  /** Present when ok. The tool's stdout, parsed. */
+  result?: unknown;
+  /** Present when not ok. Already scrubbed of every credential the tool held. */
+  error?: string;
+  /**
+   * What the sandbox actually did on this machine, which is not always what
+   * the tool asked for. Additive: a server that ignores it loses nothing, and
+   * a server that reads it can tell a tool that ran with no containment from
+   * one that ran with all of it. See src/local/sandbox.ts.
+   */
+  sandbox?: SandboxReportFrame;
+}
+
+/** The machine-readable half of the sandbox report. See src/local/sandbox.ts. */
+export interface SandboxReportFrame {
+  /** `node-permissions` when Node's permission model was applied, else `none`. */
+  filesystem: 'node-permissions' | 'none';
+  /** `namespace` when the tool ran with no network at all, else `open`. */
+  network: 'namespace' | 'open';
+  /** Plain sentences naming everything the sandbox did NOT cover here. */
+  notes: string[];
+}
+
 /** Union of all messages the bridge sends to the server. */
 export type BridgeToServerMessage =
   | HelloMessage
@@ -162,7 +271,8 @@ export type BridgeToServerMessage =
   | PingMessage
   | ToolCallMessage
   | BridgeErrorMessage
-  | ProvidersUpdateMessage;
+  | ProvidersUpdateMessage
+  | LocalResultMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Bridge Messages
@@ -319,6 +429,28 @@ export interface TokenRefreshMessage {
   token: string;
 }
 
+/**
+ * The server asks the bridge to run one tool, here, now.
+ *
+ * Unlike a `welcome`-registered local tool, this is not something a model
+ * decided to call: it is a panel or a job on the server invoking a tool a
+ * person configured. It still goes through the same gate, so a bridge that was
+ * never started with local execution refuses it outright.
+ *
+ * `space_id` scopes every credential this call can reach. `fill` names
+ * resolved secret IDs, never names, and every one of them must live in
+ * `space_id` or the call is refused.
+ */
+export interface LocalCallMessage {
+  type: 'local_call';
+  id: string;
+  space_id: string;
+  tool: LocalCallTool;
+  fill?: SecretFill[];
+  /** Passed to the tool as one JSON document on stdin. */
+  input?: unknown;
+}
+
 /** Union of all messages the server sends to the bridge. */
 export type ServerToBridgeMessage =
   | WelcomeMessage
@@ -328,7 +460,8 @@ export type ServerToBridgeMessage =
   | PongMessage
   | ErrorMessage
   | ConnectionErrorMessage
-  | TokenRefreshMessage;
+  | TokenRefreshMessage
+  | LocalCallMessage;
 
 // ---------------------------------------------------------------------------
 // Stream Event Types and Data

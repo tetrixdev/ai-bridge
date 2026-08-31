@@ -31,6 +31,7 @@ import type {
   StreamEventType,
   StreamEventData,
   DoneData,
+  LocalCallMessage,
 } from './protocol/types.js';
 import { PROTOCOL_VERSION, BRIDGE_VERSION } from './protocol/version.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './providers/base.js';
@@ -39,7 +40,9 @@ import { getBridgeWorkingDir } from './providers/env.js';
 import { ToolResolver } from './tools/resolver.js';
 import { LOCAL_EXECUTION_OFF, refusalReason, runsLocally, type LocalExecutionConfig } from './local/gate.js';
 import { runLocalTool } from './local/executor.js';
-import { grantedTo, loadSecrets, type EngramConfig } from './local/engram.js';
+import { fillRoles, grantedTo, loadSecrets, SecretStore, type EngramConfig } from './local/engram.js';
+import { handleLocalCall, stagePackage } from './local/call.js';
+import { SpaceLimiter } from './local/limits.js';
 import type { Identity } from './local/identity.js';
 import type { Redaction } from './local/scrub.js';
 import { BridgeMcpServer } from './mcp/server.js';
@@ -220,9 +223,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * and the secrets then never appeared, however long the bridge ran and
    * whoever approved it. See secretsFor().
    */
-  private secrets?: Map<string, Redaction>;
+  private secrets?: SecretStore;
   /** When this.secrets was fetched, for the TTL in secretsFor(). */
   private secretsFetchedAt = 0;
+  /**
+   * How much a single space may run at once, and how fast.
+   *
+   * On the Bridge rather than per call, because the point is to bound what one
+   * space can do over time: a limiter created per call counts to one and stops
+   * nothing. See src/local/limits.ts.
+   */
+  private readonly localLimiter = new SpaceLimiter();
   /**
    * Bridge-side HTTP MCP server. Tools/list returns the welcome's registered
    * tools; tools/call routes through the WebSocket via toolResolver. The
@@ -327,7 +338,31 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       throw new Error(`local tool "${tool.name}" has no command to run`);
     }
 
-    const granted = grantedTo(await this.secretsFor(tool.secrets), tool.secrets);
+    // Both bindings, resolved in the tool's own space and nowhere else. A tool
+    // that names neither resolves nothing and never asks Engram for anything.
+    const names = tool.secrets ?? [];
+    const fill = tool.fill ?? [];
+    const store = await this.secretsFor(tool.space_id, {
+      names,
+      ids: fill.map((f) => f.secret_id),
+    });
+
+    const granted: Redaction[] = [...grantedTo(store, tool.space_id, tool.secrets)];
+    if (fill.length > 0) {
+      if (!tool.space_id) {
+        throw new Error(
+          `local tool "${tool.name}" fills roles but names no space, so there is no ` +
+          `space to resolve those secret ids in.`,
+        );
+      }
+      granted.push(...fillRoles(store, tool.space_id, fill));
+    }
+
+    const staged = await stagePackage(tool.package, {
+      ...(this.localExecution.dataDir ? { dataDir: this.localExecution.dataDir } : {}),
+      spaceId: tool.space_id,
+      ...(this.localExecution.workdir ? { fallbackCwd: this.localExecution.workdir } : {}),
+    });
 
     const result = await runLocalTool({
       name: tool.name,
@@ -335,7 +370,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       args: tool.run.args ?? [],
       toolArgs: args,
       secrets: granted,
-      cwd: this.localExecution.workdir,
+      ...(staged.cwd ? { cwd: staged.cwd } : {}),
+      extraEnv: staged.extraEnv,
+      sandbox: {
+        ...(tool.network !== undefined ? { network: tool.network } : {}),
+        ...(staged.readDir ? { readDir: staged.readDir } : {}),
+      },
     });
 
     return {
@@ -343,7 +383,39 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       stdout: result.stdout,
       stderr: result.stderr,
       ...(result.timedOut ? { timed_out: true } : {}),
+      // What actually confined the tool, which on some machines is nothing.
+      // Reported rather than assumed: see src/local/sandbox.ts.
+      sandbox: result.sandbox,
     };
+  }
+
+  /**
+   * Run one tool because the SERVER asked, rather than because a model did.
+   *
+   * Same gate, same space check, same limiter, same sandbox. The only thing
+   * this adds is the frame: the answer goes back over the WebSocket as a
+   * `local_result` carrying the id the call arrived with, so a server that
+   * sent ten calls can tell which one answered.
+   */
+  private handleLocalCallMessage(message: LocalCallMessage): void {
+    void handleLocalCall(
+      {
+        config: this.localExecution,
+        limiter: this.localLimiter,
+        secrets: (spaceId, ids) => this.secretsFor(spaceId, { ids }),
+        ...(this.localExecution.dataDir ? { dataDir: this.localExecution.dataDir } : {}),
+      },
+      message,
+    ).then(
+      (result) => this.send(result),
+      // handleLocalCall answers rather than throwing, so reaching this means
+      // the socket itself failed. Logged rather than left as an unhandled
+      // rejection that would take the bridge down mid-session.
+      (err: unknown) => log.error('could not answer a local_call', {
+        id: message.id,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
   }
 
   /**
@@ -371,12 +443,23 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * cache. From here an unreachable Engram and a revoked device look the same,
    * and the one that must not run is the revoked one.
    */
-  private async secretsFor(wanted: string[] | undefined): Promise<Map<string, Redaction>> {
-    if (!wanted || wanted.length === 0) return new Map();
-    if (!this.engram || !this.identity?.deviceId) return this.secrets ?? new Map();
+  private async secretsFor(
+    spaceId: string | undefined,
+    wanted: { names?: string[]; ids?: string[] },
+  ): Promise<SecretStore> {
+    const names = wanted.names ?? [];
+    const ids = wanted.ids ?? [];
+    if (names.length === 0 && ids.length === 0) return new SecretStore();
+    if (!this.engram || !this.identity?.deviceId) return this.secrets ?? new SecretStore();
 
     const fresh = this.secrets !== undefined && Date.now() - this.secretsFetchedAt < SECRETS_TTL_MS;
-    const complete = wanted.every((name) => this.secrets?.has(name));
+    // "Complete" is asked space by space, because that is the only question
+    // worth asking: a secret of this name held by some OTHER space does not
+    // make this call resolvable, and treating it as if it did is the bug the
+    // store was rebuilt to remove.
+    const complete = spaceId !== undefined
+      && names.every((name) => this.secrets?.hasName(spaceId, name))
+      && ids.every((id) => this.secrets?.hasId(spaceId, id));
     if (fresh && complete) return this.secrets!;
 
     this.secrets = await loadSecrets(this.engram, this.identity, this.identity.deviceId);
@@ -522,6 +605,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         break;
       case 'token_refresh':
         this.adoptRefreshedToken(message.token, 'token_refresh message');
+        break;
+      case 'local_call':
+        this.handleLocalCallMessage(message);
         break;
       default:
         log.warn('Unknown message type received', { type: (message as { type: string }).type });

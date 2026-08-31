@@ -1,14 +1,22 @@
 /**
- * How a fetched set of secrets is keyed, and what happens when one is missing.
+ * Which secrets a tool can reach, and which it must not.
  *
- * Both are places where the wrong answer is silent: a tool that receives the
- * wrong credential, or none, reports whatever the tool itself does about it,
- * and the model reads that as the tool having worked.
+ * The bug these tests exist for was live: `loadSecrets` decrypted every secret
+ * from every space the device held a key for into ONE flat map, keyed both
+ * `space/name` and bare `name`, and a tool's declared names resolved against
+ * that flat map. A `ToolDefinition` carried no space at all. So a tool defined
+ * in a shared space could name a credential that only exists in the user's
+ * private space and be handed it. The only thing in the way was a name
+ * collision, and colliding names were deleted, which means the reachable ones
+ * were exactly the uniquely named ones.
+ *
+ * Every assertion below is about the same rule from a different direction:
+ * a lookup names a space, or it does not resolve.
  */
 
 import { webcrypto } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { grantedTo, loadSecrets } from '../../src/local/engram.js';
+import { fillRoles, grantedTo, loadSecrets, roleEnvName } from '../../src/local/engram.js';
 import { b64u, type Identity } from '../../src/local/identity.js';
 
 const C = webcrypto.subtle;
@@ -50,16 +58,20 @@ async function seal(spaceKey: Uint8Array, value: string): Promise<{ iv: string; 
   return { iv: b64u.encode(iv), ct: b64u.encode(ct) };
 }
 
-/** Stand in for Engram: real ciphertext, so decryption is exercised for real. */
+/**
+ * Stand in for Engram: real ciphertext, so decryption is exercised for real.
+ * A secret's id is `<space>-<name>`, which makes an id in a test readable and
+ * makes a cross-space id easy to write down.
+ */
 async function serve(identity: Identity, spaces: Record<string, Record<string, string>>): Promise<void> {
   const keys: { space_id: string; wrapped_key: string }[] = [];
-  const secrets: { space_id: string; name: string; envelope: { iv: string; ct: string } }[] = [];
+  const secrets: { id: string; space_id: string; name: string; envelope: { iv: string; ct: string } }[] = [];
 
   for (const [spaceId, entries] of Object.entries(spaces)) {
     const spaceKey = webcrypto.getRandomValues(new Uint8Array(32));
     keys.push({ space_id: spaceId, wrapped_key: await wrapToDevice(identity.publicKey, spaceKey) });
     for (const [name, value] of Object.entries(entries)) {
-      secrets.push({ space_id: spaceId, name, envelope: await seal(spaceKey, value) });
+      secrets.push({ id: `${spaceId}-${name}`, space_id: spaceId, name, envelope: await seal(spaceKey, value) });
     }
   }
 
@@ -71,69 +83,169 @@ async function serve(identity: Identity, spaces: Record<string, Record<string, s
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe('keying the secrets a device holds', () => {
-  it('drops a secret whose name contains a slash instead of deleting what it collides with', async () => {
-    // `space/name` is the qualified form, so a secret NAMED `alpha/db-password`
-    // produces a bare key identical to space alpha's qualified key for
-    // `db-password`. The ambiguity sweep then deleted that entry, and a tool
-    // asking for `alpha/db-password` ran with no credential at all: not the
-    // wrong client's password, but an empty variable and a puzzling error from
-    // inside the tool.
-    const identity = await makeIdentity();
-    await serve(identity, {
-      alpha: { 'db-password': 'alpha-real-password' },
-      beta: { 'alpha/db-password': 'beta-smuggled-value' },
-    });
+/** One device holding a key for a shared space and for the user's private one. */
+const twoSpaces = async (): Promise<Identity> => {
+  const identity = await makeIdentity();
+  await serve(identity, {
+    shared: { 'shared-key': 'shared-value-0000' },
+    private: { 'personal-token': 'private-value-9999' },
+  });
+  return identity;
+};
 
-    const available = await loadSecrets(cfg, identity, 'dev_1');
+describe('a tool reaching for a secret in another space', () => {
+  it('cannot have it by name, however uniquely that name is spelled', async () => {
+    // The exact leak. `personal-token` exists in exactly one space, so under
+    // the old flat map it was reachable bare from anywhere, and a tool living
+    // in `shared` naming it was handed the user's private credential.
+    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
 
-    expect(available.get('alpha/db-password')?.value).toBe('alpha-real-password');
-    expect(grantedTo(available, ['alpha/db-password'])).toEqual([
-      { name: 'DB_PASSWORD', value: 'alpha-real-password' },
-    ]);
-    // The slashed name is reachable under no key at all, bare or qualified.
-    expect([...available.values()].some((s) => s.value === 'beta-smuggled-value')).toBe(false);
+    expect(() => grantedTo(store, 'shared', ['personal-token']))
+      .toThrow(/does not hold a secret named "personal-token"/);
+    // And from its own space it is perfectly ordinary, so the refusal above is
+    // about the boundary rather than about the secret being unavailable.
+    expect(grantedTo(store, 'private', ['personal-token']))
+      .toEqual([{ name: 'PERSONAL_TOKEN', value: 'private-value-9999' }]);
   });
 
-  it('still hides a name two spaces both hold, so neither is served by guess', async () => {
-    // The rule the slash fix must not break: picking one of two `deploy-key`s
-    // would hand a tool the other client's credential and look like it worked.
-    const identity = await makeIdentity();
-    await serve(identity, {
-      alpha: { 'deploy-key': 'alpha-key' },
-      beta: { 'deploy-key': 'beta-key' },
-    });
+  it('cannot have it by id either, which is the same leak with a different key', async () => {
+    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
+    const fill = [{ role: 'mailbox', secret_id: 'private-personal-token' }];
 
-    const available = await loadSecrets(cfg, identity, 'dev_1');
-
-    expect(available.has('deploy-key')).toBe(false);
-    expect(available.get('alpha/deploy-key')?.value).toBe('alpha-key');
-    expect(available.get('beta/deploy-key')?.value).toBe('beta-key');
+    expect(() => fillRoles(store, 'shared', fill)).toThrow(/cannot reach across spaces/);
+    expect(fillRoles(store, 'private', fill))
+      .toEqual([{ name: 'ENGRAM_SECRET_MAILBOX', value: 'private-value-9999' }]);
   });
 
-  it('exposes an unambiguous name both bare and qualified', async () => {
-    const identity = await makeIdentity();
-    await serve(identity, { alpha: { 'deploy-key': 'only-one' } });
-
-    const available = await loadSecrets(cfg, identity, 'dev_1');
-
-    expect(available.get('deploy-key')?.value).toBe('only-one');
-    expect(available.get('alpha/deploy-key')?.value).toBe('only-one');
-    expect(available.get('deploy-key')?.name).toBe('DEPLOY_KEY');
+  it('cannot fall back to a bare lookup, because a tool with no space resolves nothing', async () => {
+    // There is no bare form left to fall back TO, and a tool that cannot name
+    // a space is refused rather than resolved against everything the device
+    // holds. A refusal is a thing an operator can read and fix; a fallback is
+    // a credential handed over quietly.
+    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
+    expect(() => grantedTo(store, undefined, ['personal-token'])).toThrow(/no space_id/);
   });
 });
 
-describe('a tool asking for a secret this device does not hold', () => {
+describe('keying the secrets a device holds', () => {
+  it('serves a name two spaces both hold, to each space, without ambiguity', async () => {
+    // The old map deleted BOTH when two spaces used one name, so a perfectly
+    // well-scoped tool stopped working because someone in another space
+    // happened to pick the same word. Scoping the lookup removes the clash
+    // rather than the secrets.
+    const identity = await makeIdentity();
+    await serve(identity, { alpha: { 'deploy-key': 'alpha-key' }, beta: { 'deploy-key': 'beta-key' } });
+
+    const store = await loadSecrets(cfg, identity, 'dev_1');
+
+    expect(store.byName('alpha', 'deploy-key')?.value).toBe('alpha-key');
+    expect(store.byName('beta', 'deploy-key')?.value).toBe('beta-key');
+    expect(store.byName('gamma', 'deploy-key')).toBeUndefined();
+  });
+
+  it('keeps a name containing a slash, which is now just a name', async () => {
+    // It used to need dropping, because `space/name` and a bare name shared
+    // one keyspace and a secret NAMED `alpha/db-password` collided with space
+    // alpha's qualified key. With no shared keyspace there is nothing to
+    // collide with, and a secret stops being unusable over its punctuation.
+    const identity = await makeIdentity();
+    await serve(identity, { beta: { 'alpha/db-password': 'beta-value' } });
+
+    const store = await loadSecrets(cfg, identity, 'dev_1');
+
+    expect(store.byName('beta', 'alpha/db-password')?.value).toBe('beta-value');
+    expect(store.byName('alpha', 'db-password')).toBeUndefined();
+  });
+
+  it('refuses to guess between two secrets one space named the same', async () => {
+    const identity = await makeIdentity();
+    const spaceKey = webcrypto.getRandomValues(new Uint8Array(32));
+    const keys = [{ space_id: 'alpha', wrapped_key: await wrapToDevice(identity.publicKey, spaceKey) }];
+    const secrets = [
+      { id: 'first', space_id: 'alpha', name: 'db', envelope: await seal(spaceKey, 'first-value') },
+      { id: 'second', space_id: 'alpha', name: 'db', envelope: await seal(spaceKey, 'second-value') },
+    ];
+    vi.stubGlobal('fetch', vi.fn(async (url: URL) => ({
+      ok: true,
+      json: async () => (String(url).endsWith('/keys') ? { keys } : { secrets }),
+    })));
+
+    const store = await loadSecrets(cfg, identity, 'dev_1');
+
+    // Neither by name, because picking one would be a coin flip with a
+    // credential. Both by id, because an id says which one.
+    expect(store.byName('alpha', 'db')).toBeUndefined();
+    expect(store.byId('alpha', 'first')?.value).toBe('first-value');
+    expect(store.byId('alpha', 'second')?.value).toBe('second-value');
+  });
+});
+
+describe('filling a role rather than naming a credential', () => {
+  it('gives the tool the role it declared, never the credential is called', async () => {
+    // The reason roles exist: one fetch_mail serving three app registrations
+    // instead of three tools. The tool reads ENGRAM_SECRET_MAILBOX and never
+    // learns which credential filled it.
+    const identity = await makeIdentity();
+    await serve(identity, { shared: { 'azure-app-a': 'value-for-a', 'azure-app-b': 'value-for-b' } });
+    const store = await loadSecrets(cfg, identity, 'dev_1');
+
+    const first = fillRoles(store, 'shared', [{ role: 'mailbox', secret_id: 'shared-azure-app-a' }]);
+    const second = fillRoles(store, 'shared', [{ role: 'mailbox', secret_id: 'shared-azure-app-b' }]);
+
+    expect(first).toEqual([{ name: 'ENGRAM_SECRET_MAILBOX', value: 'value-for-a' }]);
+    expect(second).toEqual([{ name: 'ENGRAM_SECRET_MAILBOX', value: 'value-for-b' }]);
+  });
+
+  it('names the variable after the role, hyphens and all', () => {
+    expect(roleEnvName('mailbox')).toBe('ENGRAM_SECRET_MAILBOX');
+    expect(roleEnvName('sending-account')).toBe('ENGRAM_SECRET_SENDING_ACCOUNT');
+  });
+
+  it('refuses two roles that become one variable', async () => {
+    // `mail-box` and `mail_box` are two roles and one environment variable.
+    // Filling both would hand the tool a credential under a role it did not
+    // ask for, decided by iteration order.
+    const identity = await makeIdentity();
+    await serve(identity, { shared: { one: 'value-one-xx', two: 'value-two-xx' } });
+    const store = await loadSecrets(cfg, identity, 'dev_1');
+
+    expect(() => fillRoles(store, 'shared', [
+      { role: 'mail-box', secret_id: 'shared-one' },
+      { role: 'mail_box', secret_id: 'shared-two' },
+    ])).toThrow(/both become ENGRAM_SECRET_MAIL_BOX/);
+  });
+
+  it('refuses a role that is not a usable variable name', async () => {
+    const identity = await makeIdentity();
+    await serve(identity, { shared: { one: 'value-one-xx' } });
+    const store = await loadSecrets(cfg, identity, 'dev_1');
+
+    expect(() => fillRoles(store, 'shared', [{ role: 'mail box; echo', secret_id: 'shared-one' }]))
+      .toThrow(/not a usable role name/);
+  });
+
+  it('says nothing about a call that fills nothing', async () => {
+    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
+    expect(fillRoles(store, 'shared', undefined)).toEqual([]);
+    expect(fillRoles(store, 'shared', [])).toEqual([]);
+  });
+});
+
+describe('a tool asking for a secret its space does not hold', () => {
   it('fails the call rather than running the tool without it', async () => {
     // Warning and running on was the worst of both: the tool ran as nobody, or
     // wrote an empty value into whatever it configures, and the model read the
-    // result as success. Missing means not granted, not yet approved, or
-    // ambiguous across spaces, and all three are for a person to fix.
-    expect(() => grantedTo(new Map(), ['deploy-key'])).toThrow(/does not hold the secret "deploy-key"/);
+    // result as success.
+    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
+    expect(() => grantedTo(store, 'shared', ['nothing-like-this']))
+      .toThrow(/does not hold a secret named "nothing-like-this"/);
   });
 
-  it('says nothing about a tool that declared none', () => {
-    expect(grantedTo(new Map(), undefined)).toEqual([]);
-    expect(grantedTo(new Map(), [])).toEqual([]);
+  it('says nothing about a tool that declared none', async () => {
+    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
+    expect(grantedTo(store, 'shared', undefined)).toEqual([]);
+    expect(grantedTo(store, 'shared', [])).toEqual([]);
+    // Not even the missing space is an error when nothing was asked for.
+    expect(grantedTo(store, undefined, [])).toEqual([]);
   });
 });

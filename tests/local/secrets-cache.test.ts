@@ -17,20 +17,24 @@ vi.mock('../../src/local/engram.js', async (importOriginal) => {
 import { Bridge } from '../../src/bridge.js';
 import { loadSecrets } from '../../src/local/engram.js';
 import type { ProviderAdapter } from '../../src/providers/base.js';
+import { SecretStore } from '../../src/local/engram.js';
 import type { ToolDefinition } from '../../src/protocol/types.js';
-import type { Redaction } from '../../src/local/scrub.js';
 
 const fetched = vi.mocked(loadSecrets);
 
 /** Prints the LENGTH of the secret, so a rotation is visible without printing it. */
 const tool: ToolDefinition = {
   name: 'deploy', description: '', parameters: {}, execute: 'local',
+  space_id: 'space_1',
   secrets: ['api-key'],
   run: { command: 'sh', args: ['-c', 'printf %s "${#API_KEY}"'] },
 };
 
-const held = (value: string): Map<string, Redaction> =>
-  new Map([['api-key', { name: 'API_KEY', value }]]);
+const held = (value: string): SecretStore => {
+  const store = new SecretStore();
+  store.add({ id: 'sec_1', spaceId: 'space_1', name: 'api-key', value });
+  return store;
+};
 
 const enrolled = () =>
   new Bridge({
@@ -58,8 +62,8 @@ describe('secrets the bridge fetched once', () => {
     // approval afterwards was ever seen: the operator approves in the browser,
     // watches the same tool keep failing, and only a restart fixes it.
     const bridge = enrolled();
-    fetched.mockResolvedValueOnce(new Map());
-    await expect(run(bridge)).rejects.toThrow(/does not hold the secret/);
+    fetched.mockResolvedValueOnce(new SecretStore());
+    await expect(run(bridge)).rejects.toThrow(/does not hold a secret named/);
 
     fetched.mockResolvedValueOnce(held('granted-value'));
     expect((await run(bridge)).stdout).toBe('13');
@@ -99,7 +103,7 @@ describe('secrets the bridge fetched once', () => {
     // hand one out, and should not fail a tool call when Engram is down.
     const bridge = enrolled();
     const noSecrets: ToolDefinition = {
-      name: 'ping', description: '', parameters: {}, execute: 'local',
+      name: 'ping', description: '', parameters: {}, execute: 'local', space_id: 'space_1',
       run: { command: 'sh', args: ['-c', 'printf ok'] },
     };
 

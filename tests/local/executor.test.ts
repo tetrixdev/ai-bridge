@@ -126,3 +126,75 @@ describe('a tool that outlives its own kill', () => {
     expect(Date.now() - started).toBeLessThan(3_000);
   }, 15_000);
 });
+
+describe('two names claiming one environment variable', () => {
+  it('refuses rather than letting iteration order pick the value', async () => {
+    // `k.toUpperCase().replace(/[^A-Z0-9]/g, '_')` maps `a-b`, `a_b` and `a.b`
+    // onto the single name ENGRAM_ARG_A_B. Three distinct arguments, one
+    // variable, last one wins, nothing anywhere saying so. The mapping is
+    // unchanged, because tools read these names; what changed is that a
+    // collision is now an error a person can fix.
+    await expect(runLocalTool({
+      ...base,
+      command: 'sh',
+      args: ['-c', 'true'],
+      toolArgs: { 'a-b': 'first', 'a.b': 'second' },
+    })).rejects.toThrow(/both become the environment variable ENGRAM_ARG_A_B/);
+  });
+
+  it('does not let a model argument overwrite a secret', async () => {
+    // The argument loop used to run AFTER the secret loop, so a secret named
+    // `engram-arg-target` was silently replaced by an argument named `target`:
+    // the tool then ran with the model's value where a credential belonged.
+    await expect(runLocalTool({
+      ...base,
+      command: 'sh',
+      args: ['-c', 'printf %s "$ENGRAM_ARG_TARGET"'],
+      toolArgs: { target: 'from-the-model' },
+      secrets: [{ name: 'ENGRAM_ARG_TARGET', value: 'the-real-credential' }],
+    })).rejects.toThrow(/both become the environment variable ENGRAM_ARG_TARGET/);
+  });
+
+  it('leaves ordinary distinct names alone', async () => {
+    const res = await runLocalTool({
+      ...base,
+      command: 'sh',
+      args: ['-c', 'printf "%s|%s" "$ENGRAM_ARG_SINCE" "$ENGRAM_ARG_UNTIL"'],
+      toolArgs: { since: '2026-08-01', until: '2026-08-31' },
+    });
+    expect(res.stdout).toBe('2026-08-01|2026-08-31');
+  });
+});
+
+describe('the input document', () => {
+  it('arrives on stdin as one JSON document', async () => {
+    const res = await runLocalTool({
+      ...base,
+      command: 'sh',
+      args: ['-c', 'cat'],
+      input: { since: '2026-08-01', nested: { n: 1 } },
+    });
+    expect(JSON.parse(res.stdout)).toEqual({ since: '2026-08-01', nested: { n: 1 } });
+  });
+
+  it('is not there at all when the run carried none', async () => {
+    // Closed rather than left open: a tool that reads stdin sees end-of-file
+    // instead of blocking on a pipe nobody will ever write to.
+    const res = await runLocalTool({ ...base, command: 'sh', args: ['-c', 'cat; echo done'] });
+    expect(res.stdout.trim()).toBe('done');
+  });
+
+  it('survives a tool that never reads it', async () => {
+    // Writing to a child that already exited raises EPIPE. That is the tool
+    // ignoring its input, not the bridge failing, and it must not take the
+    // process down.
+    const res = await runLocalTool({
+      ...base,
+      command: 'sh',
+      args: ['-c', 'printf ignored'],
+      input: { big: 'x'.repeat(200_000) },
+    });
+    expect(res.stdout).toBe('ignored');
+    expect(res.exitCode).toBe(0);
+  });
+});

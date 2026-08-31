@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createLogger } from '../utils/logger.js';
+import { describeSandbox, sandboxed, type SandboxReport, type SandboxRequest } from './sandbox.js';
 import { scrub, type Redaction } from './scrub.js';
 
 const log = createLogger('LocalTool');
@@ -47,11 +48,23 @@ export interface LocalRun {
   /** Arguments fixed by the tool definition, before the model's own. */
   args: string[];
   /** What the model passed, injected as ENGRAM_ARG_* rather than a command line. */
-  toolArgs: Record<string, unknown>;
+  toolArgs?: Record<string, unknown>;
+  /**
+   * One JSON document written to the tool's stdin, for the local_call path.
+   *
+   * Absent means the tool gets no stdin at all rather than an empty pipe it
+   * might block on. `undefined` and `null` are different here: `null` is a
+   * document that says null, and absent is no document.
+   */
+  input?: unknown;
   /** Resolved secrets, injected as environment and redacted from the output. */
   secrets: Redaction[];
   cwd?: string;
   timeoutMs?: number;
+  /** What the tool declared it needs, so the sandbox can confine the rest. */
+  sandbox?: SandboxRequest;
+  /** Extra environment the bridge itself sets, e.g. ENGRAM_PACKAGE_DIR. */
+  extraEnv?: Record<string, string>;
 }
 
 export interface LocalResult {
@@ -59,6 +72,74 @@ export interface LocalResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** What the sandbox actually did, which is not always what was asked for. */
+  sandbox: SandboxReport;
+}
+
+/**
+ * The environment variable an argument key becomes.
+ *
+ * This used to be `k.toUpperCase().replace(/[^A-Z0-9]/g, '_')`, which maps
+ * `a-b`, `a_b` and `a.b` onto the single name `A_B`. Three distinct arguments,
+ * one variable, last one wins, and nothing anywhere says so. The mapping is
+ * unchanged, because renaming it would break every tool that reads these; what
+ * changed is that a collision is now detected and refused rather than resolved
+ * by iteration order. See composeEnv().
+ */
+export const argEnvName = (key: string): string =>
+  `ENGRAM_ARG_${key.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+
+/**
+ * Build the child's environment, and refuse any name two things claim.
+ *
+ * Arguments go in first and secrets second, so a secret can never be lost to
+ * an argument. That ordering used to be the other way round, which meant a
+ * secret named `engram-arg-foo` was silently overwritten by an argument named
+ * `foo`: the tool then ran with the model's value where a credential belonged.
+ * The ordering alone is not the fix though, because the reverse (an argument
+ * quietly overwritten by a secret) is just as wrong, so anything claimed twice
+ * fails the call instead.
+ */
+function composeEnv(run: LocalRun): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of INHERITED) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  for (const [key, value] of Object.entries(run.extraEnv ?? {})) env[key] = value;
+
+  /** What claimed each variable, so a collision can name both sides. */
+  const claimed = new Map<string, string>();
+  const claim = (variable: string, by: string): void => {
+    const already = claimed.get(variable);
+    if (already !== undefined) {
+      throw new Error(
+        `"${already}" and "${by}" both become the environment variable ${variable}, ` +
+        `so one would silently replace the other. Rename one of them in the tool ` +
+        `definition rather than letting iteration order decide which value the tool sees.`,
+      );
+    }
+    claimed.set(variable, by);
+  };
+
+  for (const [key, value] of Object.entries(run.toolArgs ?? {})) {
+    const variable = argEnvName(key);
+    claim(variable, `argument ${key}`);
+    env[variable] = typeof value === 'string' ? value : JSON.stringify(value);
+  }
+
+  for (const s of run.secrets) {
+    if (PROTECTED.has(s.name)) {
+      // A space member choosing a secret's name must not get to decide which
+      // binary the child actually runs.
+      log.warn('refusing to inject a secret over a protected variable', { name: s.name });
+      continue;
+    }
+    claim(s.name, `secret ${s.name}`);
+    env[s.name] = s.value;
+  }
+
+  return env;
 }
 
 /**
@@ -70,45 +151,50 @@ export interface LocalResult {
  * program receives, not something the system interprets. Composing a command
  * line from model output is the one mistake in this file that would matter, and
  * the shape of the API is what prevents it rather than a rule someone follows.
+ *
+ * Throws only for a tool definition that cannot be run at all, such as two
+ * names claiming one environment variable. Everything the TOOL does, including
+ * failing to start, comes back as a result: a non-zero exit is an answer, not
+ * an exception.
  */
 export async function runLocalTool(run: LocalRun): Promise<LocalResult> {
-  const env: NodeJS.ProcessEnv = {};
-  for (const key of INHERITED) {
-    const value = process.env[key];
-    if (value !== undefined) env[key] = value;
-  }
-  for (const s of run.secrets) {
-    if (PROTECTED.has(s.name)) {
-      // A space member choosing a secret's name must not get to decide which
-      // binary the child actually runs.
-      log.warn('refusing to inject a secret over a protected variable', { name: s.name });
-      continue;
-    }
-    env[s.name] = s.value;
-  }
-  for (const [k, v] of Object.entries(run.toolArgs)) {
-    env[`ENGRAM_ARG_${k.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`] =
-      typeof v === 'string' ? v : JSON.stringify(v);
-  }
+  const env = composeEnv(run);
+  const confined = await sandboxed(run.command, run.args, {
+    ...run.sandbox,
+    cwd: run.sandbox?.cwd ?? run.cwd,
+  });
 
   log.info('running local tool', {
     name: run.name,
     command: run.command,
     secrets: run.secrets.map((s) => s.name),
+    sandbox: describeSandbox(confined.report),
   });
+  for (const note of confined.report.notes) log.debug('sandbox', { note });
 
   return new Promise<LocalResult>((resolve) => {
-    const child = spawn(run.command, run.args, {
+    const child = spawn(confined.command, confined.args, {
       cwd: run.cwd,
       env,
       shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      // stdin is always a pipe, and is closed immediately when there is no
+      // input. A tool that reads stdin then sees end-of-file, exactly as it
+      // would from /dev/null, rather than blocking on a pipe nobody writes to.
+      stdio: 'pipe',
       // Its own process group, so the timeout can reach what the tool started
       // as well as the tool itself. Without it a tool that backgrounds a worker
       // survives its own kill: the worker keeps running as the user, still
       // holding stdout, after the bridge has reported the tool killed.
       detached: true,
     });
+
+    // A tool that never reads stdin makes this write fail with EPIPE. That is
+    // the tool ignoring its input, not the bridge failing, so it must not
+    // become an unhandled error that takes the whole process down.
+    child.stdin.on('error', (err: NodeJS.ErrnoException) => {
+      log.debug('the tool did not read its stdin', { name: run.name, code: err.code });
+    });
+    child.stdin.end(run.input === undefined ? undefined : JSON.stringify(run.input));
 
     let stdout = '';
     let stderr = '';
@@ -154,12 +240,15 @@ export async function runLocalTool(run: LocalRun): Promise<LocalResult> {
       clearTimeout(timer);
       if (flushTimer) clearTimeout(flushTimer);
       // Scrubbing happens here, at the one place output leaves this process,
-      // rather than at each caller. A caller that forgot would leak silently.
+      // rather than at each caller. A caller that forgot would leak silently,
+      // and it happens BEFORE anything parses stdout, so a credential cannot
+      // survive inside a JSON string the parser hands on.
       resolve({
         exitCode,
         stdout: scrub(stdout, run.secrets),
         stderr: scrub(stderr, run.secrets),
         timedOut,
+        sandbox: confined.report,
       });
     };
 
