@@ -73,6 +73,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test, typecheck]
     if: github.event_name == 'release' && github.event.action == 'published'
+    # id-token is what makes provenance possible: npm asks GitHub to vouch,
+    # over OIDC, that this tarball was built by this workflow from this commit.
+    # Read-all at the top of the file would otherwise deny it, and the failure
+    # is a publish that quietly lacks an attestation rather than an error.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       # Pinned to commit SHA.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
@@ -109,7 +116,13 @@ jobs:
       - name: Build
         run: npm run build
 
+      # --provenance publishes a signed statement of WHERE this came from: the
+      # repository, the commit and the workflow run that built it. It does not
+      # make the code trustworthy; it makes the link between the code somebody
+      # can read on GitHub and the tarball npm serves checkable by them rather
+      # than taken on our word. That is the whole of what a published package
+      # can offer, and it is the reason the bridge is one.
       - name: Publish
-        run: npm publish --access public
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
