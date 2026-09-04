@@ -17,6 +17,7 @@
  *   {"type":"turn.failed","error":{"message":"..."}}
  */
 
+import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { homedir } from 'node:os';
@@ -39,6 +40,59 @@ const log = createLogger('CodexAdapter');
  * with both API key and ChatGPT auth modes.
  */
 const DEFAULT_MODEL = 'gpt-5.3-codex';
+
+/**
+ * Whether the installed codex accepts `--cd`, probed once per process.
+ *
+ * Setting the child's cwd is already enough to make codex work in the right
+ * directory, so this is belt-and-braces: codex resolves some of its own
+ * notions of "the workspace" from the flag rather than from cwd, and passing
+ * both means the two agree. Older builds do not have the flag and reject it
+ * outright, which would turn a working turn into a spawn failure — hence the
+ * probe rather than just passing it.
+ */
+let codexSupportsCdPromise: Promise<boolean> | null = null;
+
+export function probeCodexSupportsCd(): Promise<boolean> {
+  if (codexSupportsCdPromise) {
+    return codexSupportsCdPromise;
+  }
+  codexSupportsCdPromise = new Promise<boolean>((resolve) => {
+    let output = '';
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
+    try {
+      const child = spawn('codex', ['exec', '--help'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      // A help probe that hangs must not hold up the turn that triggered it.
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        finish(false);
+      }, 5_000);
+      child.stdout.on('data', (c: Buffer) => { output += c.toString(); });
+      child.stderr.on('data', (c: Buffer) => { output += c.toString(); });
+      child.on('error', () => { clearTimeout(timer); finish(false); });
+      child.on('close', () => {
+        clearTimeout(timer);
+        finish(/(^|\s)--cd\b/.test(output));
+      });
+    } catch {
+      finish(false);
+    }
+  });
+  return codexSupportsCdPromise;
+}
+
+/** Test seam — forget the cached probe result. */
+export function resetCodexCdProbe(): void {
+  codexSupportsCdPromise = null;
+}
 
 export class CodexAdapter extends ProviderAdapter {
   readonly providerName = 'codex';
@@ -110,17 +164,60 @@ export class CodexAdapter extends ProviderAdapter {
     // symlinking — tracked in tasks/open/cli-isolation-layer-b.md.
     if (context.mcp) {
       args.push(...buildCodexMcpArgs(context.mcp));
-      if (context.cliIsolation === 'native') {
-        // Legacy escape hatch for developers running the bridge against their
-        // own machine. Matches the pre-MCP behaviour: the model can run
-        // shell, edit files, and execute the wrapper scripts that used to
-        // back the tool plumbing. Not safe when end users can send chat
-        // messages.
-        args.push(
-          '-c', 'sandbox_mode=danger-full-access',
-          '-c', 'approval_policy=never',
-        );
-      }
+    }
+
+    // Sandbox posture. Kept out of the `context.mcp` block above because it
+    // has nothing to do with whether the server registered any tools — a
+    // `workspace` turn with no tools still has to be able to edit and build.
+    if (context.cliIsolation === 'native') {
+      // Legacy escape hatch for developers running the bridge against their
+      // own machine. Matches the pre-MCP behaviour: the model can run
+      // shell, edit files, and execute the wrapper scripts that used to
+      // back the tool plumbing. Not safe when end users can send chat
+      // messages.
+      args.push(
+        '-c', 'sandbox_mode=danger-full-access',
+        '-c', 'approval_policy=never',
+      );
+    } else if (context.cliIsolation === 'isolated') {
+      // Stated explicitly rather than left to codex's default, for the same
+      // reason Claude is given an explicit permission mode above: the default
+      // is read from the OPERATOR's `~/.codex/config.toml`, so an operator who
+      // set `sandbox_mode = danger-full-access` there for their own work would
+      // silently hand every `isolated` turn full access to their machine. The
+      // posture has to be something the bridge asserts, not something it hopes
+      // the local configuration happens to agree with.
+      //
+      // NOTE: reasoned, not measured — codex is not installed on the machine
+      // this was developed on, so unlike the Claude equivalent it has not been
+      // verified against the real CLI. `read-only` is the value codex's own
+      // documentation names for this, and it is the default the adapter has
+      // always assumed.
+      args.push('-c', 'sandbox_mode=read-only');
+    } else if (context.cliIsolation === 'workspace') {
+      // `workspace-write`, explicitly NOT `danger-full-access`: codex may
+      // write inside the directory it was pointed at, and reaching outside it
+      // is an escalation. `approval_policy=never` is required alongside —
+      // `codex exec` is headless, so anything that asks for approval waits
+      // for an answer that can never arrive, and the turn hangs until the
+      // request timeout kills it rather than reporting anything useful.
+      //
+      // This bounds codex more tightly than the equivalent Claude posture
+      // does. It is still not a sandbox in any sense the README would be
+      // willing to claim: the model has a shell.
+      args.push(
+        '-c', 'sandbox_mode=workspace-write',
+        '-c', 'approval_policy=never',
+      );
+    }
+
+    // Point codex at the working directory explicitly when its build supports
+    // it. `--skip-git-repo-check` above is now usually unnecessary — it exists
+    // because the pinned scratch cwd was not a repository, and inside a real
+    // checkout it is a no-op. It is left in place because it stays correct for
+    // the scratch-directory case, which is still the default.
+    if (await probeCodexSupportsCd()) {
+      args.push('--cd', context.workingDir);
     }
 
     // Build the prompt positional argument. The prompt is appended LAST, after
@@ -173,7 +270,7 @@ export class CodexAdapter extends ProviderAdapter {
         context.mcp ? { [CODEX_BEARER_ENV_VAR]: context.mcp.bearerToken } : undefined,
       );
 
-      const child = this.spawnCli('codex', args, env);
+      const child = this.spawnCli('codex', args, env, undefined, context.workingDir);
 
       // Enforce the server-configured request_timeout (ai-bridge#2).
       const timeoutTimer = startRequestTimeout(

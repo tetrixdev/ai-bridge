@@ -60,11 +60,18 @@ Same as BYOK, but the application provides its own API key. Users pay the app a 
 
 ### WebSocket Establishment
 
-The bridge connects to the server's WebSocket endpoint:
+The bridge connects to the WebSocket address the server hands it. The Laravel
+package's dedicated WebSocket server listens on its own port and serves the
+connection at the origin root, so the address is an origin rather than a path:
 
 ```
-wss://{host}/api/ai-bridge/ws?token={connection_token}
+wss://{host}:{port}?token={connection_token}
 ```
+
+The exact value comes from the server (`ai-bridge.server.public_url` when set,
+otherwise `ws://{host}:{port}`) and is whatever the operator passes to
+`--server`. The token also travels as an `Authorization: Bearer` header; the
+query parameter is kept for servers that have not adopted the header.
 
 The `connection_token` is a short-lived JWT obtained by the user through the web application's settings page. It encodes:
 
@@ -172,6 +179,31 @@ If a CLI is not installed, `available` is `false` and the server won't route req
 
 **`supports_session_resume`** indicates whether the provider supports resuming conversations by session ID. All three currently supported providers support this.
 
+#### Additive field: `workspaces`
+
+A bridge started with `--allow-dir` also advertises the directories it will accept in `ai_request.working_dir`:
+
+```json
+{
+  "type": "hello",
+  "version": "0.1",
+  "bridge_version": "0.2.0",
+  "providers": [ "..." ],
+  "workspaces": [
+    { "path": "/Users/jasper/zp-studio/zeroplex-studio/ZeroPlex_Studio__D09042", "label": "Studio D09042" }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `path` | Absolute, symlink-resolved root. Any directory at or below it may be named. |
+| `label` | Human-readable name for a picker. Defaults to the directory's basename; the operator sets it with `--allow-dir <path>=<label>`. |
+
+This is what makes the feature usable: the server shows a picker of the checkouts the developer allowed, and nobody types an absolute path into a chat box.
+
+The field is **omitted entirely** when the operator allowed nothing, so "this bridge has no workspaces" and "this bridge predates workspaces" look the same to the server — correctly, because in both cases naming a directory is refused. An older server ignores the field.
+
 ### Bridge → Server: `providers_update`
 
 Sent mid-connection when the bridge's set of available provider CLIs changes after the `hello` — for example, the user installs or removes a CLI while the bridge stays connected.
@@ -234,6 +266,40 @@ The bridge re-probes its CLIs after every handshake and after a provider spawn f
   "refreshed_token": "<new JWT>"
 }
 ```
+
+#### `cli_isolation`
+
+How much of the operator's local environment the spawned CLI may see, and what it may do. Sent on `welcome`; **absent means `isolated`**, so an older server gets the safe default rather than the legacy behaviour.
+
+| Value | The CLI may... | The operator's environment... |
+|---|---|---|
+| `isolated` (default) | reach server-declared tools through the bridge's MCP server. No edits. Per-CLI — see the flag table below: Claude's built-ins are denied outright, Codex keeps its own `shell` bounded by a read-only, no-network sandbox, and Gemini's built-ins stall on an approval nothing can answer. The bridge states this posture explicitly on Claude and Codex, so the operator's own CLI configuration cannot widen it; Gemini offers no such lever. | stays out: other MCP servers ignored, neutral fallback system prompt. |
+| `workspace` | **also use its own file and shell tools**, inside `working_dir`. | stays out, exactly as in `isolated`. |
+| `native` | do anything the CLI can do. | is fully in play: user `CLAUDE.md`, skills, hooks, configured MCP servers, plugins, the CLI's own default prompt. |
+
+`workspace` exists because neither of the other two fits a chat that is supposed to do the work: `isolated` blocks the edit and shell tools that *are* the capability, and `native` switches off far more than that. It is the middle setting — work in the named directory, keep the operator's own environment out — and it maps to these flags:
+
+| CLI | `isolated` | `workspace` |
+|---|---|---|
+| Claude | `--strict-mcp-config`, `--allowedTools mcp__bridge__*`, `--permission-mode manual`. The permission mode is what makes the tool restriction real: `--allowedTools` only asks, and the denial comes from Claude's own permission system, which reads the operator's `~/.claude/settings.json`. Without it, a `defaultMode: "auto"` there turns `isolated` into "everything allowed". | Keeps `--strict-mcp-config`; drops the `--allowedTools` restriction; adds `--permission-mode bypassPermissions`. In headless `-p` mode `acceptEdits` would still stall on the first shell command — and running the tests *is* a shell command — so `bypassPermissions` is what actually runs a real task. The permission mode contains nothing; saying otherwise would be misleading. |
+| Codex | MCP only, plus `-c sandbox_mode=read-only` stated explicitly rather than left to the operator's `~/.codex/config.toml` default | `-c sandbox_mode=workspace-write` — explicitly **not** `danger-full-access`, which is what `native` uses — plus `-c approval_policy=never`, because `codex exec` is headless and anything that asks for approval waits for an answer that can never arrive. `--cd` is passed as well when the installed codex supports it. |
+| Gemini | no `--yolo`, so built-ins stall on approval | `--yolo`. It is the only lever Gemini offers: there is no middle setting, so `workspace` on Gemini is materially broader than on Codex. |
+
+`--skip-git-repo-check` on Codex exists because the pinned scratch cwd is not a repository. Inside a real checkout it is a no-op; it is left in place because it is still correct for the scratch case.
+
+See [`docs/isolation.md`](docs/isolation.md) in the bridge repository for how each posture is enforced, what `isolated` does not stop, and how to verify it on a given machine.
+
+**Both permissive postures are refused unless the operator opted in.** `workspace` requires `--allow-dir`; `native` requires `--allow-native`. A bridge started without them runs `isolated` instead and logs why.
+
+This is not a formality. `workspace` is what enables the shell, and a shell in the empty scratch directory is still a shell — so if the allow-list bounded only the working directory, a server could switch the capability on by sending this field. And gating `workspace` alone would have been theatre, because `native` is strictly broader: a server refused the shell one way would ask for it the other way and get the operator's own MCP servers, hooks and plugins as well. Same rule as `--local-tools`, in all three cases.
+
+An unrecognised value — a typo, a newer server — is also treated as `isolated` rather than passed to the adapters, which test it with `!== 'isolated'` and would otherwise land in the permissive branch on one CLI and the restrictive branch on another.
+
+The system prompt behaves in `workspace` exactly as in `isolated`: the server's prompt when there is one, the neutral fallback when there is not. Only `native` lets the CLI's own default through.
+
+`bridge__attach_file` is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else, which is what the row above says and what it should keep meaning.
+
+**Gemini and `working_dir`.** Gemini is the one CLI with no per-invocation MCP config flag — it reads `.gemini/settings.json` from cwd. When cwd is a developer's checkout the bridge therefore writes into it, and handles that explicitly: it **refuses the turn rather than overwriting** a settings file the repository already has, removes the one it wrote when the turn ends (`done`, `error` or `cancel`), and removes the `.gemini` directory too if it created it and nothing else is in it. Because there is only one such path per directory and the file carries a per-spawn bearer token, **two concurrent Gemini turns in one directory are refused** rather than allowed to race — the loser would otherwise read the winner's credential and have its tool calls routed to the other turn's request.
 
 #### Local tools (optional)
 
@@ -323,6 +389,13 @@ The bridge replaces its current token with this value and uses it for subsequent
 ---
 
 ## Local Calls
+
+> **Bridge-side only.** These frames are implemented in `@tetrixdev/ai-bridge`;
+> `tetrixdev/laravel-ai-bridge` does not send or understand them, and a bridge
+> that emits a `local_result` at it has the message logged as an unknown type
+> and dropped. They are documented here because both packages share this file
+> and a reader should know the protocol is this size — not because the Laravel
+> server implements this half.
 
 A `local_call` is the server asking the bridge to run one tool on the operator's
 machine, directly. Unlike a `welcome`-registered local tool it is not something
@@ -475,6 +548,75 @@ When the server needs an AI response (triggered by a user message in the browser
 **`history`**: Prior conversation turns (`{role, content}`). Included only when `cli_session_id` is `null`, so a fresh CLI session can be seeded with context. Omitted when resuming — the resumed session already holds its history.
 
 **`options`**: Provider-agnostic generation options. The bridge maps these to CLI-specific flags where supported.
+
+#### Additive field: `working_dir`
+
+Where the CLI should be spawned. Optional; **absent means today's behaviour exactly** — a freshly made empty directory under `~/.cache/ai-bridge/`.
+
+```json
+{
+  "type": "ai_request",
+  "request_id": "req_abc123",
+  "working_dir": "/Users/jasper/zp-studio/zeroplex-studio/ZeroPlex_Studio__D09042"
+}
+```
+
+It is honoured **only** when the operator started the bridge with `--allow-dir` and the path resolves inside one of those roots. Otherwise the turn is refused. The rules, all of them refusals rather than corrections:
+
+| Condition | Result |
+|---|---|
+| Absent, on a fresh session | The empty scratch directory, as before. |
+| Absent, on a resume | The directory that session already runs in — re-checked against the allow-list as it stands now, so a revoked directory is refused rather than reused. Servers **should** resend `working_dir` on every turn anyway — see the note below. |
+| Bridge started without `--allow-dir` | `working_dir_not_allowed` |
+| Not absolute, or contains a null byte | `working_dir_not_allowed` |
+| Resolves outside every allowed root (after `realpath`, so a symlink inside a root that points out of it is caught) | `working_dir_not_allowed` |
+| Inside an allowed root but does not exist, or is not a directory | `working_dir_not_found`. **The bridge never creates it.** |
+| Present, and differs from the directory the resumed `cli_session_id` was started in | `working_dir_changed` |
+
+There is deliberately **no silent fallback to the scratch directory**. A turn that quietly ran in an empty directory looks exactly like a turn that worked, and every answer in it is wrong.
+
+A path outside the allow-list is reported identically whether or not it exists, so the bridge cannot be used as a filesystem probe.
+
+**A working directory belongs to a CLI session for that session's life.** Resuming a session started elsewhere is incoherent — its history is all about another checkout — so it is refused with `working_dir_changed` and the server starts a fresh session deliberately.
+
+A resume that names nothing keeps the directory the session already has. The bridge remembers that mapping across restarts (it persists to `~/.cache/ai-bridge/sessions.json`, shared by every bridge that user runs on the machine), but it is still a local record, bounded and advisory. Two cases follow from that:
+
+- **A session it has no record of** — evicted by age, or started on another machine — resumes in the scratch directory, which for a workspace conversation is the wrong answer.
+- **A remembered directory that is no longer permitted** — the operator narrowed `--allow-dir` — is refused with `working_dir_not_allowed`, and the turn does not run. The record never outlives the revocation.
+
+
+So a server that supports workspaces **should send `working_dir` on every turn**, not only the first. It costs nothing, and it is the only thing that makes the outcome independent of what the bridge happens to remember.
+
+**Consequence, and it is intended:** once `working_dir` is a real checkout, that repository's own `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` load, because the CLIs read them from cwd. That is the point of working in a checkout, not a leak. User-level files (`~/.claude/CLAUDE.md`) are a separate matter and load regardless — see `cli_isolation`.
+
+#### Additive field: `attachments`
+
+Files the assistant should be able to read this turn. References, never bytes:
+
+```json
+"attachments": [
+  {
+    "id": "att_9f3c",
+    "name": "invoice.pdf",
+    "mime_type": "application/pdf",
+    "size": 482113,
+    "sha256": "9f3c...",
+    "url": "https://studio.example.com/ai-bridge/attachments/att_9f3c"
+  }
+]
+```
+
+Inlining the bytes is not an option worth trying. The server's WebSocket message cap is 1 MB, the bridge's client accepts 10 MB frames and the HTTP relay body cap is 16 MB — so a single screenshot, once base64 has added a third, already exceeds the tightest of them, and it would exceed it as a *dropped WebSocket message* rather than as an error anybody could act on.
+
+So the bridge fetches each one instead:
+
+1. **The URL must be on the origin this bridge is connected to** (derived from `--server`, or the explicit `--api` override), and it must be HTTPS — the sole exception being a loopback host, where there is no wire to eavesdrop on. Redirects are **not** followed, since an allowed origin answering `302` to anywhere it likes would make the check decorative. Anything else is refused with `attachment_refused`. Without this, a compromised or hostile server turns every connected bridge into a fetcher for arbitrary hosts, with the operator's own connection token attached.
+2. It is streamed to a per-request directory under `~/.cache/ai-bridge/attachments/` — named from the request id plus a short digest of it, since two ids that sanitise alike must not share a directory and delete each other's files. **Never into the working directory**: a checkout must not be dirtied by the transport. If the file belongs in the repo, the developer asks the assistant to copy it there.
+3. `name` is reduced to a single safe path component (separators of both kinds stripped, leading dots removed, length capped, collisions numbered). The server's filename is never trusted to be a path.
+4. Per-file and per-request caps apply (`--attachment-max-mb`, `--attachment-total-mb`; 25 MB and 100 MB by default), enforced against the *declared* size before fetching and against the *actual* bytes while streaming. Over the cap is `attachment_too_large`.
+5. `size` and `sha256` are verified afterwards. A mismatch fails the whole request with `attachment_failed` — a half-downloaded PDF is, to the model, indistinguishable from a genuinely corrupt one, so it would confidently report the wrong problem.
+6. A short preamble naming the absolute paths, types and sizes is prepended to `message`, so the model knows the files exist and where they are. In `isolated`, where Claude's tool surface is otherwise restricted to `mcp__bridge__*`, a turn carrying attachments also gets a read rule **scoped to that turn's attachment directory** (`Read(/<dir>/**)`). Without it the preamble would name paths the model is not permitted to open, and the turn would end with it saying it cannot see a file the user had just attached. A bare `Read` would instead grant the whole filesystem — a server controls both the attachments and the message, so that would be arbitrary file read switched on by sending a field.
+7. The request's attachment directory is deleted when the turn terminates — on `done`, `error` and `cancelled` alike. `--keep-attachments` retains it for debugging.
 
 ### Bridge → Server: `ai_request_ack`
 
@@ -675,6 +817,31 @@ After the server executes a tool and returns the result (see [Tool Calls](#tool-
 }
 ```
 
+#### `attachment`
+
+A file the assistant produced and chose to hand back. Emitted when the model calls the bridge-owned `bridge__attach_file` tool and the upload succeeded.
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "attachment",
+  "data": {
+    "id": "att_new123",
+    "name": "report.md",
+    "mime_type": "text/markdown",
+    "size": 4096,
+    "description": "The migration report you asked for"
+  }
+}
+```
+
+`id` is the identifier the server assigned when the bridge uploaded the file to `POST /ai-bridge/attachments`, so the UI can render it from the server's own attachment store. A server that does not understand the event ignores it.
+
+The tool is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else.
+
+The model has to nominate the file, and that is not a limitation to work around: a transport cannot guess which of the hundred files a turn just touched is the answer. The path it names must resolve — **after `realpath`, because in `workspace` mode the model has a shell and can create a symlink** — inside the working directory or that turn's attachment directory, and it is subject to the same per-file cap and the same host binding as the inbound direction.
+
 #### `done`
 
 Signals the end of the AI response. No more events for this `request_id`.
@@ -871,6 +1038,15 @@ The server also tracks heartbeats. If no `ping` is received for 2x the heartbeat
 | `rate_limited` | CLI provider rate limit hit | Exponential backoff, notify user |
 | `provider_warning` | Non-fatal provider warning (e.g. content policy notice). The request continues; the message is informational | Surface to user as informational notice |
 | `invalid_request` | Malformed request from server | Log and respond with error |
+| `working_dir_not_allowed` | The `working_dir` is not inside a root the operator permitted with `--allow-dir` (or none were permitted). Also emitted on a turn that named NOTHING, when the directory its CLI session is remembered in has since been revoked | Operator restarts the bridge with `--allow-dir`, or the server offers only the `workspaces` from `hello`. Terminal: `done` follows |
+| `working_dir_not_found` | The named `working_dir` is inside an allowed root but does not exist, or is not a directory. The bridge never creates it | Check the path. Terminal: `done` follows |
+| `working_dir_changed` | A resume named a different directory from the one its CLI session was started in | Server starts a fresh session deliberately. Terminal: `done` follows |
+| `attachment_refused` | An attachment URL is not on the connected server's origin, or is not HTTPS | Server fixes the URL (or the operator sets `--api`). Terminal: `done` follows |
+| `attachment_too_large` | An attachment exceeds the per-file or per-request cap | Server sends a smaller file, or the operator raises `--attachment-max-mb` / `--attachment-total-mb`. Terminal: `done` follows |
+| `attachment_failed` | An attachment could not be downloaded, or failed its size/checksum verification | Retry. Terminal: `done` follows |
+| `gemini_working_dir_unavailable` | Gemini cannot use this working directory: the repository already has a `.gemini/settings.json`, or another Gemini turn is running in it | Move the file aside, use Claude or Codex, or wait for the other turn. Terminal: `done` follows |
+
+All of the above are **refusals**: they carry their own code and are followed by `done`, which ends the turn. They are deliberately not reported as `session_lost` — that code tells the server to wipe the session and silently re-issue the turn, which for a refusal would retry it forever and never surface the reason.
 
 ### Bridge → Server: Error Response
 
@@ -1059,6 +1235,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 
 - `0.x` — Pre-release, breaking changes allowed between minor versions
 - `1.x` — Stable, semantic versioning applies
+
+**Workspaces, attachments and `workspace` isolation do not bump the version.** They stay on `0.1`, deliberately. Every one of them is optional in both directions — `hello.workspaces`, `ai_request.working_dir`, `ai_request.attachments`, the `attachment` stream event and the `workspace` value of `cli_isolation` are all additive, and both ends already ignore fields they do not recognise. Only the major number is enforced, so a bump would refuse every bridge already installed in exchange for nothing.
 
 ---
 

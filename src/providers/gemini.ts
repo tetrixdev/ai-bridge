@@ -40,9 +40,21 @@
 import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
-import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
+import {
+  buildSpawnEnv,
+  buildCombinedPrompt,
+  appendStderr,
+  formatStderrMessage,
+  getBridgeWorkingDir,
+  resolveSystemPrompt,
+} from './env.js';
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
-import { BRIDGE_MCP_SERVER_NAME, writeGeminiSettings } from '../mcp/cli-config.js';
+import {
+  BRIDGE_MCP_SERVER_NAME,
+  acquireGeminiSettings,
+  type GeminiSettingsHandle,
+} from '../mcp/cli-config.js';
+import { RequestRefusal } from '../errors.js';
 import { resumeAwareErrorCode } from './session-error.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
@@ -105,8 +117,27 @@ export class GeminiAdapter extends ProviderAdapter {
     // still load in `isolated` mode (cwd is pinned but $HOME is not).
     // Closing that residual leakage requires HOME/GEMINI_HOME redirection
     // with auth symlinking — tracked in tasks/open/cli-isolation-layer-b.md.
+    //
+    // Once the working directory can be a developer's checkout, that file is
+    // no longer ours: see acquireGeminiSettings(), which refuses rather than
+    // overwrites an existing one and removes the one it writes when the turn
+    // ends. Gemini is the only provider with this problem — Claude and Codex
+    // take their MCP configuration per invocation.
+    const managedWorkingDir = context.workingDir !== getBridgeWorkingDir();
+    let settingsHandle: GeminiSettingsHandle | null = null;
     if (context.mcp) {
-      writeGeminiSettings(context.workingDir, context.mcp);
+      try {
+        settingsHandle = acquireGeminiSettings(context.workingDir, context.mcp, managedWorkingDir);
+      } catch (err) {
+        // A refusal, not a provider failure. Raised as RequestRefusal so the
+        // bridge reports it as itself and ends the turn — a bare throw on a
+        // resumed turn would be read as `session_lost` and silently re-issued,
+        // which would retry the same refusal forever.
+        throw new RequestRefusal(
+          'gemini_working_dir_unavailable',
+          err instanceof Error ? err.message : String(err),
+        );
+      }
     }
 
     // Build CLI arguments
@@ -116,16 +147,30 @@ export class GeminiAdapter extends ProviderAdapter {
       '--skip-trust',                   // Required for headless/non-interactive mode
     ];
 
-    if (context.mcp) {
-      // Limit the visible MCP server set to ours, regardless of what the
-      // operator's user/project settings might contain elsewhere.
+    // Limit the visible MCP server set to ours, regardless of what the
+    // operator's user/project settings might contain elsewhere.
+    //
+    // Outside the `context.mcp` block deliberately. `mcp` is null exactly when
+    // the bridge's own MCP server failed to start — and the turn still runs.
+    // Inside the block, a `workspace` turn would then launch with `--yolo` and
+    // NO server restriction, so gemini would load the operator's
+    // `~/.gemini/settings.json` servers and the checkout's own
+    // `.gemini/settings.json`, auto-approving every tool they expose. Same
+    // shape as the Claude flags; same reason.
+    if (context.cliIsolation !== 'native') {
       args.push('--allowed-mcp-server-names', BRIDGE_MCP_SERVER_NAME);
     }
 
-    if (context.cliIsolation === 'native') {
-      // Legacy operator opt-in: auto-approve everything, including built-in
-      // shell/edit. Matches the pre-MCP posture and is unsafe with untrusted
-      // end-user input.
+    if (context.cliIsolation !== 'isolated') {
+      // `--yolo` auto-approves everything, including built-in shell and edit.
+      //
+      // In `native` this is the legacy operator opt-in. In `workspace` it is
+      // the only lever Gemini offers: there is no middle setting, no
+      // equivalent of Codex's `workspace-write`, and without it every built-in
+      // tool stalls on an approval prompt that headless mode can never show.
+      // So `workspace` on Gemini is materially broader than `workspace` on
+      // Codex, and the README says so rather than implying the three CLIs are
+      // equivalent.
       args.push('--yolo');
     }
 
@@ -154,7 +199,13 @@ export class GeminiAdapter extends ProviderAdapter {
       log.debug('Spawning gemini', { args: args.map((a) => a.length > 50 ? a.substring(0, 50) + '...' : a) });
     }
 
-    return new Promise<string | null>((resolve) => {
+    // try/finally rather than releasing at each exit: the settings file must
+    // come back out of the developer's checkout whatever happened — a clean
+    // finish, a provider error, a timeout, or a cancel — and a release that
+    // has to be remembered at four separate call sites is a release that will
+    // be forgotten at one of them.
+    try {
+      return await new Promise<string | null>((resolve) => {
       let sessionId: string | null = null;
       let blockIndex = 0;
       let settled = false;
@@ -162,7 +213,7 @@ export class GeminiAdapter extends ProviderAdapter {
 
       const env = buildSpawnEnv(context.requestId);
 
-      const child = this.spawnCli('gemini', args, env);
+      const child = this.spawnCli('gemini', args, env, undefined, context.workingDir);
 
       // Enforce the server-configured request_timeout (ai-bridge#2).
       const timeoutTimer = startRequestTimeout(
@@ -471,7 +522,10 @@ export class GeminiAdapter extends ProviderAdapter {
         clearRequestTimeout(timeoutTimer);
         finalizer.onChildClose(code);
       });
-    });
+      });
+    } finally {
+      settingsHandle?.release();
+    }
   }
 
   async listModels(): Promise<ModelInfo[]> {

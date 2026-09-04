@@ -25,9 +25,75 @@ import { handleTestRequest } from './test-mode.js';
 import { setDebug, setLogFile, closeLogFile, createLogger } from './utils/logger.js';
 import { BRIDGE_VERSION, PROTOCOL_VERSION } from './protocol/version.js';
 import { loadOrCreateIdentity, saveIdentity, fingerprint, type Identity } from './local/identity.js';
+import { buildAllowedRoots, type AllowedRoot } from './workspace/allowlist.js';
+import { resolveApiOrigin } from './attachments/origin.js';
 import { enrol, type EngramConfig } from './local/engram.js';
 
 const log = createLogger('CLI');
+
+/**
+ * Parse a megabyte option into bytes.
+ *
+ * Throws rather than falling back to a default: a mistyped cap that silently
+ * becomes 25 MB is one nobody notices until a large attachment is refused for
+ * reasons that make no sense.
+ */
+function parseMegabytes(raw: string, flag: string): number {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${flag} must be a positive number of megabytes (got "${raw}")`);
+  }
+  return Math.floor(value * 1024 * 1024);
+}
+
+/** The parts of BridgeOptions the operator's own flags decide. */
+export interface OperatorPosture {
+  allowedRoots: AllowedRoot[];
+  apiOrigin: string;
+  attachmentLimits: { maxFileBytes: number; maxTotalBytes: number };
+  allowNative: boolean;
+  keepAttachments: boolean;
+}
+
+/** Just the option fields this mapping reads. */
+export interface OperatorOptions {
+  allowDir: string[];
+  api?: string;
+  allowNative: boolean;
+  keepAttachments: boolean;
+  attachmentMaxMb: string;
+  attachmentTotalMb: string;
+}
+
+/**
+ * Turn the operator's flags into the options that decide what a server may do.
+ *
+ * A named, exported, pure function rather than five expressions inline in the
+ * action handler — because this is the single most load-bearing wire in the
+ * package and nothing could reach it otherwise. Hardcoding `allowNative: true`
+ * in the handler used to leave the whole suite green: every test builds a
+ * `Bridge` directly, so they prove `adoptIsolation` honours the field and
+ * never that the flag reaches it. A rename on either side of that assignment
+ * silently opens or closes the gate.
+ *
+ * @throws Error when an option is unusable. The caller reports and exits.
+ */
+export function resolveOperatorPosture(
+  opts: OperatorOptions,
+  serverUrl: string,
+  env: NodeJS.ProcessEnv,
+): OperatorPosture {
+  return {
+    allowedRoots: buildAllowedRoots(opts.allowDir, env['AI_BRIDGE_ALLOWED_DIRS']),
+    apiOrigin: resolveApiOrigin(serverUrl, opts.api),
+    attachmentLimits: {
+      maxFileBytes: parseMegabytes(opts.attachmentMaxMb, '--attachment-max-mb'),
+      maxTotalBytes: parseMegabytes(opts.attachmentTotalMb, '--attachment-total-mb'),
+    },
+    allowNative: opts.allowNative,
+    keepAttachments: opts.keepAttachments,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // CLI Definition
@@ -95,6 +161,43 @@ program
     process.env['ENGRAM_IDENTITY'] ?? join(homedir(), '.engram', 'device.json'),
   )
   .option(
+    '--allow-dir <path>',
+    'Permit the server to run turns in this directory (repeatable). Format: <path>[=<label>], '
+    + 'where the label is what the workspace picker shows. Off unless you pass it: without it a '
+    + 'request naming a working directory is refused, whatever the server sends. '
+    + 'Read the security note in the README first — this bounds where the assistant STARTS, not what it can reach.',
+    (value: string, previous: string[]) => previous.concat([value]),
+    [] as string[],
+  )
+  .option(
+    '--allow-native',
+    'Permit the server to select `native` isolation — the CLI\'s full local environment, including '
+    + 'your own MCP servers, hooks, plugins and a shell. Off unless you pass it. Only for a bridge '
+    + 'you run against your own machine, never one reachable by end users.',
+    false,
+  )
+  .option(
+    '--api <url>',
+    'Base URL of the server HTTP API for attachments, when it is not the same host as --server '
+    + '(or set AI_BRIDGE_API). Defaults to the https:// origin of --server.',
+    process.env['AI_BRIDGE_API'],
+  )
+  .option(
+    '--keep-attachments',
+    'Keep downloaded attachments after a turn instead of deleting them. Debugging aid.',
+    false,
+  )
+  .option(
+    '--attachment-max-mb <n>',
+    'Largest single attachment the bridge will download, in MB.',
+    '25',
+  )
+  .option(
+    '--attachment-total-mb <n>',
+    'Largest total of attachments per request, in MB.',
+    '100',
+  )
+  .option(
     '--log-file <path>',
     'Also append logs to this file (or set AI_BRIDGE_LOG_FILE env var). Rotates once past 5 MB, keeping one previous copy.',
     process.env['AI_BRIDGE_LOG_FILE'],
@@ -103,6 +206,8 @@ program
     token?: string; server?: string; debug: boolean; test: boolean; logFile?: string;
     localTools: boolean; engram?: string; engramToken?: string;
     deviceLabel: string; deviceMode: string; identityFile: string; localDataDir: string;
+    allowDir: string[]; api?: string; keepAttachments: boolean; allowNative: boolean;
+    attachmentMaxMb: string; attachmentTotalMb: string;
   }) => {
     // Enable debug logging if requested
     if (opts.debug) {
@@ -258,6 +363,43 @@ program
       }
     }
 
+    // -----------------------------------------------------------------------
+    // Workspaces, off unless asked for
+    // -----------------------------------------------------------------------
+    //
+    // The same posture as local tools above, and the same reason: this is the
+    // one place it is decided, and nothing a server sends can reach it. A
+    // bridge started without --allow-dir refuses every working directory a
+    // server names, so it is exactly as constrained as it was before this
+    // feature existed.
+
+    if (opts.allowNative) {
+      log.warn(
+        'native isolation is PERMITTED: this server may run the CLI with your full local '
+        + 'environment — your MCP servers, hooks, plugins and a shell, as you.',
+      );
+    }
+
+    let operatorPosture: OperatorPosture;
+    try {
+      operatorPosture = resolveOperatorPosture(opts, serverUrl, process.env);
+    } catch (err) {
+      log.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+    const { allowedRoots, apiOrigin, attachmentLimits } = operatorPosture;
+
+    if (allowedRoots.length > 0) {
+      log.warn(
+        'workspaces are ENABLED: this server can ask the assistant to work inside '
+        + `${allowedRoots.length} director${allowedRoots.length === 1 ? 'y' : 'ies'}, with the CLI's `
+        + 'own file and shell tools, as you. This is not a sandbox — see the README.',
+      );
+      for (const root of allowedRoots) {
+        log.info(`  workspace: ${root.label} → ${root.path}`);
+      }
+    }
+
     const bridge = new Bridge({
       serverUrl,
       token,
@@ -268,6 +410,11 @@ program
       localExecution: { enabled: opts.localTools, dataDir: opts.localDataDir },
       engram,
       identity,
+      allowedRoots,
+      apiOrigin,
+      attachmentLimits,
+      keepAttachments: operatorPosture.keepAttachments,
+      allowNative: operatorPosture.allowNative,
     });
 
     // Lifecycle logging

@@ -9,6 +9,7 @@
 import { mkdtempSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import type { CliIsolation } from '../protocol/types.js';
 
 /** Maximum stderr buffer size (10 KB). */
 const MAX_STDERR_BYTES = 10 * 1024;
@@ -17,8 +18,15 @@ const MAX_STDERR_BYTES = 10 * 1024;
 let cachedWorkingDir: string | null = null;
 
 /**
- * Resolve the dedicated, empty working directory that every provider CLI is
- * spawned in.
+ * Resolve the dedicated, empty working directory a provider CLI is spawned in
+ * when the server has NOT named one.
+ *
+ * Still the default and still the whole of the behaviour for a chat-only turn.
+ * When a server names a working directory and the operator allowed it, the
+ * bridge spawns in that directory instead and the notes below about
+ * suppressing project context files stop applying — deliberately, because
+ * reading the repository's own CLAUDE.md / AGENTS.md is the point of working
+ * in a checkout. See src/workspace/resolve.ts.
  *
  * Claude, Codex and Gemini all auto-load project context files
  * (CLAUDE.md / AGENTS.md / GEMINI.md) from their working directory and its
@@ -82,10 +90,21 @@ export function buildSpawnEnv(
       env[key] = value;
     }
   }
-  // Remove bridge credential variables from the child process environment so
-  // the token does not leak into /proc/<pid>/environ or the CLI's own logging.
+  // Remove credential variables from the child process environment so they do
+  // not leak into /proc/<pid>/environ or the CLI's own logging.
+  //
+  // ENGRAM_TOKEN belongs on this list as much as the bridge's own token — it
+  // is the vault credential, and it defaults to the bridge token when unset.
+  // It was survivable while `isolated` was the only posture a server could
+  // ask for, because that CLI has no shell. `workspace` gives every provider
+  // one, so a single `printenv ENGRAM_TOKEN` would hand the vault credential
+  // back to the server in the assistant's own transcript. src/local/executor.ts
+  // makes the same argument for local tools and solves it with an allowlist.
   delete env['AI_BRIDGE_TOKEN'];
   delete env['AI_BRIDGE_SERVER'];
+  delete env['ENGRAM_TOKEN'];
+  delete env['ENGRAM_URL'];
+  delete env['ENGRAM_IDENTITY'];
   return env;
 }
 
@@ -103,8 +122,10 @@ export const ISOLATED_FALLBACK_SYSTEM_PROMPT =
  * Resolve the system prompt to pass to the CLI for this turn.
  *
  * - If the server sent one, use it as-is (regardless of isolation).
- * - In `isolated` mode with no server prompt, return the neutral fallback so
- *   the CLI's built-in default never seeps through.
+ * - In `isolated` AND `workspace` mode with no server prompt, return the
+ *   neutral fallback so the CLI's built-in default never seeps through.
+ *   `workspace` widens what the CLI may DO; it does not hand the CLI's own
+ *   coding-agent persona to a product whose prompt the server owns.
  * - In `native` mode with no server prompt, return null — the CLI applies
  *   whatever it normally would.
  *
@@ -112,12 +133,12 @@ export const ISOLATED_FALLBACK_SYSTEM_PROMPT =
  */
 export function resolveSystemPrompt(
   serverPrompt: string | null,
-  isolation: 'isolated' | 'native',
+  isolation: CliIsolation,
 ): string | null {
   if (serverPrompt) {
     return serverPrompt;
   }
-  return isolation === 'isolated' ? ISOLATED_FALLBACK_SYSTEM_PROMPT : null;
+  return isolation === 'native' ? null : ISOLATED_FALLBACK_SYSTEM_PROMPT;
 }
 
 /**

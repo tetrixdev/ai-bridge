@@ -116,21 +116,99 @@ export class ClaudeAdapter extends ProviderAdapter {
     // `-p` mode (no interactive approver), so the model can only reach our
     // tools — not shell.
     //
-    // In `native` mode the operator's other MCP servers stay loadable and we
-    // pass `--permission-mode bypassPermissions`, matching the legacy posture
-    // for the developer-runs-bridge-against-own-machine case.
+    // In `native` mode the operator's other MCP servers stay loadable. The
+    // permission mode is decided separately, below, because it must not depend
+    // on whether an MCP channel exists.
+    // `isolated` AND `workspace` both keep the operator's own MCP servers out.
+    // That is the half of isolation `workspace` does NOT relax: it widens what
+    // the model may do with the repository in front of it, not what else on
+    // this machine it can reach.
+    //
+    // Pushed OUTSIDE the `context.mcp` block on purpose. `mcp` is null whenever
+    // the bridge's own MCP server failed to start — and the turn still runs.
+    // Inside the block, that failure would silently drop the flag and let
+    // Claude load the operator's `~/.claude.json` and project `.mcp.json`
+    // servers, at the exact moment it is also running with bypassPermissions.
+    // The one path where isolation matters most must not be the one where it
+    // is skipped.
+    if (context.cliIsolation !== 'native') {
+      args.push('--strict-mcp-config');
+    }
+
+    // Also outside the `context.mcp` block, and for the same reason as
+    // `--strict-mcp-config`: without it, an `isolated` turn whose MCP channel
+    // failed to start would run with NO tool restriction at all — the flag
+    // dropped exactly where it matters most.
+    //
+    // Glob is supported in --allowedTools matchers (per Claude CLI docs, e.g.
+    // "Bash(git *)"). `mcp__<server>__*` is the standard MCP tool namespace
+    // prefix Claude uses. Omitted in `workspace`, where the built-in Read /
+    // Edit / Write / Bash tools are exactly what we want.
+    if (context.cliIsolation === 'isolated') {
+      // A turn carrying attachments needs to be able to read them: the
+      // preamble names absolute paths outside cwd, and without a rule covering
+      // them the turn ends with the model saying it cannot see a file the user
+      // just attached, with nothing in the logs pointing at this flag.
+      //
+      // SCOPED TO THE ATTACHMENT DIRECTORY, and nothing else. A bare `Read`
+      // here would be a whole-filesystem read grant — verified against Claude
+      // 2.1.260: `--allowedTools "…,Read"` reads `/etc`, `~/.ssh` and anything
+      // else, because the entry pre-approves the tool rather than bounding it.
+      // A server controls both the attachments and the message, so that would
+      // hand any server arbitrary file read in the DEFAULT posture, switched
+      // on by sending a field — the exact thing --allow-dir and --local-tools
+      // exist to prevent.
+      //
+      // The `Read(/<abs path>/**)` form is a gitignore-style absolute matcher
+      // (the doubled slash is load-bearing). Verified to allow the attachment
+      // and to deny a path outside it. Glob and Grep are deliberately NOT
+      // granted: the preamble gives absolute paths, so nothing needs to search.
+      //
+      // Comma-separated in ONE argv value rather than several: this flag is
+      // variadic, and a bare list would let it swallow the flag that follows.
+      const allowed = [`mcp__${BRIDGE_MCP_SERVER_NAME}__*`];
+      if (context.attachmentDir) {
+        allowed.push(`Read(/${context.attachmentDir}/**)`);
+      }
+      args.push('--allowedTools', allowed.join(','));
+    }
+
     if (context.mcp) {
       const configPath = writeClaudeMcpConfig(context.mcp);
       args.push('--mcp-config', configPath);
-      if (context.cliIsolation === 'isolated') {
-        args.push('--strict-mcp-config');
-        // Glob is supported in --allowedTools matchers (per Claude CLI docs,
-        // e.g. "Bash(git *)"). `mcp__<server>__*` is the standard MCP tool
-        // namespace prefix Claude uses.
-        args.push('--allowedTools', `mcp__${BRIDGE_MCP_SERVER_NAME}__*`);
-      } else {
-        args.push('--permission-mode', 'bypassPermissions');
-      }
+    }
+
+    // Permission mode, decided independently of whether any tools were
+    // registered — a `workspace` turn with no server tools still needs to be
+    // able to edit and run things, and a `native` turn was always meant to.
+    //
+    // `bypassPermissions` is what actually runs a real task, and saying
+    // otherwise would be misleading: in headless `-p` mode there is no
+    // interactive approver, so `acceptEdits` gets through file edits and then
+    // stalls the first time the model reaches for the shell. Running the tests
+    // is a shell command, so "edit the file and run the tests" stops halfway
+    // with no error anyone can see. See the security note in the README —
+    // this is not a sandbox and is not described as one.
+    if (context.cliIsolation === 'isolated') {
+      // `manual` is what actually enforces `isolated`, and without it the
+      // posture is only as strong as the operator's own Claude settings.
+      //
+      // The bridge asks for a restricted tool surface with --allowedTools and
+      // relies on Claude to deny the rest. That denial comes from Claude's
+      // permission system, which reads ~/.claude/settings.json — so a
+      // developer who set `permissions.defaultMode: "auto"` to stop being
+      // prompted in their own work silently turns `isolated` into "everything
+      // allowed", on every turn a server sends them. Verified against 2.1.260:
+      // with that setting an isolated turn read an arbitrary file and ran an
+      // arbitrary shell command; with this flag both are denied.
+      //
+      // `manual` rather than dropping the settings file wholesale
+      // (--setting-sources) because auth lives in there too: an operator using
+      // apiKeyHelper would lose their credentials, which is the trap --bare
+      // already falls into and the reason this adapter cannot use it.
+      args.push('--permission-mode', 'manual');
+    } else {
+      args.push('--permission-mode', 'bypassPermissions');
     }
 
     // The user message is delivered via STDIN, not as a positional argument.
@@ -156,7 +234,7 @@ export class ClaudeAdapter extends ProviderAdapter {
       // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
       delete env['CLAUDECODE'];
 
-      const child = this.spawnCli('claude', args, env, userMessage);
+      const child = this.spawnCli('claude', args, env, userMessage, context.workingDir);
 
       // Enforce the server-configured request_timeout. Without this a stuck
       // CLI would run forever; with it the bridge bounds every turn.

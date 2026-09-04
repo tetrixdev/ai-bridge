@@ -34,6 +34,108 @@ npx @tetrixdev/ai-bridge
 | `--device-mode <mode>` | | `transcript` or `isolated`. Self-reported |
 | `--identity-file <path>` | `ENGRAM_IDENTITY` | Where the device keypair lives (default `~/.engram/device.json`) |
 | `--local-data-dir <path>` | `AI_BRIDGE_DATA_DIR` | Where npm packages for local tools are installed, one directory per space (default `~/.ai-bridge`) |
+| `--allow-dir <path>[=<label>]` | `AI_BRIDGE_ALLOWED_DIRS` | Permit the server to run turns in this directory. Repeatable; the environment variable is path-separator delimited (`:` on POSIX, `;` on Windows). **Off unless you pass it** — without it a named working directory is refused, and so is `workspace` isolation. Read [Working in a repository](#working-in-a-repository) first |
+| `--api <url>` | `AI_BRIDGE_API` | Base URL of the server's HTTP API for attachments, when it is not the same host as `--server`. Defaults to the `https://` origin of `--server` |
+| `--attachment-max-mb <n>` | | Largest single attachment to download (default `25`) |
+| `--attachment-total-mb <n>` | | Largest total of attachments per request (default `100`) |
+| `--allow-native` | | Permit the server to select `native` isolation — the CLI's full local environment, including your own MCP servers, hooks, plugins and a shell. **Off unless you pass it.** Only for a bridge you run against your own machine |
+| `--keep-attachments` | | Keep downloaded attachments after a turn instead of deleting them. Debugging aid |
+
+## Working in a repository
+
+By default every CLI is spawned in a dedicated empty directory, so a chat can talk about code but cannot touch any. Pass `--allow-dir` and the server may ask the assistant to work inside a real checkout instead — read a repository, edit it, run the tests, commit.
+
+```bash
+npx @tetrixdev/ai-bridge \
+  --server wss://studio.example.com/api/ai-bridge/ws \
+  --token "$AI_BRIDGE_TOKEN" \
+  --allow-dir ~/zp-studio=Studio
+```
+
+### The posture is server-sent; the capability is yours
+
+> Full detail — how `isolated` is enforced, what it does not stop, and how to
+> check it on your own machine — is in [docs/isolation.md](docs/isolation.md).
+
+The server chooses how much the CLI may do, by sending `cli_isolation` on the
+handshake. [PROTOCOL.md](PROTOCOL.md) gives the per-CLI flags; the shape is:
+
+| Posture | The CLI may... | Your own environment... |
+|---|---|---|
+| `isolated` (the default, and what an older server gets) | reach server-declared tools only. No shell, no edits — **subject to the caveat below**. | stays out, except your permission settings. |
+| `workspace` | **also use its own file and shell tools**, in the directory the server named. | stays out — your MCP servers, hooks and plugins are still excluded. |
+| `native` | do anything the CLI can do. | is fully in play. |
+
+> **What `isolated` does and does not enforce.** The bridge states the posture
+> explicitly rather than trusting whatever the CLI happens to be configured to
+> do: Claude is run with `--permission-mode manual` and Codex with
+> `sandbox_mode=read-only`, so a `permissions.defaultMode: "auto"` in your
+> `~/.claude/settings.json` — or a permissive `~/.codex/config.toml` — no
+> longer widens what a server can do on your machine. Verified against Claude
+> 2.1.260 both ways: with the flag an isolated turn is denied an arbitrary file
+> read and an arbitrary shell command; without it, that same setting allowed
+> both.
+>
+> **Gemini is the exception.** It offers no equivalent lever — `--yolo` is on or
+> off, and its built-in tools otherwise stall on an approval that headless mode
+> cannot answer — so an `isolated` Gemini turn is bounded by Gemini's own
+> defaults and by whatever is in `~/.gemini/settings.json`. If your server is
+> reachable by people you do not trust, do not offer Gemini.
+>
+> **What still leaks in `isolated`, on every provider:** user-level instruction
+> files, skills, hooks and plugins load, because suppressing them needs `--bare`
+> (Claude) or HOME redirection, and `--bare` breaks subscription auth. Those are
+> the operator's own configuration rather than something a server chooses, but
+> they do shape the turn.
+
+**Both of the permissive postures require an operator opt-in.** `workspace`
+needs `--allow-dir`; `native` needs `--allow-native`. A bridge started without
+them refuses that posture and runs `isolated` instead, saying so in the log.
+
+This matters more than it looks. `workspace` is what enables the shell, and a
+shell in an empty scratch directory is still a shell — so if the allow-list
+bounded only the *directory*, a server could switch the capability on by
+sending a field. And gating `workspace` alone would have been theatre, because
+`native` is strictly broader: a server refused the shell one way would simply
+ask for it the other way and get the operator's own MCP servers, hooks and
+plugins along with it. Same rule as `--local-tools`, in all three cases: the
+operator opts in, never the server.
+
+The bridge advertises what you allowed in its handshake, so the app can show a picker of your checkouts rather than asking you to type a path. A request naming anything outside those roots is refused, and so is one naming a directory that does not exist — the bridge never creates it, because a typo that silently starts an empty session looks exactly like a session that worked.
+
+A working directory belongs to a CLI session for that session's life: a later turn on the same conversation that names a different directory is refused rather than resumed into a session whose history is about somewhere else.
+
+Once cwd is a real checkout, that repository's own `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` load. That is intended — it is the point of working in a checkout.
+
+### Read this before using it
+
+> Once a server may name a working directory and the CLI has shell, the bridge runs code chosen by the server, on this machine, as you. The allow-list bounds where the assistant **starts**, not what it can **reach**: `cd ..` and `~/.ssh` are one command away, and no flag in this table changes that.
+>
+> The controls that actually carry the weight are: the allow-list is opt-in and empty by default, so a bridge started without `--allow-dir` cannot be pointed anywhere; the connection token is per person and revocable; and you should only connect a bridge to a server you would give a shell to.
+
+`workspace` is a narrower blast radius than `native`, and a real one. It is **not** a sandbox, and nothing here should be read as claiming otherwise. Codex is bounded more tightly than the others (`sandbox_mode=workspace-write` rather than `danger-full-access`); Gemini is bounded least, because `--yolo` is the only lever it offers and there is no middle setting.
+
+### Gemini leaves a file in your checkout, briefly
+
+Gemini has no per-invocation MCP config flag — it reads `.gemini/settings.json` from its working directory. Pointed at a checkout, the bridge therefore writes one there. It handles that explicitly: it **refuses the turn rather than overwriting** a `.gemini/settings.json` your repository already has, deletes the one it wrote when the turn ends — on success, error, cancel, and on the bridge process exiting, so a SIGTERM mid-turn does not leave a stale file that blocks that checkout for good — and removes the `.gemini` directory too if it created it and left it empty. A `SIGKILL` is the one case nothing can clean up; delete the file by hand if you ever see one. Two Gemini turns cannot run in one directory at the same time — the second is refused, because the file holds a per-spawn credential and the loser would read the winner's.
+
+Claude and Codex take their MCP configuration per invocation and never write anything into your checkout.
+
+Two Gemini turns *without* a working directory still share the bridge's scratch
+directory and so still race on that one file — a pre-existing wrinkle this
+release does not fix, because the fix is a per-turn scratch directory for every
+provider. Claude and Codex are unaffected.
+
+## Attachments
+
+A file attached in the chat does not travel over the WebSocket — the server's frame cap is 1 MB, so a screenshot would not fit, and would not fit as a *dropped message* rather than an error. The server sends a reference instead and the bridge fetches it:
+
+- only from the origin it is connected to (or `--api`), only over HTTPS, and never following a redirect;
+- into a per-request directory under `~/.cache/ai-bridge/attachments/`, **never into your checkout**;
+- verified against the declared size and SHA-256, failing the turn loudly on a mismatch rather than handing the model a truncated file it will describe as corrupt;
+- deleted when the turn ends — on success, error, cancel, and on the bridge process exiting.
+
+The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. That tool is offered in `workspace` and `native` only. In `isolated`, Claude reaches server-declared tools plus — on a turn that has attachments — permission to read that turn's attachment directory, and nothing else. Codex and Gemini have no equivalent per-path grant: Codex sits at its own read-only sandbox and Gemini at its own defaults, both of which are broader than that. See the posture table in [PROTOCOL.md](PROTOCOL.md). It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
 
 ## Local tools
 
@@ -203,7 +305,9 @@ logged, cached and stored elsewhere.
 
 The bridge auto-detects which CLIs are installed on startup.
 
-**Server-defined tools** registered by the web application are exposed to every provider as Bash wrapper scripts placed on the CLI's `PATH`; the CLI invokes them as ordinary shell commands and the bridge routes the call back through the WebSocket. For Codex, the bridge runs `codex exec` with a workspace-write sandbox and network access enabled so the wrapper scripts can reach the bridge — this is handled automatically when tools are present.
+**Server-defined tools** registered by the web application are exposed to every provider through a small MCP server the bridge runs on loopback, with a per-spawn bearer token; a tool call travels back over the WebSocket for the server to resolve. (Earlier versions injected Bash wrapper scripts onto the CLI's `PATH`. That mechanism is gone — the bridge no longer modifies `PATH` at all.)
+
+Codex's own sandbox is set by the isolation posture and not by whether tools are present: `isolated` leaves it at its read-only default, `workspace` sets `workspace-write`, and `native` sets `danger-full-access`. See [Working in a repository](#working-in-a-repository).
 
 ## Test Mode
 

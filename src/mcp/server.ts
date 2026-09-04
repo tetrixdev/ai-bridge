@@ -82,6 +82,16 @@ export class BridgeMcpServer {
   private httpServer: Server | null = null;
   private port: number | null = null;
   private tools: ToolDefinition[] = [];
+  /**
+   * Tools the BRIDGE implements, offered alongside the server's.
+   *
+   * They are kept in their own list rather than merged into `tools` because
+   * they must not be routed the way a server tool is: a server tool round-trips
+   * over the WebSocket as a `tool_call` frame, while these are handled here, on
+   * this machine, by the bridge itself. The Bridge's call handler dispatches on
+   * the name.
+   */
+  private bridgeTools: ToolDefinition[] = [];
   private readonly handleCall: ToolCallHandler;
   /** Per-spawn bearer tokens → AI request_id they map to. */
   private readonly tokens = new Map<string, string>();
@@ -108,11 +118,11 @@ export class BridgeMcpServer {
       const ctx = this.callContext.getStore();
       log.info('MCP tools/list', {
         requestId: ctx?.requestId,
-        toolCount: this.tools.length,
-        tools: this.tools.map((t) => t.name),
+        toolCount: this.tools.length + this.bridgeTools.length,
+        tools: [...this.tools, ...this.bridgeTools].map((t) => t.name),
       });
       return {
-        tools: this.tools.map((t) => ({
+        tools: [...this.tools, ...this.bridgeTools].map((t) => ({
           name: t.name,
           description: t.description,
           inputSchema: this.normalizeInputSchema(t.parameters),
@@ -174,6 +184,39 @@ export class BridgeMcpServer {
   }
 
   /**
+   * Register the tools the bridge implements itself.
+   *
+   * Set once at construction time in practice. Separate from setTools() so a
+   * welcome message carrying a fresh server tool list cannot drop them.
+   */
+  setBridgeTools(tools: ToolDefinition[]): void {
+    this.bridgeTools = tools;
+    log.debug('Bridge-owned tool set updated', { tools: tools.map((t) => t.name) });
+  }
+
+  /**
+   * Whether a given bridge-owned tool is currently registered.
+   *
+   * The call handler consults this before dispatching by name, so a tool that
+   * is withheld from tools/list is also refused when invoked, and a
+   * server-declared tool cannot shadow a bridge one.
+   */
+  hasBridgeTool(name: string): boolean {
+    return this.bridgeTools.some((t) => t.name === name);
+  }
+
+  /**
+   * True when the MCP server has anything at all to offer.
+   *
+   * The bridge starts this server lazily, and used to key that off "the server
+   * registered at least one tool". With bridge-owned tools in the picture that
+   * is no longer the same question.
+   */
+  hasTools(): boolean {
+    return this.tools.length > 0 || this.bridgeTools.length > 0;
+  }
+
+  /**
    * Open the HTTP listener.
    */
   async start(): Promise<void> {
@@ -193,16 +236,28 @@ export class BridgeMcpServer {
       });
     });
 
-    await new Promise<void>((resolve, reject) => {
-      this.httpServer!.once('error', reject);
-      // Loopback only — never 0.0.0.0 even by accident, since this endpoint
-      // is bearer-token-authed and not meant for off-host access.
-      this.httpServer!.listen(0, '127.0.0.1', () => {
-        const addr = this.httpServer!.address() as AddressInfo;
-        this.port = addr.port;
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.httpServer!.once('error', reject);
+        // Loopback only — never 0.0.0.0 even by accident, since this endpoint
+        // is bearer-token-authed and not meant for off-host access.
+        this.httpServer!.listen(0, '127.0.0.1', () => {
+          const addr = this.httpServer!.address() as AddressInfo;
+          this.port = addr.port;
+          resolve();
+        });
       });
-    });
+    } catch (err) {
+      // Put the object back the way it was, or a failed listen (EMFILE,
+      // EACCES, no loopback) is unrecoverable for the life of the process:
+      // `httpServer` stays set, so every later attempt hits the "already
+      // started" guard above and the operator sees that instead of the real
+      // cause, on every reconnect, with the tool channel never coming back.
+      this.httpServer?.close(() => undefined);
+      this.httpServer = null;
+      this.port = null;
+      throw err;
+    }
 
     log.info('Bridge MCP server listening', { url: this.getBaseUrl() });
   }
@@ -226,9 +281,18 @@ export class BridgeMcpServer {
     log.info('Bridge MCP server stopped');
   }
 
-  /** True once start() has resolved and stop() has not been called. */
+  /**
+   * True once the listener is actually bound, and stop() has not been called.
+   *
+   * The port, not just the server object. `start()` assigns `httpServer`
+   * synchronously and only learns the port when `listen` calls back, so a
+   * check on the object alone is true during a window in which `getBaseUrl()`
+   * still throws. A server that sends `welcome` and `ai_request` back to back
+   * lands in exactly that window, and the turn dies with
+   * "BridgeMcpServer not started" reported as a provider error.
+   */
   isRunning(): boolean {
-    return this.httpServer !== null;
+    return this.httpServer !== null && this.port !== null;
   }
 
   /** Base URL CLIs connect to. Throws if start() has not been called. */

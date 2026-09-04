@@ -47,9 +47,15 @@ export interface ExecutionContext {
    */
   cliIsolation: CliIsolation;
   /**
-   * Per-process working directory the CLI is spawned in. Used by adapters
-   * (Gemini) that read MCP config from a file in cwd. Pre-populated by the
-   * bridge with whatever config the CLI needs.
+   * The directory the CLI is spawned in, and the one adapters that write
+   * config into cwd (Gemini) must use.
+   *
+   * Resolved once per request by the bridge: the empty scratch directory when
+   * the server named nothing, or the checkout it named when the operator
+   * allowed it. Adapters pass it straight to spawnCli() and never call
+   * getBridgeWorkingDir() themselves — a second source for this value is how
+   * the CLI ends up running somewhere other than where the settings file was
+   * written.
    */
   workingDir: string;
   /** Abort signal for cancellation. */
@@ -58,6 +64,17 @@ export interface ExecutionContext {
   requestTimeoutSeconds: number;
   /** CLI session ID if resuming, or null for new session. */
   cliSessionId: string | null;
+  /**
+   * The directory this turn's attachments were written to, or null.
+   *
+   * The PATH, not a boolean, because adapters that restrict the tool surface
+   * need to grant read access to exactly this directory and nowhere else.
+   * Telling a model "the user attached a file, read it at this path" while its
+   * file-reading tool is denied produces a turn that fails for a reason
+   * nothing reports — and granting it the file-reading tool outright grants
+   * the whole filesystem, which is a great deal worse.
+   */
+  attachmentDir: string | null;
 }
 
 /**
@@ -188,9 +205,13 @@ export abstract class ProviderAdapter {
    * Spawn a provider CLI subprocess with the bridge's standard launch options.
    *
    * Centralizes the two settings every adapter must get right:
-   *   - `cwd` is pinned to a dedicated empty directory so the CLI cannot
+   *   - `cwd` defaults to a dedicated empty directory so the CLI cannot
    *     auto-load CLAUDE.md / AGENTS.md / GEMINI.md from the bridge's own
-   *     working tree (see getBridgeWorkingDir()).
+   *     working tree (see getBridgeWorkingDir()). Adapters pass
+   *     `context.workingDir`, which IS that directory unless the server named
+   *     one and the operator allowed it — see src/workspace/resolve.ts. The
+   *     default stays here so a future adapter that forgets to pass it gets
+   *     the safe directory rather than the bridge's own cwd.
    *   - `stdio` keeps stdin closed by default — every CLI hangs if stdin is a
    *     live pipe — unless `stdinInput` is given, in which case stdin is piped,
    *     the input written, and the pipe immediately closed. stdout/stderr stay
@@ -204,6 +225,8 @@ export abstract class ProviderAdapter {
    * @param command  CLI binary name (e.g. "claude").
    * @param args     CLI arguments.
    * @param env      Fully-built environment for the child process.
+   * @param stdinInput  Prompt to write to stdin, when the CLI reads it there.
+   * @param cwd      Directory to spawn in. Defaults to the empty scratch dir.
    * @returns The spawned ChildProcess.
    */
   protected spawnCli(
@@ -211,6 +234,7 @@ export abstract class ProviderAdapter {
     args: string[],
     env: NodeJS.ProcessEnv,
     stdinInput?: string,
+    cwd?: string,
   ): ChildProcessByStdio<Writable | null, Readable, Readable> {
     // stdin defaults to 'ignore' (null) — a live stdin pipe hangs most CLIs.
     // When stdinInput is given we pipe it, write it, and immediately end() so
@@ -220,7 +244,7 @@ export abstract class ProviderAdapter {
     // stdout/stderr stay piped for streaming.
     const child = spawn(command, args, {
       env,
-      cwd: getBridgeWorkingDir(),
+      cwd: cwd ?? getBridgeWorkingDir(),
       stdio: [stdinInput !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
 
