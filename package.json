@@ -1,7 +1,7 @@
 {
   "name": "@tetrixdev/ai-bridge",
   "version": "0.1.2",
-  "description": "Local CLI bridge for AI web apps — connects Codex, Claude, and Gemini CLIs to web applications via WebSocket",
+  "description": "Local CLI bridge for AI web apps \u2014 connects Codex, Claude, and Gemini CLIs to web applications via WebSocket",
   "type": "module",
   "bin": {
     "ai-bridge": "dist/cli.js",
@@ -46,6 +46,6 @@
     "url": "https://github.com/tetrixdev/ai-bridge.git"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   }
 }

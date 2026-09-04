@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20, 22]
+        node-version: [22, 24]
 
     steps:
       # Pinned to commit SHA to prevent supply-chain attacks via mutable tags.
@@ -48,7 +48,7 @@ jobs:
     # Typecheck on both Node versions to catch version-specific type incompatibilities.
     strategy:
       matrix:
-        node-version: [20, 22]
+        node-version: [22, 24]
     steps:
       # Pinned to commit SHA.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
