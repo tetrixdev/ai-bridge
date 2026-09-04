@@ -37,10 +37,19 @@ export interface UploadContext {
   attachmentDir: string | null;
   /** Origin to upload to — the same one attachments are fetched from. */
   apiOrigin: string;
-  /** The bridge's connection token. */
-  token: string;
+  /**
+   * The bridge's connection token, read at CALL time.
+   *
+   * A function rather than a string because the server tops up long-lived
+   * tokens mid-connection: a turn that captured the value at its start and
+   * then called this tool after a refresh would upload with a credential that
+   * had already been replaced, and get an opaque 401.
+   */
+  token: () => string;
   /** Per-file cap, shared with the inbound path. */
   maxFileBytes: number;
+  /** Aborts with the turn, so an upload cannot outlive the request. */
+  signal?: AbortSignal;
 }
 
 /** The MCP tool definition advertised to the CLI. */
@@ -150,16 +159,30 @@ export async function uploadAttachment(
     form.append('description', description);
   }
 
+  const abort = signal ?? ctx.signal;
   const response = await fetch(`${ctx.apiOrigin}/ai-bridge/attachments`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${ctx.token}` },
+    headers: { Authorization: `Bearer ${ctx.token()}` },
     body: form,
     redirect: 'error',
-    ...(signal ? { signal } : {}),
+    ...(abort ? { signal: abort } : {}),
   });
 
   if (!response.ok) {
-    throw new Error(`server rejected the upload with HTTP ${response.status}`);
+    // Read what the server said. A bare "HTTP 501" tells the model nothing and
+    // invites a retry; the server's own message says the application does not
+    // accept files and names the hook to register, which is something the
+    // model can actually report to the person asking.
+    let detail = '';
+    try {
+      const body = (await response.json()) as { message?: string };
+      if (typeof body.message === 'string' && body.message !== '') {
+        detail = `: ${body.message}`;
+      }
+    } catch {
+      // A non-JSON error body is no worse than none.
+    }
+    throw new Error(`server rejected the upload with HTTP ${response.status}${detail}`);
   }
 
   const body = (await response.json()) as {

@@ -34,7 +34,7 @@ npx @tetrixdev/ai-bridge
 | `--device-mode <mode>` | | `transcript` or `isolated`. Self-reported |
 | `--identity-file <path>` | `ENGRAM_IDENTITY` | Where the device keypair lives (default `~/.engram/device.json`) |
 | `--local-data-dir <path>` | `AI_BRIDGE_DATA_DIR` | Where npm packages for local tools are installed, one directory per space (default `~/.ai-bridge`) |
-| `--allow-dir <path>[=<label>]` | `AI_BRIDGE_ALLOWED_DIRS` | Permit the server to run turns in this directory. Repeatable; the environment variable is `:`-separated. **Off unless you pass it.** Read [Working in a repository](#working-in-a-repository) first |
+| `--allow-dir <path>[=<label>]` | `AI_BRIDGE_ALLOWED_DIRS` | Permit the server to run turns in this directory. Repeatable; the environment variable is path-separator delimited (`:` on POSIX, `;` on Windows). **Off unless you pass it** — without it a named working directory is refused, and so is `workspace` isolation. Read [Working in a repository](#working-in-a-repository) first |
 | `--api <url>` | `AI_BRIDGE_API` | Base URL of the server's HTTP API for attachments, when it is not the same host as `--server`. Defaults to the `https://` origin of `--server` |
 | `--attachment-max-mb <n>` | | Largest single attachment to download (default `25`) |
 | `--attachment-total-mb <n>` | | Largest total of attachments per request (default `100`) |
@@ -50,6 +50,24 @@ npx @tetrixdev/ai-bridge \
   --token "$AI_BRIDGE_TOKEN" \
   --allow-dir ~/zp-studio=Studio
 ```
+
+### The posture is server-sent; the capability is yours
+
+The server chooses how much the CLI may do, by sending `cli_isolation` on the
+handshake. [PROTOCOL.md](PROTOCOL.md) gives the per-CLI flags; the shape is:
+
+| Posture | The CLI may... | Your own environment... |
+|---|---|---|
+| `isolated` (the default, and what an older server gets) | reach server-declared tools only. No shell, no edits. | stays out. |
+| `workspace` | **also use its own file and shell tools**, in the directory the server named. | stays out — your MCP servers, hooks and plugins are still excluded. |
+| `native` | do anything the CLI can do. | is fully in play. |
+
+**`workspace` requires `--allow-dir`.** A bridge started without it refuses that
+posture and runs `isolated` instead, saying so in the log. This matters more
+than it looks: `workspace` is what enables the shell, and a shell in an empty
+scratch directory is still a shell. If the allow-list bounded only the
+*directory*, a server could switch the capability on by sending a field. It
+cannot. Same rule as `--local-tools` — the operator opts in, never the server.
 
 The bridge advertises what you allowed in its handshake, so the app can show a picker of your checkouts rather than asking you to type a path. A request naming anything outside those roots is refused, and so is one naming a directory that does not exist — the bridge never creates it, because a typo that silently starts an empty session looks exactly like a session that worked.
 
@@ -70,6 +88,16 @@ Once cwd is a real checkout, that repository's own `CLAUDE.md` / `AGENTS.md` / `
 Gemini has no per-invocation MCP config flag — it reads `.gemini/settings.json` from its working directory. Pointed at a checkout, the bridge therefore writes one there. It handles that explicitly: it **refuses the turn rather than overwriting** a `.gemini/settings.json` your repository already has, deletes the one it wrote when the turn ends however the turn ended, and removes the `.gemini` directory too if it created it and left it empty. Two Gemini turns cannot run in one directory at the same time — the second is refused, because the file holds a per-spawn credential and the loser would read the winner's.
 
 Claude and Codex take their MCP configuration per invocation and never write anything into your checkout.
+
+Two Gemini turns *without* a working directory still share the bridge's scratch
+directory and so still race on that one file — a pre-existing wrinkle this
+release does not fix, because the fix is a per-turn scratch directory for every
+provider. Claude and Codex are unaffected.
+
+Two Gemini turns *without* a working directory still share the bridge's scratch
+directory and therefore still race on that one file — a pre-existing wrinkle
+this release does not fix, because the fix is a per-turn scratch directory for
+every provider. Claude and Codex are unaffected.
 
 ## Attachments
 
@@ -250,7 +278,9 @@ logged, cached and stored elsewhere.
 
 The bridge auto-detects which CLIs are installed on startup.
 
-**Server-defined tools** registered by the web application are exposed to every provider as Bash wrapper scripts placed on the CLI's `PATH`; the CLI invokes them as ordinary shell commands and the bridge routes the call back through the WebSocket. For Codex, the bridge runs `codex exec` with a workspace-write sandbox and network access enabled so the wrapper scripts can reach the bridge — this is handled automatically when tools are present.
+**Server-defined tools** registered by the web application are exposed to every provider through a small MCP server the bridge runs on loopback, with a per-spawn bearer token; a tool call travels back over the WebSocket for the server to resolve. (Earlier versions injected Bash wrapper scripts onto the CLI's `PATH`. That mechanism is gone — the bridge no longer modifies `PATH` at all.)
+
+Codex's own sandbox is set by the isolation posture and not by whether tools are present: `isolated` leaves it at its read-only default, `workspace` sets `workspace-write`, and `native` sets `danger-full-access`. See [Working in a repository](#working-in-a-repository).
 
 ## Test Mode
 

@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -17,6 +17,7 @@ import { Bridge } from '../../src/bridge.js';
 import { ProviderAdapter, type AdapterStreamEvent, type ExecutionContext } from '../../src/providers/base.js';
 import type { AllowedRoot } from '../../src/workspace/allowlist.js';
 import type { ModelInfo } from '../../src/protocol/types.js';
+import { attachmentDirFor } from '../../src/attachments/store.js';
 
 /** Records the context it was executed with, and reports a session id. */
 class RecordingAdapter extends ProviderAdapter {
@@ -237,6 +238,27 @@ describe('a working directory belongs to its CLI session', () => {
     expect(adapter.seen).toHaveLength(2);
   });
 
+  it('keeps the session directory when a resume names nothing', async () => {
+    // The protocol says absent means "the default", and once a session exists
+    // its own directory IS the default. Reading absent as "the scratch dir"
+    // would refuse the turn as working_dir_changed with a message claiming the
+    // request asked for a temp directory it never mentioned — and the
+    // documented recovery would then run in that empty directory, which is the
+    // outcome the whole module exists to prevent.
+    const adapter = new RecordingAdapter();
+    await startBridge([{ path: root, label: 'root' }], adapter);
+
+    const first = sendRequest({ working_dir: checkout });
+    await waitFor((f) => f['type'] === 'stream' && f['request_id'] === first && f['event'] === 'done', 'first done');
+
+    const second = sendRequest({ cli_session_id: 'sess-1' });
+    await waitFor((f) => f['type'] === 'stream' && f['request_id'] === second && f['event'] === 'done', 'second done');
+
+    expect(streamEvents(second).map((e) => e.event)).toEqual(['done']);
+    expect(adapter.seen).toHaveLength(2);
+    expect(adapter.seen[1]!.workingDir).toBe(checkout);
+  });
+
   it('allows a resume for a session it has no record of', async () => {
     // The position a restarted bridge is in. Refusing here would break every
     // conversation across a bridge restart.
@@ -250,7 +272,51 @@ describe('a working directory belongs to its CLI session', () => {
   });
 });
 
+describe('refusals do not leak per-turn state', () => {
+  it('revokes the per-spawn MCP token even when the turn is refused', async () => {
+    // The token is issued before the working directory is resolved. A refusal
+    // that threw past the revoke would leave one live credential in the MCP
+    // server's map per refused turn, for the life of a background service.
+    const adapter = new RecordingAdapter();
+    // An allow-list, so `workspace` is accepted, the bridge registers its own
+    // tool, the MCP server starts and a token really is issued per turn.
+    await startBridge([{ path: root, label: 'root' }], adapter);
+
+    const mcpServer = (bridge as unknown as {
+      mcpServer: { tokens: Map<string, string>; isRunning(): boolean };
+    }).mcpServer;
+    expect(mcpServer.isRunning()).toBe(true);
+
+    // Refused: inside no allowed root.
+    for (let i = 0; i < 3; i++) {
+      const id = sendRequest({ working_dir: '/etc' });
+      await waitFor((f) => f['type'] === 'stream' && f['request_id'] === id && f['event'] === 'done', 'done');
+      expect(streamEvents(id)[0]!.data['code']).toBe('working_dir_not_allowed');
+    }
+
+    expect(mcpServer.tokens.size).toBe(0);
+    expect(adapter.seen).toEqual([]);
+  });
+});
+
 describe('attachments', () => {
+  it('leaves nothing on disk when a turn is refused part-way through fetching', async () => {
+    // The spec asks for the directory to be gone after done, error AND cancel.
+    // A refusal mid-fetch is the awkward one: some files are already written.
+    const adapter = new RecordingAdapter();
+    await startBridge([{ path: root, label: 'root' }], adapter);
+
+    const id = sendRequest({
+      attachments: [{
+        id: 'att_1', name: 'x.pdf', mime_type: 'application/pdf', size: 3,
+        sha256: 'abc', url: 'https://evil.example.com/x.pdf',
+      }],
+    });
+    await waitFor((f) => f['type'] === 'stream' && f['request_id'] === id && f['event'] === 'done', 'done');
+
+    expect(existsSync(attachmentDirFor(id))).toBe(false);
+  });
+
   it('refuses a turn whose attachment points at another host, without spawning', async () => {
     const adapter = new RecordingAdapter();
     await startBridge([{ path: root, label: 'root' }], adapter);

@@ -11,6 +11,22 @@
  */
 
 /**
+ * A URL this bridge will not fetch, as a type rather than as a sentence.
+ *
+ * The caller reports a policy refusal (`attachment_refused`) differently from
+ * a download that failed (`attachment_failed`), because one is a misconfigured
+ * or hostile server and the other is a network. Deriving that distinction by
+ * matching the message text would make a reworded string quietly turn a
+ * host-binding refusal into something the server may retry.
+ */
+export class AttachmentUrlError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AttachmentUrlError';
+  }
+}
+
+/**
  * Derive the HTTP origin that matches a WebSocket server URL.
  *
  * `wss://studio.example.com/api/ai-bridge/ws` gives `https://studio.example.com`.
@@ -86,18 +102,18 @@ export function assertAllowedAttachmentUrl(rawUrl: string, expectedOrigin: strin
   try {
     url = new URL(rawUrl);
   } catch {
-    throw new Error(`attachment URL is not a valid URL: "${rawUrl}"`);
+    throw new AttachmentUrlError(`attachment URL is not a valid URL: "${rawUrl}"`);
   }
 
   if (url.protocol !== 'https:' && !isLoopbackHost(url.hostname)) {
-    throw new Error(
+    throw new AttachmentUrlError(
       `attachment URL must use https:// (got "${url.protocol}//" for host "${url.hostname}").`,
     );
   }
 
   const origin = `${url.protocol}//${url.host}`;
   if (origin !== expectedOrigin) {
-    throw new Error(
+    throw new AttachmentUrlError(
       `attachment URL host "${origin}" is not the server this bridge is connected to (${expectedOrigin}). `
       + 'Refusing to fetch it. Use --api if the HTTP API is genuinely on another host.',
     );

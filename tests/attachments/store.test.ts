@@ -16,8 +16,8 @@ import {
 } from '../../src/attachments/store.js';
 
 describe('safeRequestDirName', () => {
-  it('keeps an ordinary request id intact', () => {
-    expect(safeRequestDirName('req_abc123')).toBe('req_abc123');
+  it('keeps an ordinary request id recognisable', () => {
+    expect(safeRequestDirName('req_abc123')).toMatch(/^req_abc123-[0-9a-f]{12}$/);
   });
 
   it('neutralises traversal in a request id', () => {
@@ -27,8 +27,28 @@ describe('safeRequestDirName', () => {
   });
 
   it('never returns an empty name', () => {
-    expect(safeRequestDirName('')).toBe('request');
+    expect(safeRequestDirName('')).not.toBe('');
     expect(safeRequestDirName('///')).not.toBe('');
+  });
+
+  it('gives DISTINCT ids distinct directories, however they sanitise', () => {
+    // The sanitiser alone is lossy — `req/1` and `req:1` both flatten to
+    // `req_1`, and long ids collide once truncated. Two turns sharing one
+    // directory means the first to finish deletes the other's attachments
+    // while its CLI is still reading them.
+    const collidingPairs: [string, string][] = [
+      ['req/1', 'req:1'],
+      ['req.1', 'req-1'],
+      [`req_${'a'.repeat(120)}_one`, `req_${'a'.repeat(120)}_two`],
+    ];
+
+    for (const [a, b] of collidingPairs) {
+      expect(safeRequestDirName(a)).not.toBe(safeRequestDirName(b));
+    }
+  });
+
+  it('is stable for the same id, so cleanup finds what the download wrote', () => {
+    expect(safeRequestDirName('req_abc123')).toBe(safeRequestDirName('req_abc123'));
   });
 });
 

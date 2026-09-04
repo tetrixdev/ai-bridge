@@ -119,16 +119,25 @@ export class ClaudeAdapter extends ProviderAdapter {
     // In `native` mode the operator's other MCP servers stay loadable and we
     // pass `--permission-mode bypassPermissions`, matching the legacy posture
     // for the developer-runs-bridge-against-own-machine case.
+    // `isolated` AND `workspace` both keep the operator's own MCP servers out.
+    // That is the half of isolation `workspace` does NOT relax: it widens what
+    // the model may do with the repository in front of it, not what else on
+    // this machine it can reach.
+    //
+    // Pushed OUTSIDE the `context.mcp` block on purpose. `mcp` is null whenever
+    // the bridge's own MCP server failed to start — and the turn still runs.
+    // Inside the block, that failure would silently drop the flag and let
+    // Claude load the operator's `~/.claude.json` and project `.mcp.json`
+    // servers, at the exact moment it is also running with bypassPermissions.
+    // The one path where isolation matters most must not be the one where it
+    // is skipped.
+    if (context.cliIsolation !== 'native') {
+      args.push('--strict-mcp-config');
+    }
+
     if (context.mcp) {
       const configPath = writeClaudeMcpConfig(context.mcp);
       args.push('--mcp-config', configPath);
-      // `isolated` AND `workspace` both keep the operator's own MCP servers
-      // out. That is the half of isolation `workspace` does NOT relax: it
-      // widens what the model may do with the repository in front of it, not
-      // what else on this machine it can reach.
-      if (context.cliIsolation !== 'native') {
-        args.push('--strict-mcp-config');
-      }
       if (context.cliIsolation === 'isolated') {
         // Glob is supported in --allowedTools matchers (per Claude CLI docs,
         // e.g. "Bash(git *)"). `mcp__<server>__*` is the standard MCP tool

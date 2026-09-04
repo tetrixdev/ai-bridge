@@ -14,7 +14,7 @@
 
 import { realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, delimiter, isAbsolute, resolve as resolvePath } from 'node:path';
+import { basename, delimiter, resolve as resolvePath } from 'node:path';
 import type { WorkspaceRef } from '../protocol/types.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -173,9 +173,4 @@ export function toWorkspaceRefs(roots: AllowedRoot[]): WorkspaceRef[] {
 /** Just the paths, which is all the containment check needs. */
 export function rootPaths(roots: AllowedRoot[]): string[] {
   return roots.map((r) => r.path);
-}
-
-/** True when a raw path is absolute and free of null bytes. */
-export function isUsablePath(input: string): boolean {
-  return input.length > 0 && !input.includes('\0') && isAbsolute(input);
 }

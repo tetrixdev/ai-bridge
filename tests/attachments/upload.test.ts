@@ -37,7 +37,7 @@ function ctx(overrides: Partial<UploadContext> = {}): UploadContext {
     workingDir,
     attachmentDir,
     apiOrigin: origin,
-    token: 'tok-xyz',
+    token: () => 'tok-xyz',
     maxFileBytes: 1024 * 1024,
     ...overrides,
   };

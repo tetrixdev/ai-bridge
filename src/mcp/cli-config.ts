@@ -177,7 +177,17 @@ export function acquireGeminiSettings(
   const settingsDir = join(workingDir, '.gemini');
   const path = join(settingsDir, 'settings.json');
 
-  if (geminiSettingsLocks.has(workingDir)) {
+  // Only managed directories are locked.
+  //
+  // Locking the bridge's own scratch directory would refuse the SECOND of any
+  // two concurrent Gemini turns on an install that never asked for workspaces,
+  // because getBridgeWorkingDir() hands every such turn the same directory —
+  // a visible regression in the default configuration, in exchange for a race
+  // that predates this feature. The race there is real (both turns write their
+  // own bearer token to one path) and is called out in the README; the fix for
+  // it is a per-turn scratch directory, which is a change to how every
+  // provider is spawned and does not belong in this commit.
+  if (managed && geminiSettingsLocks.has(workingDir)) {
     throw new Error(
       `another Gemini turn is already running in "${workingDir}". Gemini reads its MCP `
       + 'configuration from a file in the working directory, so two turns cannot share one. '
@@ -196,7 +206,9 @@ export function acquireGeminiSettings(
     );
   }
 
-  geminiSettingsLocks.add(workingDir);
+  if (managed) {
+    geminiSettingsLocks.add(workingDir);
+  }
   try {
     writeGeminiSettings(workingDir, conn);
   } catch (err) {

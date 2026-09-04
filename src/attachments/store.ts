@@ -11,6 +11,7 @@
  * path and a shell.
  */
 
+import { createHash } from 'node:crypto';
 import { mkdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { extname, join } from 'node:path';
@@ -31,8 +32,16 @@ export function attachmentsRoot(): string {
  * onto a filesystem path. `../../.ssh` is a perfectly good JSON string.
  */
 export function safeRequestDirName(requestId: string): string {
-  const cleaned = requestId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80);
-  return cleaned.length > 0 ? cleaned : 'request';
+  const cleaned = requestId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60);
+  // A short digest of the RAW id, because the sanitiser above is lossy in two
+  // ways: `req/1` and `req:1` both become `req_1`, and any two ids sharing a
+  // long prefix collide once truncated. Two concurrent turns sharing one
+  // directory is not a cosmetic problem — whichever finishes first deletes the
+  // other's files while its CLI is still reading the paths named in the
+  // preamble, and the model reports a file the user definitely attached as
+  // missing or corrupt.
+  const digest = createHash('sha256').update(requestId).digest('hex').slice(0, 12);
+  return `${cleaned.length > 0 ? cleaned : 'request'}-${digest}`;
 }
 
 /** The directory this request's attachments are written into. */
@@ -80,7 +89,9 @@ export function removeAttachmentDir(requestId: string): void {
  * @param id    The attachment id, used when nothing usable survives.
  */
 export function sanitiseAttachmentName(name: string, id: string): string {
-  const fallback = `attachment-${safeRequestDirName(id)}`;
+  // Not safeRequestDirName(): that one appends a digest to guarantee directory
+  // uniqueness, which is exactly what a human-readable filename does not want.
+  const fallback = `attachment-${id.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60) || 'file'}`;
 
   // Take the last segment under either separator convention.
   const lastSegment = name.split(/[/\\]/).pop() ?? '';
@@ -91,6 +102,10 @@ export function sanitiseAttachmentName(name: string, id: string): string {
     // confusing in a prompt preamble the model is about to read.
     // eslint-disable-next-line no-control-regex
     .replace(/[\x00-\x1f\x7f]/g, '')
+    // Trim FIRST, then strip leading dots. The other order lets " .bashrc"
+    // through: the dot-stripper sees a leading space, does nothing, and the
+    // trim then exposes the dot it was supposed to have removed.
+    .trim()
     .replace(/^\.+/, '')
     .trim();
 

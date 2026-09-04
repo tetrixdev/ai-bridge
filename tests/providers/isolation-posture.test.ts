@@ -140,11 +140,20 @@ describe('claude', () => {
     expect(args).toContain('bypassPermissions');
   });
 
-  it('in workspace with no server tools, still gets its permission mode', async () => {
-    // A workspace turn with no registered tools still has to be able to edit
-    // and run things; the posture must not depend on the tool list.
+  it('in workspace with no MCP channel, keeps BOTH halves of the posture', async () => {
+    // `mcp` is null when the bridge's own MCP server failed to start, and the
+    // turn still runs. Asserting only the permissive half would let
+    // `--strict-mcp-config` be skipped exactly there — loading the operator's
+    // own MCP servers at the same moment the CLI is bypassing permissions.
     const { args } = await launch(ClaudeAdapter, 'workspace', false);
     expect(args).toContain('bypassPermissions');
+    expect(args).toContain('--strict-mcp-config');
+  });
+
+  it('in isolated with no MCP channel, still refuses the operator own MCP servers', async () => {
+    const { args } = await launch(ClaudeAdapter, 'isolated', false);
+    expect(args).toContain('--strict-mcp-config');
+    expect(args).not.toContain('bypassPermissions');
   });
 });
 

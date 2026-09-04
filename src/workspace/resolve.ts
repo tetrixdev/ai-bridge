@@ -43,15 +43,34 @@ function describeRoots(allowedRoots: string[]): string {
  *
  * @param requested     `ai_request.working_dir`, or undefined for today's behaviour.
  * @param allowedRoots  Absolute, already symlink-resolved roots from `--allow-dir`.
+ * @param sessionDir    Where the CLI session being resumed was started, when
+ *                      the bridge still remembers it. Undefined for a fresh
+ *                      session, and for a resume after a bridge restart.
  * @returns The absolute path to spawn in.
  * @throws  RequestRefusal — the turn must not run. The caller reports the code
  *          as an `error` stream event and does not spawn.
  */
-export function resolveWorkingDir(requested: string | undefined, allowedRoots: string[]): string {
-  // 1. Nothing named: the empty scratch directory, exactly as before. This is
-  //    the whole of the old behaviour and the only path that reaches it.
+export function resolveWorkingDir(
+  requested: string | undefined,
+  allowedRoots: string[],
+  sessionDir?: string,
+): string {
+  // 1. Nothing named.
+  //
+  //    On a fresh turn that is the empty scratch directory, exactly as before,
+  //    and it is the only path that reaches it.
+  //
+  //    On a RESUME it is the directory the session already runs in. The server
+  //    is not required to resend `working_dir` on every turn — the protocol
+  //    says absent means "the default", and the session's own directory is
+  //    what the default means once a session exists. Treating absent as "the
+  //    scratch directory" instead would refuse the turn as `working_dir_changed`
+  //    with a message claiming the request asked for a temp directory it never
+  //    mentioned, and the documented recovery (start a fresh session) would
+  //    then quietly run in that empty directory — the outcome this whole
+  //    module exists to prevent.
   if (requested === undefined || requested === null || requested === '') {
-    return getBridgeWorkingDir();
+    return sessionDir ?? getBridgeWorkingDir();
   }
 
   // 2. The operator never opted in. Reported before anything is touched on
@@ -96,8 +115,15 @@ export function resolveWorkingDir(requested: string | undefined, allowedRoots: s
   //    session that worked, and the developer only finds out when the
   //    assistant reports that the repository is empty.
   let resolved: string;
+  let isDirectory: boolean;
   try {
     resolved = realpathSync(lexical);
+    // Inside the SAME try as the realpath. If the directory disappears between
+    // the two calls, a bare Error escapes — and on a resumed turn the bridge
+    // translates any non-refusal into `session_lost`, which tells the server to
+    // wipe the session and silently re-issue. A vanished directory would then
+    // be retried forever instead of reported once.
+    isDirectory = statSync(resolved).isDirectory();
   } catch {
     throw new RequestRefusal(
       WORKING_DIR_NOT_FOUND,
@@ -105,7 +131,7 @@ export function resolveWorkingDir(requested: string | undefined, allowedRoots: s
       + 'The bridge never creates it — check the path.',
     );
   }
-  if (!statSync(resolved).isDirectory()) {
+  if (!isDirectory) {
     throw new RequestRefusal(
       WORKING_DIR_NOT_FOUND,
       `The requested working directory "${requested}" is not a directory.`,
@@ -120,6 +146,23 @@ export function resolveWorkingDir(requested: string | undefined, allowedRoots: s
       WORKING_DIR_NOT_ALLOWED,
       `The requested working directory "${requested}" resolves to "${resolved}", `
       + `which is not inside a permitted root (${describeRoots(allowedRoots)}).`,
+    );
+  }
+
+  // 6. A working directory belongs to a CLI session for that session's whole
+  //    life. Resuming a session started elsewhere is incoherent — its history
+  //    is all about another checkout and the model has no way to know the
+  //    ground moved — so it is reported rather than papered over, and the
+  //    server starts a fresh session deliberately.
+  //
+  //    Compared against the RESOLVED path, so naming the same directory
+  //    through a symlink is not mistaken for a change.
+  if (sessionDir !== undefined && sessionDir !== resolved) {
+    throw new RequestRefusal(
+      WORKING_DIR_CHANGED,
+      `This conversation's CLI session was started in "${sessionDir}", but the request `
+      + `asks for "${resolved}". A session cannot change working directory. `
+      + 'Start a new conversation, or send this turn without resuming.',
     );
   }
 

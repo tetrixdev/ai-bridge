@@ -391,10 +391,24 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       );
     });
 
-    // Bridge-owned tools are registered once, here, rather than from the
-    // welcome handler — a welcome carrying a fresh server tool list must not
-    // be able to drop them.
-    this.mcpServer.setBridgeTools([ATTACH_FILE_TOOL_DEFINITION as unknown as import('./protocol/types.js').ToolDefinition]);
+  }
+
+  /**
+   * Register the bridge's own tools for the posture just adopted.
+   *
+   * Not in the constructor, because whether they are offered depends on the
+   * isolation posture, which arrives on the welcome. `isolated` is documented
+   * as "server-declared tools only", and a bridge-owned tool that performs a
+   * network upload is not a server-declared tool — offering it there would
+   * make the sentence false and would start an MCP server for a deployment
+   * that registered no tools at all, which used to configure none.
+   */
+  private registerBridgeTools(): void {
+    const tools = this.cliIsolation === 'isolated'
+      ? []
+      : [ATTACH_FILE_TOOL_DEFINITION as unknown as import('./protocol/types.js').ToolDefinition];
+
+    this.mcpServer.setBridgeTools(tools);
   }
 
   /**
@@ -972,9 +986,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // Adopt the server's CLI isolation posture. Older servers that don't
     // send the field get the safe default (`isolated`) — never the legacy
     // native behaviour.
-    this.cliIsolation = message.cli_isolation ?? 'isolated';
+    this.cliIsolation = this.adoptIsolation(message.cli_isolation);
     this.currentTools = message.tools;
     this.mcpServer.setTools(message.tools);
+    // After the posture is known — it decides whether they are offered at all.
+    this.registerBridgeTools();
     log.info('Welcome registered tools', {
       count: message.tools.length,
       cliIsolation: this.cliIsolation,
@@ -1058,6 +1074,56 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         });
       }
     }
+  }
+
+  /**
+   * Decide the isolation posture to actually run under.
+   *
+   * Two things happen here that must not be skipped.
+   *
+   * First, the value is VALIDATED against the three literals. Every adapter
+   * tests it with `!== 'isolated'` or `!== 'native'`, so an unrecognised
+   * string — a typo, a newer server, `"Isolated"` — would land in the
+   * permissive branch on one provider and the restrictive branch on another.
+   * Anything unknown becomes `isolated`.
+   *
+   * Second, `workspace` is GATED ON THE OPERATOR'S ALLOW-LIST. Without this
+   * the posture is a capability a server can switch on by sending a field:
+   * `workspace` is what adds `bypassPermissions` / `workspace-write` /
+   * `--yolo`, and none of those care whether a working directory was named.
+   * A bridge started with no `--allow-dir` would then still hand a hostile
+   * server a shell — in the empty scratch directory, from which `cd ~/.ssh`
+   * is one command — while the README promised that such a bridge "cannot be
+   * pointed anywhere". The allow-list has to gate the capability, not just
+   * the cwd, or the sentence is not true.
+   *
+   * This mirrors the `--local-tools` gate exactly: the operator opts in, and
+   * no server can turn it on by sending a field.
+   */
+  private adoptIsolation(requested: CliIsolation | undefined): CliIsolation {
+    if (requested === undefined) {
+      // An older server that does not send the field gets the safe default,
+      // never the legacy native behaviour.
+      return 'isolated';
+    }
+
+    if (requested !== 'isolated' && requested !== 'native' && requested !== 'workspace') {
+      log.warn('Server sent an unrecognised cli_isolation — falling back to isolated', {
+        received: String(requested),
+      });
+      return 'isolated';
+    }
+
+    if (requested === 'workspace' && this.allowedRoots.length === 0) {
+      log.warn(
+        'Server asked for `workspace` isolation, but this bridge was started without --allow-dir. '
+        + 'Running `isolated` instead: workspace mode gives the CLI a shell on this machine, and '
+        + 'that is the operator\'s decision to make, not the server\'s. Pass --allow-dir <path> to enable it.',
+      );
+      return 'isolated';
+    }
+
+    return requested;
   }
 
   /**
@@ -1256,34 +1322,33 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       });
     }
 
-    // Where this turn runs. A refusal here throws and the turn never spawns —
-    // there is deliberately no fallback to the scratch directory, because a
-    // turn that runs in the wrong place looks exactly like one that worked.
-    const workingDir = resolveWorkingDir(request.working_dir, this.allowedRootPaths);
+    // Everything from here is inside the try whose `finally` revokes the
+    // per-spawn MCP token and clears the attachment directory. The refusals
+    // below throw, and a throw that escaped before the try was entered would
+    // leave a live credential in the MCP server's token map for the life of
+    // the process — one per refused turn, never collected — and any
+    // part-downloaded attachments on disk.
+    try {
+      // Where this turn runs. A refusal here throws and the turn never spawns:
+      // there is deliberately no fallback to the scratch directory, because a
+      // turn that runs in the wrong place looks exactly like one that worked.
+      //
+      // The session's own directory is passed in so a resume can be checked
+      // against it — and so a resume that names NOTHING keeps the directory it
+      // has rather than being told it moved to the scratch dir.
+      const workingDir = resolveWorkingDir(
+        request.working_dir,
+        this.allowedRootPaths,
+        cliSessionId !== null ? this.sessionWorkingDirs.get(cliSessionId) : undefined,
+      );
 
-    // A working directory belongs to a CLI session for that session's whole
-    // life. Resuming a session that was started elsewhere is incoherent: the
-    // history is all about another checkout, and the model has no way to know
-    // the ground moved. Report it and let the server start a fresh session
-    // deliberately rather than papering over it here.
-    if (cliSessionId !== null) {
-      const startedIn = this.sessionWorkingDirs.get(cliSessionId);
-      if (startedIn !== undefined && startedIn !== workingDir) {
-        throw new RequestRefusal(
-          WORKING_DIR_CHANGED,
-          `This conversation's CLI session was started in "${startedIn}", but the request `
-          + `asks for "${workingDir}". A session cannot change working directory. `
-          + 'Start a new conversation, or send this turn without resuming.',
-        );
-      }
-    }
-
-    // Attachments land on disk before the CLI starts, so the preamble below
-    // can name paths that already exist.
-    let saved: SavedAttachment[] = [];
-    const attachments = request.attachments ?? [];
-    if (attachments.length > 0) {
-      try {
+      // Attachments land on disk before the CLI starts, so the preamble below
+      // can name paths that already exist. The cleanup for a failure part-way
+      // through is the same `finally` that handles every other outcome, so a
+      // refused turn leaves nothing behind either.
+      let saved: SavedAttachment[] = [];
+      const attachments = request.attachments ?? [];
+      if (attachments.length > 0) {
         saved = await fetchAttachments({
           attachments,
           requestId: request_id,
@@ -1292,23 +1357,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
           limits: this.attachmentLimits,
           signal,
         });
-      } catch (err) {
-        // A failure part-way through leaves whatever already downloaded on
-        // disk. The try/finally below never runs for this path — it has not
-        // been entered yet — so the partial files are cleared here instead of
-        // being left behind by every refused turn.
-        if (!this.keepAttachments) {
-          try {
-            removeAttachmentDir(request_id);
-          } catch {
-            // Best-effort: the original failure is the one worth reporting.
-          }
-        }
-        throw err;
       }
-    }
 
-    try {
       // Tell the model what was saved and where. Without this the files are
       // present and invisible, and the turn answers as if nothing had been
       // attached.
@@ -1322,8 +1372,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         workingDir,
         attachmentDir: saved.length > 0 ? attachmentDirFor(request_id) : null,
         apiOrigin: this.apiOrigin,
-        token: this.token,
+        // A getter, not the current value — see UploadContext.token.
+        token: () => this.token,
         maxFileBytes: this.attachmentLimits.maxFileBytes,
+        signal,
       });
 
       // Build execution context
@@ -1394,7 +1446,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // Attachments go on every terminal outcome — done, error and cancelled
       // alike. Cleaning up only on success would grow the cache without bound
       // precisely on the machines where things go wrong most.
-      if (saved.length > 0 && !this.keepAttachments) {
+      if ((request.attachments?.length ?? 0) > 0 && !this.keepAttachments) {
         try {
           removeAttachmentDir(request_id);
         } catch (err) {

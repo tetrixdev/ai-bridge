@@ -280,7 +280,13 @@ How much of the operator's local environment the spawned CLI may see, and what i
 
 `--skip-git-repo-check` on Codex exists because the pinned scratch cwd is not a repository. Inside a real checkout it is a no-op; it is left in place because it is still correct for the scratch case.
 
+**`workspace` is refused unless the operator opted in.** A bridge started without `--allow-dir` runs `isolated` instead and logs why. This is not a formality: `workspace` is what enables the shell, and a shell in the empty scratch directory is still a shell — so if the allow-list bounded only the working directory, a server could switch the capability on by sending this field. It cannot. Same rule as `--local-tools`.
+
+An unrecognised value — a typo, a newer server — is also treated as `isolated` rather than passed to the adapters, which test it with `!== 'isolated'` and would otherwise land in the permissive branch on one CLI and the restrictive branch on another.
+
 The system prompt behaves in `workspace` exactly as in `isolated`: the server's prompt when there is one, the neutral fallback when there is not. Only `native` lets the CLI's own default through.
+
+`bridge__attach_file` is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else, which is what the row above says and what it should keep meaning.
 
 **Gemini and `working_dir`.** Gemini is the one CLI with no per-invocation MCP config flag — it reads `.gemini/settings.json` from cwd. When cwd is a developer's checkout the bridge therefore writes into it, and handles that explicitly: it **refuses the turn rather than overwriting** a settings file the repository already has, removes the one it wrote when the turn ends (`done`, `error` or `cancel`), and removes the `.gemini` directory too if it created it and nothing else is in it. Because there is only one such path per directory and the file carries a per-spawn bearer token, **two concurrent Gemini turns in one directory are refused** rather than allowed to race — the loser would otherwise read the winner's credential and have its tool calls routed to the other turn's request.
 
@@ -541,18 +547,19 @@ It is honoured **only** when the operator started the bridge with `--allow-dir` 
 
 | Condition | Result |
 |---|---|
-| Absent | The empty scratch directory, as before. |
+| Absent, on a fresh session | The empty scratch directory, as before. |
+| Absent, on a resume | The directory that session already runs in. The server is **not** required to resend `working_dir` every turn. |
 | Bridge started without `--allow-dir` | `working_dir_not_allowed` |
 | Not absolute, or contains a null byte | `working_dir_not_allowed` |
 | Resolves outside every allowed root (after `realpath`, so a symlink inside a root that points out of it is caught) | `working_dir_not_allowed` |
 | Inside an allowed root but does not exist, or is not a directory | `working_dir_not_found`. **The bridge never creates it.** |
-| Differs from the directory the resumed `cli_session_id` was started in | `working_dir_changed` |
+| Present, and differs from the directory the resumed `cli_session_id` was started in | `working_dir_changed` |
 
 There is deliberately **no silent fallback to the scratch directory**. A turn that quietly ran in an empty directory looks exactly like a turn that worked, and every answer in it is wrong.
 
 A path outside the allow-list is reported identically whether or not it exists, so the bridge cannot be used as a filesystem probe.
 
-**A working directory belongs to a CLI session for that session's life.** Resuming a session started elsewhere is incoherent — its history is all about another checkout — so it is refused with `working_dir_changed` and the server starts a fresh session deliberately. A bridge that has no record of the session (it restarted) resumes normally.
+**A working directory belongs to a CLI session for that session's life.** Resuming a session started elsewhere is incoherent — its history is all about another checkout — so it is refused with `working_dir_changed` and the server starts a fresh session deliberately. A bridge that has no record of the session (it restarted) resumes normally, and a resume that names nothing keeps the directory the session already has.
 
 **Consequence, and it is intended:** once `working_dir` is a real checkout, that repository's own `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` load, because the CLIs read them from cwd. That is the point of working in a checkout, not a leak. User-level files (`~/.claude/CLAUDE.md`) are a separate matter and load regardless — see `cli_isolation`.
 
@@ -804,6 +811,8 @@ A file the assistant produced and chose to hand back. Emitted when the model cal
 ```
 
 `id` is the identifier the server assigned when the bridge uploaded the file to `POST /ai-bridge/attachments`, so the UI can render it from the server's own attachment store. A server that does not understand the event ignores it.
+
+The tool is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else.
 
 The model has to nominate the file, and that is not a limitation to work around: a transport cannot guess which of the hundred files a turn just touched is the answer. The path it names must resolve — **after `realpath`, because in `workspace` mode the model has a shell and can create a symlink** — inside the working directory or that turn's attachment directory, and it is subject to the same per-file cap and the same host binding as the inbound direction.
 

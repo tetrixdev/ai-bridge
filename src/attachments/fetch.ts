@@ -17,7 +17,7 @@ import { createWriteStream } from 'node:fs';
 import { join } from 'node:path';
 import type { AttachmentRef } from '../protocol/types.js';
 import { RequestRefusal } from '../errors.js';
-import { assertAllowedAttachmentUrl } from './origin.js';
+import { assertAllowedAttachmentUrl, AttachmentUrlError } from './origin.js';
 import { disambiguate, ensureAttachmentDir, sanitiseAttachmentName } from './store.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -156,7 +156,27 @@ async function downloadOne(
         }
         hash.update(value);
         if (!sink.write(value)) {
-          await new Promise<void>((resolve) => sink.once('drain', resolve));
+          // Raced against error and abort, never awaited bare. A write stream
+          // that has failed (ENOSPC, quota) emits `error` and then never emits
+          // `drain` — a bare await would park here forever, with no `done` and
+          // no `error` ever reaching the server, and the provider timeout not
+          // yet started because the CLI has not been spawned.
+          await new Promise<void>((resolve, reject) => {
+            const onDrain = () => { cleanup(); resolve(); };
+            const onError = (err: Error) => { cleanup(); reject(err); };
+            const onAbort = () => {
+              cleanup();
+              reject(new Error('download aborted'));
+            };
+            const cleanup = () => {
+              sink.off('drain', onDrain);
+              sink.off('error', onError);
+              fetchSignal.removeEventListener('abort', onAbort);
+            };
+            sink.once('drain', onDrain);
+            sink.once('error', onError);
+            fetchSignal.addEventListener('abort', onAbort, { once: true });
+          });
         }
       }
       await new Promise<void>((resolve) => sink.end(() => resolve()));
@@ -256,8 +276,10 @@ export async function fetchAttachments(opts: {
       // A URL the bridge will not touch is a different thing from a download
       // that went wrong, and the operator reading the log needs to tell them
       // apart: one is a misconfigured (or hostile) server, the other is a
-      // network.
-      const code = message.startsWith('attachment URL') ? ATTACHMENT_REFUSED : ATTACHMENT_FAILED;
+      // network. Decided by the error's TYPE, not by matching its prose —
+      // rewording a message must not silently reclassify a host-binding
+      // refusal as a transient failure the server may then retry.
+      const code = err instanceof AttachmentUrlError ? ATTACHMENT_REFUSED : ATTACHMENT_FAILED;
       throw new RequestRefusal(code, `Attachment "${ref.name}" could not be fetched: ${message}`);
     }
 
