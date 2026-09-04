@@ -37,14 +37,23 @@ specified against:
   arrives on disk with a matching checksum, the model reads it, and the
   directory is gone afterwards.
 
-## A caveat worth knowing before you trust a green run
+- with `--with-cli`: an `isolated` turn cannot read a file outside its working
+  directory, **while server-declared tools still work** — the two halves of the
+  isolation guarantee, checked on the machine you are running this on.
 
-`isolated` is enforced by the provider CLI's own permission system, not by the
-bridge. Claude Code reads `~/.claude/settings.json`, and the bridge does not
-suppress it. If yours sets `permissions.defaultMode` to `auto`, `acceptEdits`
-or `bypassPermissions`, an `isolated` turn has shell, read and write whatever
-the bridge asked for — and these checks will still pass, because they assert
-what the bridge sends, not what your local settings then do with it.
+## Why the isolation checks are here rather than in the unit suite
 
-Check with `cat ~/.claude/settings.json` before drawing conclusions about
-isolation from a green run here.
+`isolated` is enforced by the provider CLI's permission system, not by the
+bridge, and that system reads the operator's own configuration
+(`~/.claude/settings.json`, `~/.codex/config.toml`). The bridge therefore states
+the posture explicitly — `--permission-mode manual` for Claude,
+`sandbox_mode=read-only` for Codex — so a permissive local default cannot widen
+what a server may do.
+
+A unit test can only assert that the bridge *sends* those flags. Whether the CLI
+then honours them, on this machine, with this configuration, is a question only a
+real run can answer — and it is the question that matters if your server is
+reachable by people you do not trust. That is what the two `isolated` checks do.
+
+Gemini has no equivalent lever, so it is not covered: an `isolated` Gemini turn
+is bounded by Gemini's own defaults. Do not offer Gemini to untrusted callers.

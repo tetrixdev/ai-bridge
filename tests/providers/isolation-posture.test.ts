@@ -124,6 +124,17 @@ describe('claude', () => {
     expect(args).not.toContain('bypassPermissions');
   });
 
+  it('in isolated, states the permission mode instead of trusting the operator settings', async () => {
+    // --allowedTools only asks; the denial comes from Claude's permission
+    // system, which reads the operator's ~/.claude/settings.json. A developer
+    // who set `permissions.defaultMode: "auto"` for their own work turns
+    // `isolated` into "everything allowed" for every turn a server sends them.
+    // Verified against 2.1.260 both ways.
+    const { args } = await launch(ClaudeAdapter, 'isolated');
+    expect(args).toContain('--permission-mode');
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('manual');
+  });
+
   it('in workspace, keeps strict-mcp-config but allows the built-in tools', async () => {
     const { args } = await launch(ClaudeAdapter, 'workspace');
     // The operator's own MCP servers stay out — that half of isolation holds.
@@ -188,8 +199,12 @@ describe('claude', () => {
 });
 
 describe('codex', () => {
-  it('in isolated, leaves the sandbox at its read-only default', async () => {
+  it('in isolated, states the read-only sandbox rather than assuming it', async () => {
+    // The default is read from the operator's ~/.codex/config.toml, so an
+    // operator who set danger-full-access there for their own work would hand
+    // every isolated turn full access. The posture has to be asserted.
     const { args } = await launch(CodexAdapter, 'isolated');
+    expect(hasConfig(args, 'sandbox_mode=read-only')).toBe(true);
     expect(hasConfig(args, 'sandbox_mode=workspace-write')).toBe(false);
     expect(hasConfig(args, 'sandbox_mode=danger-full-access')).toBe(false);
   });

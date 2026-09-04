@@ -179,6 +179,21 @@ export class CodexAdapter extends ProviderAdapter {
         '-c', 'sandbox_mode=danger-full-access',
         '-c', 'approval_policy=never',
       );
+    } else if (context.cliIsolation === 'isolated') {
+      // Stated explicitly rather than left to codex's default, for the same
+      // reason Claude is given an explicit permission mode above: the default
+      // is read from the OPERATOR's `~/.codex/config.toml`, so an operator who
+      // set `sandbox_mode = danger-full-access` there for their own work would
+      // silently hand every `isolated` turn full access to their machine. The
+      // posture has to be something the bridge asserts, not something it hopes
+      // the local configuration happens to agree with.
+      //
+      // NOTE: reasoned, not measured — codex is not installed on the machine
+      // this was developed on, so unlike the Claude equivalent it has not been
+      // verified against the real CLI. `read-only` is the value codex's own
+      // documentation names for this, and it is the default the adapter has
+      // always assumed.
+      args.push('-c', 'sandbox_mode=read-only');
     } else if (context.cliIsolation === 'workspace') {
       // `workspace-write`, explicitly NOT `danger-full-access`: codex may
       // write inside the directory it was pointed at, and reaching outside it

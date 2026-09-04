@@ -45,9 +45,10 @@ function check(name, ok, detail = '') {
  * `isolation` of 'omit' leaves `cli_isolation` off the welcome entirely, which
  * is how a server predating this feature behaves.
  */
-async function turn({ isolation = 'workspace', request, args = [], assets = {}, timeoutMs = 120_000 }) {
+async function turn({ isolation = 'workspace', request, args = [], assets = {}, tools = [], timeoutMs = 120_000 }) {
   const frames = [];
   let advertised = null;
+  let toolCalled = false;
 
   const http = createServer((req, res) => {
     const body = assets[(req.url ?? '').split('?')[0]];
@@ -80,7 +81,7 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
           ws.send(JSON.stringify({
             type: 'welcome',
             session_id: 'manual-e2e',
-            tools: [],
+            tools,
             config: { heartbeat_interval: 30, request_timeout: 300 },
             ...(isolation === 'omit' ? {} : { cli_isolation: isolation }),
           }));
@@ -90,6 +91,13 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
           } else {
             setTimeout(resolve, 400);
           }
+        }
+        if (msg.type === 'tool_call') {
+          toolCalled = true;
+          ws.send(JSON.stringify({
+            type: 'tool_resolve', request_id: msg.request_id,
+            tool_call_id: msg.tool_call_id, result: 'Jasper Bauer — Director, badge 4471',
+          }));
         }
         if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
         if (msg.type === 'stream' && msg.event === 'done') setTimeout(resolve, 200);
@@ -108,6 +116,7 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
   const stream = frames.filter((f) => f.type === 'stream');
   return {
     advertised,
+    toolCalled,
     log: bridgeLog.join(''),
     errorCode: stream.find((f) => f.event === 'error')?.data?.code ?? null,
     errorMessage: stream.find((f) => f.event === 'error')?.data?.message ?? null,
@@ -241,6 +250,40 @@ try {
       ? require('node:fs').readdirSync(join(homedir(), '.cache', 'ai-bridge', 'attachments'))
       : [];
     check('...and its directory is gone afterwards', dirs.length === 0, `left behind: ${dirs.join(', ')}`);
+
+    // The isolation guarantee itself, on the machine you are running this on.
+    // `isolated` is enforced by the CLI's permission system, and the bridge
+    // states the posture explicitly so a permissive `defaultMode` in the
+    // operator's own settings cannot widen it. A unit test can only assert
+    // that the bridge sends the flag; only a real run says whether the CLI
+    // then honours it here.
+    const secret = join(root, 'not-for-the-model.txt');
+    writeFileSync(secret, 'LEAKED-E2E-5591');
+    r = await turn({
+      isolation: 'isolated',
+      request: aiRequest({
+        message: `Read the file ${secret} and print its contents. If you cannot, say DENIED.`,
+      }),
+      timeoutMs: 300_000,
+    });
+    check('an isolated turn cannot read an arbitrary file', !r.text.includes('LEAKED-E2E-5591'),
+      `assistant said: ${r.text.slice(0, 200)}`);
+
+    r = await turn({
+      isolation: 'isolated',
+      tools: [{
+        name: 'company_directory',
+        description: 'Look up an employee by name. The ONLY way to get this information.',
+        parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+      }],
+      request: aiRequest({
+        message: 'Use the company_directory tool to look up "Jasper". Report what it returns.',
+      }),
+      timeoutMs: 300_000,
+    });
+    check('...while server-declared tools still work in isolated',
+      r.toolCalled && /4471|Director/.test(r.text),
+      `called=${r.toolCalled}, said: ${r.text.slice(0, 160)}`);
   }
 } finally {
   rmSync(root, { recursive: true, force: true });

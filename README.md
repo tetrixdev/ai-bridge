@@ -63,23 +63,27 @@ handshake. [PROTOCOL.md](PROTOCOL.md) gives the per-CLI flags; the shape is:
 | `workspace` | **also use its own file and shell tools**, in the directory the server named. | stays out — your MCP servers, hooks and plugins are still excluded. |
 | `native` | do anything the CLI can do. | is fully in play. |
 
-> **`isolated` is enforced by the CLI, not by the bridge, and your own settings
-> can switch it off.** The bridge passes `--allowedTools mcp__bridge__*` and
-> relies on Claude Code denying everything else. That denial comes from Claude's
-> permission system, which reads `~/.claude/settings.json` — and the bridge does
-> not suppress it (`--bare` would, but it breaks subscription auth; see the note
-> in `src/providers/claude.ts`).
+> **What `isolated` does and does not enforce.** The bridge states the posture
+> explicitly rather than trusting whatever the CLI happens to be configured to
+> do: Claude is run with `--permission-mode manual` and Codex with
+> `sandbox_mode=read-only`, so a `permissions.defaultMode: "auto"` in your
+> `~/.claude/settings.json` — or a permissive `~/.codex/config.toml` — no
+> longer widens what a server can do on your machine. Verified against Claude
+> 2.1.260 both ways: with the flag an isolated turn is denied an arbitrary file
+> read and an arbitrary shell command; without it, that same setting allowed
+> both.
 >
-> So if your user-level settings set `permissions.defaultMode` to `auto`,
-> `acceptEdits` or `bypassPermissions`, an `isolated` turn gets shell, read and
-> write on your machine regardless of what the bridge asked for. Verified
-> against Claude 2.1.260: with `defaultMode: "auto"` an `isolated` turn read
-> `~/.bashrc` and ran `cat` on an arbitrary path; with the default mode both
-> were denied.
+> **Gemini is the exception.** It offers no equivalent lever — `--yolo` is on or
+> off, and its built-in tools otherwise stall on an approval that headless mode
+> cannot answer — so an `isolated` Gemini turn is bounded by Gemini's own
+> defaults and by whatever is in `~/.gemini/settings.json`. If your server is
+> reachable by people you do not trust, do not offer Gemini.
 >
-> Check with `cat ~/.claude/settings.json` before pointing a bridge at a server
-> you do not fully trust. This applies on `main` too — it is not something this
-> feature introduced.
+> **What still leaks in `isolated`, on every provider:** user-level instruction
+> files, skills, hooks and plugins load, because suppressing them needs `--bare`
+> (Claude) or HOME redirection, and `--bare` breaks subscription auth. Those are
+> the operator's own configuration rather than something a server chooses, but
+> they do shape the turn.
 
 **Both of the permissive postures require an operator opt-in.** `workspace`
 needs `--allow-dir`; `native` needs `--allow-native`. A bridge started without

@@ -189,7 +189,25 @@ export class ClaudeAdapter extends ProviderAdapter {
     // is a shell command, so "edit the file and run the tests" stops halfway
     // with no error anyone can see. See the security note in the README —
     // this is not a sandbox and is not described as one.
-    if (context.cliIsolation !== 'isolated') {
+    if (context.cliIsolation === 'isolated') {
+      // `manual` is what actually enforces `isolated`, and without it the
+      // posture is only as strong as the operator's own Claude settings.
+      //
+      // The bridge asks for a restricted tool surface with --allowedTools and
+      // relies on Claude to deny the rest. That denial comes from Claude's
+      // permission system, which reads ~/.claude/settings.json — so a
+      // developer who set `permissions.defaultMode: "auto"` to stop being
+      // prompted in their own work silently turns `isolated` into "everything
+      // allowed", on every turn a server sends them. Verified against 2.1.260:
+      // with that setting an isolated turn read an arbitrary file and ran an
+      // arbitrary shell command; with this flag both are denied.
+      //
+      // `manual` rather than dropping the settings file wholesale
+      // (--setting-sources) because auth lives in there too: an operator using
+      // apiKeyHelper would lose their credentials, which is the trap --bare
+      // already falls into and the reason this adapter cannot use it.
+      args.push('--permission-mode', 'manual');
+    } else {
       args.push('--permission-mode', 'bypassPermissions');
     }
 
