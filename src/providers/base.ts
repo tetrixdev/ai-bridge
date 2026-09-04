@@ -64,6 +64,14 @@ export interface ExecutionContext {
   requestTimeoutSeconds: number;
   /** CLI session ID if resuming, or null for new session. */
   cliSessionId: string | null;
+  /**
+   * Whether this turn has attachment files on disk for the model to read.
+   *
+   * Adapters that restrict the tool surface need to know: telling a model
+   * "the user attached a file, read it at this path" while its file-reading
+   * tool is denied produces a turn that fails for a reason nothing reports.
+   */
+  hasAttachments: boolean;
 }
 
 /**

@@ -145,7 +145,21 @@ export class ClaudeAdapter extends ProviderAdapter {
     // prefix Claude uses. Omitted in `workspace`, where the built-in Read /
     // Edit / Write / Bash tools are exactly what we want.
     if (context.cliIsolation === 'isolated') {
-      args.push('--allowedTools', `mcp__${BRIDGE_MCP_SERVER_NAME}__*`);
+      // A turn carrying attachments also needs the read-only file tools, or
+      // the preamble names paths the model is not permitted to open and the
+      // turn ends with it saying it cannot see a file the user just attached —
+      // with nothing in the logs pointing at this flag. Read-only only: no
+      // Write, no Edit, no Bash. The files live in the bridge's own cache
+      // directory, so this does not widen what an isolated turn can reach on
+      // the rest of the machine.
+      //
+      // Comma-separated in ONE argv value rather than several: this flag is
+      // variadic, and a bare list would let it swallow the flag that follows.
+      const allowed = [`mcp__${BRIDGE_MCP_SERVER_NAME}__*`];
+      if (context.hasAttachments) {
+        allowed.push('Read', 'Glob', 'Grep');
+      }
+      args.push('--allowedTools', allowed.join(','));
     }
 
     if (context.mcp) {

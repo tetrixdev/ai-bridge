@@ -34,17 +34,65 @@ const log = createLogger('CLI');
 /**
  * Parse a megabyte option into bytes.
  *
- * Exits rather than falling back to a default: a mistyped cap that silently
+ * Throws rather than falling back to a default: a mistyped cap that silently
  * becomes 25 MB is one nobody notices until a large attachment is refused for
  * reasons that make no sense.
  */
 function parseMegabytes(raw: string, flag: string): number {
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) {
-    log.error(`${flag} must be a positive number of megabytes (got "${raw}")`);
-    process.exit(1);
+    throw new Error(`${flag} must be a positive number of megabytes (got "${raw}")`);
   }
   return Math.floor(value * 1024 * 1024);
+}
+
+/** The parts of BridgeOptions the operator's own flags decide. */
+export interface OperatorPosture {
+  allowedRoots: AllowedRoot[];
+  apiOrigin: string;
+  attachmentLimits: { maxFileBytes: number; maxTotalBytes: number };
+  allowNative: boolean;
+  keepAttachments: boolean;
+}
+
+/** Just the option fields this mapping reads. */
+export interface OperatorOptions {
+  allowDir: string[];
+  api?: string;
+  allowNative: boolean;
+  keepAttachments: boolean;
+  attachmentMaxMb: string;
+  attachmentTotalMb: string;
+}
+
+/**
+ * Turn the operator's flags into the options that decide what a server may do.
+ *
+ * A named, exported, pure function rather than five expressions inline in the
+ * action handler — because this is the single most load-bearing wire in the
+ * package and nothing could reach it otherwise. Hardcoding `allowNative: true`
+ * in the handler used to leave the whole suite green: every test builds a
+ * `Bridge` directly, so they prove `adoptIsolation` honours the field and
+ * never that the flag reaches it. A rename on either side of that assignment
+ * silently opens or closes the gate.
+ *
+ * @throws Error when an option is unusable. The caller reports and exits.
+ */
+export function resolveOperatorPosture(
+  opts: OperatorOptions,
+  serverUrl: string,
+  env: NodeJS.ProcessEnv,
+): OperatorPosture {
+  return {
+    allowedRoots: buildAllowedRoots(opts.allowDir, env['AI_BRIDGE_ALLOWED_DIRS']),
+    apiOrigin: resolveApiOrigin(serverUrl, opts.api),
+    attachmentLimits: {
+      maxFileBytes: parseMegabytes(opts.attachmentMaxMb, '--attachment-max-mb'),
+      maxTotalBytes: parseMegabytes(opts.attachmentTotalMb, '--attachment-total-mb'),
+    },
+    allowNative: opts.allowNative,
+    keepAttachments: opts.keepAttachments,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -332,13 +380,14 @@ program
       );
     }
 
-    let allowedRoots: AllowedRoot[] = [];
+    let operatorPosture: OperatorPosture;
     try {
-      allowedRoots = buildAllowedRoots(opts.allowDir, process.env['AI_BRIDGE_ALLOWED_DIRS']);
+      operatorPosture = resolveOperatorPosture(opts, serverUrl, process.env);
     } catch (err) {
       log.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
+    const { allowedRoots, apiOrigin, attachmentLimits } = operatorPosture;
 
     if (allowedRoots.length > 0) {
       log.warn(
@@ -350,19 +399,6 @@ program
         log.info(`  workspace: ${root.label} → ${root.path}`);
       }
     }
-
-    let apiOrigin: string;
-    try {
-      apiOrigin = resolveApiOrigin(serverUrl, opts.api);
-    } catch (err) {
-      log.error(err instanceof Error ? err.message : String(err));
-      process.exit(1);
-    }
-
-    const attachmentLimits = {
-      maxFileBytes: parseMegabytes(opts.attachmentMaxMb, '--attachment-max-mb'),
-      maxTotalBytes: parseMegabytes(opts.attachmentTotalMb, '--attachment-total-mb'),
-    };
 
     const bridge = new Bridge({
       serverUrl,
@@ -377,8 +413,8 @@ program
       allowedRoots,
       apiOrigin,
       attachmentLimits,
-      keepAttachments: opts.keepAttachments,
-      allowNative: opts.allowNative,
+      keepAttachments: operatorPosture.keepAttachments,
+      allowNative: operatorPosture.allowNative,
     });
 
     // Lifecycle logging

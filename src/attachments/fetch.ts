@@ -31,6 +31,17 @@ export const ATTACHMENT_FAILED = 'attachment_failed';
 /** How long a single attachment download may take. */
 const DOWNLOAD_TIMEOUT_MS = 120_000;
 
+/**
+ * How many files one turn may carry.
+ *
+ * The byte caps bound what lands on disk; they do not bound how long the turn
+ * waits. Downloads run in sequence with their own timeout, and the CLI has not
+ * been spawned yet, so the request timeout is not running either — five
+ * hundred attachments from a slow endpoint would hold the request open for
+ * most of a day.
+ */
+const MAX_ATTACHMENTS = 50;
+
 /** Caps on what one turn may pull onto the machine. */
 export interface AttachmentLimits {
   /** Largest single file, in bytes. */
@@ -237,6 +248,13 @@ export async function fetchAttachments(opts: {
 
   // Refuse on the declared sizes before touching the network, so an obviously
   // oversized request costs nothing.
+  if (attachments.length > MAX_ATTACHMENTS) {
+    throw new RequestRefusal(
+      ATTACHMENT_TOO_LARGE,
+      `The turn carries ${attachments.length} attachments, over the ${MAX_ATTACHMENTS} per-request limit.`,
+    );
+  }
+
   const declaredTotal = attachments.reduce((sum, a) => sum + (a.size ?? 0), 0);
   if (declaredTotal > limits.maxTotalBytes) {
     throw new RequestRefusal(

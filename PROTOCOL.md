@@ -60,11 +60,18 @@ Same as BYOK, but the application provides its own API key. Users pay the app a 
 
 ### WebSocket Establishment
 
-The bridge connects to the server's WebSocket endpoint:
+The bridge connects to the WebSocket address the server hands it. The Laravel
+package's dedicated WebSocket server listens on its own port and serves the
+connection at the origin root, so the address is an origin rather than a path:
 
 ```
-wss://{host}/api/ai-bridge/ws?token={connection_token}
+wss://{host}:{port}?token={connection_token}
 ```
+
+The exact value comes from the server (`ai-bridge.server.public_url` when set,
+otherwise `ws://{host}:{port}`) and is whatever the operator passes to
+`--server`. The token also travels as an `Authorization: Bearer` header; the
+query parameter is kept for servers that have not adopted the header.
 
 The `connection_token` is a short-lived JWT obtained by the user through the web application's settings page. It encodes:
 
@@ -381,6 +388,13 @@ The bridge replaces its current token with this value and uses it for subsequent
 
 ## Local Calls
 
+> **Bridge-side only.** These frames are implemented in `@tetrixdev/ai-bridge`;
+> `tetrixdev/laravel-ai-bridge` does not send or understand them, and a bridge
+> that emits a `local_result` at it has the message logged as an unknown type
+> and dropped. They are documented here because both packages share this file
+> and a reader should know the protocol is this size — not because the Laravel
+> server implements this half.
+
 A `local_call` is the server asking the bridge to run one tool on the operator's
 machine, directly. Unlike a `welcome`-registered local tool it is not something
 a model decided to call: it is a panel, a job or a button invoking a tool a
@@ -550,7 +564,7 @@ It is honoured **only** when the operator started the bridge with `--allow-dir` 
 | Condition | Result |
 |---|---|
 | Absent, on a fresh session | The empty scratch directory, as before. |
-| Absent, on a resume | The directory that session already runs in. The server is **not** required to resend `working_dir` every turn. |
+| Absent, on a resume | The directory that session already runs in. Servers **should** resend `working_dir` on every turn anyway — see the note below. |
 | Bridge started without `--allow-dir` | `working_dir_not_allowed` |
 | Not absolute, or contains a null byte | `working_dir_not_allowed` |
 | Resolves outside every allowed root (after `realpath`, so a symlink inside a root that points out of it is caught) | `working_dir_not_allowed` |
@@ -561,7 +575,11 @@ There is deliberately **no silent fallback to the scratch directory**. A turn th
 
 A path outside the allow-list is reported identically whether or not it exists, so the bridge cannot be used as a filesystem probe.
 
-**A working directory belongs to a CLI session for that session's life.** Resuming a session started elsewhere is incoherent — its history is all about another checkout — so it is refused with `working_dir_changed` and the server starts a fresh session deliberately. A bridge that has no record of the session (it restarted) resumes normally, and a resume that names nothing keeps the directory the session already has.
+**A working directory belongs to a CLI session for that session's life.** Resuming a session started elsewhere is incoherent — its history is all about another checkout — so it is refused with `working_dir_changed` and the server starts a fresh session deliberately.
+
+A resume that names nothing keeps the directory the session already has. The bridge remembers that mapping across restarts (it persists to `~/.cache/ai-bridge/sessions.json`), but it is still the bridge's own record, bounded and local: a session evicted by age, or one started by a different bridge on another machine, is one it has no record of. It then resumes in the scratch directory, which for a workspace conversation is the wrong answer.
+
+So a server that supports workspaces **should send `working_dir` on every turn**, not only the first. It costs nothing, and it is the only thing that makes the outcome independent of what the bridge happens to remember.
 
 **Consequence, and it is intended:** once `working_dir` is a real checkout, that repository's own `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` load, because the CLIs read them from cwd. That is the point of working in a checkout, not a leak. User-level files (`~/.claude/CLAUDE.md`) are a separate matter and load regardless — see `cli_isolation`.
 
@@ -587,11 +605,11 @@ Inlining the bytes is not an option worth trying. The server's WebSocket message
 So the bridge fetches each one instead:
 
 1. **The URL must be on the origin this bridge is connected to** (derived from `--server`, or the explicit `--api` override), and it must be HTTPS — the sole exception being a loopback host, where there is no wire to eavesdrop on. Redirects are **not** followed, since an allowed origin answering `302` to anywhere it likes would make the check decorative. Anything else is refused with `attachment_refused`. Without this, a compromised or hostile server turns every connected bridge into a fetcher for arbitrary hosts, with the operator's own connection token attached.
-2. It is streamed to `~/.cache/ai-bridge/attachments/<request_id>/<name>`. **Never into the working directory** — a checkout must not be dirtied by the transport. If the file belongs in the repo, the developer asks the assistant to copy it there.
+2. It is streamed to a per-request directory under `~/.cache/ai-bridge/attachments/` — named from the request id plus a short digest of it, since two ids that sanitise alike must not share a directory and delete each other's files. **Never into the working directory**: a checkout must not be dirtied by the transport. If the file belongs in the repo, the developer asks the assistant to copy it there.
 3. `name` is reduced to a single safe path component (separators of both kinds stripped, leading dots removed, length capped, collisions numbered). The server's filename is never trusted to be a path.
 4. Per-file and per-request caps apply (`--attachment-max-mb`, `--attachment-total-mb`; 25 MB and 100 MB by default), enforced against the *declared* size before fetching and against the *actual* bytes while streaming. Over the cap is `attachment_too_large`.
 5. `size` and `sha256` are verified afterwards. A mismatch fails the whole request with `attachment_failed` — a half-downloaded PDF is, to the model, indistinguishable from a genuinely corrupt one, so it would confidently report the wrong problem.
-6. A short preamble naming the absolute paths, types and sizes is prepended to `message`, so the model knows the files exist and where they are.
+6. A short preamble naming the absolute paths, types and sizes is prepended to `message`, so the model knows the files exist and where they are. In `isolated`, where Claude's tool surface is otherwise restricted to `mcp__bridge__*`, a turn carrying attachments also gets `Read`, `Glob` and `Grep` — read-only, and only for such a turn. Without them the preamble would name paths the model is not permitted to open, and the turn would end with it saying it cannot see a file the user had just attached.
 7. The request's attachment directory is deleted when the turn terminates — on `done`, `error` and `cancelled` alike. `--keep-attachments` retains it for debugging.
 
 ### Bridge → Server: `ai_request_ack`

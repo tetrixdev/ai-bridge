@@ -11,7 +11,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireGeminiSettings, BRIDGE_MCP_SERVER_NAME } from '../../src/mcp/cli-config.js';
+import {
+  acquireGeminiSettings,
+  releaseGeminiSettingsOnExit,
+  BRIDGE_MCP_SERVER_NAME,
+} from '../../src/mcp/cli-config.js';
 
 const conn = { url: 'http://127.0.0.1:9/mcp', bearerToken: 'tok-1' };
 
@@ -84,6 +88,38 @@ describe('a managed working directory (a developer checkout)', () => {
     const second = acquireGeminiSettings(checkout, conn, true);
     expect(existsSync(settingsPath)).toBe(true);
     second.release();
+  });
+});
+
+describe('when the bridge process is killed mid-turn', () => {
+  it('still takes its settings file back out of the checkout', () => {
+    // The per-turn `finally` only runs when the spawn promise settles, which it
+    // never does on SIGTERM, a crash or a SIGKILL. The file would otherwise
+    // survive in the repository, show up in `git status`, and — because
+    // acquire refuses rather than overwrites — block every future Gemini turn
+    // in that checkout until somebody deleted it by hand.
+    acquireGeminiSettings(checkout, conn, true);
+    expect(existsSync(settingsPath)).toBe(true);
+
+    releaseGeminiSettingsOnExit();
+
+    expect(existsSync(settingsPath)).toBe(false);
+    expect(existsSync(join(checkout, '.gemini'))).toBe(false);
+  });
+
+  it('frees the directory lock too, so a restarted bridge can use it', () => {
+    acquireGeminiSettings(checkout, conn, true);
+    releaseGeminiSettingsOnExit();
+
+    const handle = acquireGeminiSettings(checkout, conn, true);
+    expect(existsSync(settingsPath)).toBe(true);
+    handle.release();
+  });
+
+  it('leaves the scratch directory alone, since that file is the bridge own', () => {
+    acquireGeminiSettings(checkout, conn, false).release();
+    releaseGeminiSettingsOnExit();
+    expect(existsSync(settingsPath)).toBe(true);
   });
 });
 

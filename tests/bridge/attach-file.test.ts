@@ -95,7 +95,10 @@ afterEach(async () => {
 });
 
 /** Start a bridge whose turns call `duringTurn` before finishing. */
-async function runTurn(duringTurn: (requestId: string) => Promise<void>): Promise<string> {
+async function runTurn(
+  duringTurn: (requestId: string) => Promise<void>,
+  isolation: 'workspace' | 'isolated' = 'workspace',
+): Promise<string> {
   const adapter = new DuringTurnAdapter(duringTurn);
   bridge = new Bridge({
     serverUrl: `ws://127.0.0.1:${(wss.address() as AddressInfo).port}/ws`,
@@ -113,7 +116,7 @@ async function runTurn(duringTurn: (requestId: string) => Promise<void>): Promis
     session_id: 'conn-1',
     tools: [],
     config: { heartbeat_interval: 30, request_timeout: 30 },
-    cli_isolation: 'workspace',
+    cli_isolation: isolation,
   } satisfies Partial<WelcomeMessage> as unknown as WelcomeMessage));
   await new Promise((r) => setTimeout(r, 50));
 
@@ -140,6 +143,51 @@ function attachFile(requestId: string, args: Record<string, unknown>): Promise<s
     handleAttachFile(id: string, a: Record<string, unknown>): Promise<string>;
   }).handleAttachFile(requestId, args);
 }
+
+/** Invoke the tool the way a spawned CLI does — through the MCP call handler. */
+function callThroughMcp(requestId: string, name: string, args: Record<string, unknown>): Promise<unknown> {
+  const handler = (bridge as unknown as {
+    mcpServer: { handleCall: (id: string, n: string, a: Record<string, unknown>) => Promise<unknown> };
+  }).mcpServer.handleCall;
+
+  return handler(requestId, name, args);
+}
+
+describe('the dispatch gate', () => {
+  it('does not answer bridge__attach_file in isolated, where it is not offered', async () => {
+    // Withholding it from tools/list is not enough on its own: anything holding
+    // the per-spawn bearer token could still invoke it by name. Dispatch has to
+    // check the tool is actually registered.
+    //
+    // Not awaited: the correct outcome is that the call falls through to the
+    // ordinary server-tool path and emits a `tool_call` frame, which this fake
+    // server never answers — so the promise stays pending, which is itself the
+    // evidence that the bridge did not handle it locally.
+    await runTurn(async (id) => {
+      void callThroughMcp(id, 'bridge__attach_file', { path: join(checkout, 'report.md') })
+        .catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 100));
+    }, 'isolated');
+
+    const toolCall = frames.find(
+      (f) => f['type'] === 'tool_call' && f['tool_name'] === 'bridge__attach_file',
+    );
+    expect(toolCall).toBeDefined();
+    expect(uploads).toEqual([]);
+  });
+
+  it('answers it in workspace, where it is offered', async () => {
+    let outcome = '';
+    await runTurn(async (id) => {
+      outcome = String(await callThroughMcp(id, 'bridge__attach_file', {
+        path: join(checkout, 'report.md'),
+      }));
+    });
+
+    expect(outcome).toContain('report.md');
+    expect(uploads).toHaveLength(1);
+  });
+});
 
 describe('the model sending a file back', () => {
   it('uploads it and announces it on the turn stream', async () => {

@@ -92,7 +92,7 @@ Once cwd is a real checkout, that repository's own `CLAUDE.md` / `AGENTS.md` / `
 
 ### Gemini leaves a file in your checkout, briefly
 
-Gemini has no per-invocation MCP config flag — it reads `.gemini/settings.json` from its working directory. Pointed at a checkout, the bridge therefore writes one there. It handles that explicitly: it **refuses the turn rather than overwriting** a `.gemini/settings.json` your repository already has, deletes the one it wrote when the turn ends however the turn ended, and removes the `.gemini` directory too if it created it and left it empty. Two Gemini turns cannot run in one directory at the same time — the second is refused, because the file holds a per-spawn credential and the loser would read the winner's.
+Gemini has no per-invocation MCP config flag — it reads `.gemini/settings.json` from its working directory. Pointed at a checkout, the bridge therefore writes one there. It handles that explicitly: it **refuses the turn rather than overwriting** a `.gemini/settings.json` your repository already has, deletes the one it wrote when the turn ends — on success, error, cancel, and on the bridge process exiting, so a SIGTERM mid-turn does not leave a stale file that blocks that checkout for good — and removes the `.gemini` directory too if it created it and left it empty. A `SIGKILL` is the one case nothing can clean up; delete the file by hand if you ever see one. Two Gemini turns cannot run in one directory at the same time — the second is refused, because the file holds a per-spawn credential and the loser would read the winner's.
 
 Claude and Codex take their MCP configuration per invocation and never write anything into your checkout.
 
@@ -106,7 +106,7 @@ provider. Claude and Codex are unaffected.
 A file attached in the chat does not travel over the WebSocket — the server's frame cap is 1 MB, so a screenshot would not fit, and would not fit as a *dropped message* rather than an error. The server sends a reference instead and the bridge fetches it:
 
 - only from the origin it is connected to (or `--api`), only over HTTPS, and never following a redirect;
-- into `~/.cache/ai-bridge/attachments/<request_id>/`, **never into your checkout**;
+- into a per-request directory under `~/.cache/ai-bridge/attachments/`, **never into your checkout**;
 - verified against the declared size and SHA-256, failing the turn loudly on a mismatch rather than handing the model a truncated file it will describe as corrupt;
 - deleted when the turn ends, on success, error and cancel alike.
 

@@ -48,6 +48,7 @@ async function launch(
   AdapterClass: new () => ClaudeAdapter | CodexAdapter | GeminiAdapter,
   isolation: CliIsolation,
   withMcp = true,
+  hasAttachments = false,
 ): Promise<Launch> {
   const recorded: Launch = { command: '', args: [] };
 
@@ -91,6 +92,7 @@ async function launch(
     signal: new AbortController().signal,
     requestTimeoutSeconds: 30,
     cliSessionId: null,
+    hasAttachments,
   };
 
   await new Probe().execute(context, (_e: AdapterStreamEvent) => undefined);
@@ -132,6 +134,28 @@ describe('claude', () => {
     // real task. Asserted so nobody "hardens" it into something that hangs.
     expect(args).toContain('--permission-mode');
     expect(args).toContain('bypassPermissions');
+  });
+
+  it('lets an isolated turn read the files the user attached', async () => {
+    // The preamble names absolute paths and tells the model to read them. With
+    // only `mcp__bridge__*` allowed, Read is denied in headless mode and the
+    // turn ends with the model saying it cannot see a file the user just
+    // attached — and nothing in the logs points at this flag.
+    const { args } = await launch(ClaudeAdapter, 'isolated', true, true);
+    const allowed = args[args.indexOf('--allowedTools') + 1] ?? '';
+
+    expect(allowed).toContain(`mcp__${BRIDGE_MCP_SERVER_NAME}__*`);
+    expect(allowed.split(',')).toContain('Read');
+    // Read-only: the files are in the bridge's cache, not the machine at large.
+    expect(allowed.split(',')).not.toContain('Write');
+    expect(allowed.split(',')).not.toContain('Bash');
+  });
+
+  it('does not widen the tool surface on a turn with no attachments', async () => {
+    const { args } = await launch(ClaudeAdapter, 'isolated', true, false);
+    const allowed = args[args.indexOf('--allowedTools') + 1] ?? '';
+
+    expect(allowed).toBe(`mcp__${BRIDGE_MCP_SERVER_NAME}__*`);
   });
 
   it('in native, bypasses permissions and does not restrict MCP config', async () => {
@@ -188,6 +212,19 @@ describe('gemini', () => {
   it('in isolated, withholds --yolo so built-ins stall rather than run', async () => {
     const { args } = await launch(GeminiAdapter, 'isolated');
     expect(args).not.toContain('--yolo');
+  });
+
+  it('with no MCP channel, still restricts the visible MCP server set', async () => {
+    // `mcp` is null when the bridge's own MCP server failed to start, and the
+    // turn still runs. Inside the `if (context.mcp)` block this flag was
+    // dropped exactly there — so a workspace turn launched with `--yolo` and
+    // no server restriction, loading the operator's ~/.gemini servers and the
+    // checkout's own, auto-approving every tool they expose.
+    for (const posture of ['isolated', 'workspace'] as const) {
+      const { args } = await launch(GeminiAdapter, posture, false);
+      expect(args).toContain('--allowed-mcp-server-names');
+      expect(args).toContain(BRIDGE_MCP_SERVER_NAME);
+    }
   });
 
   it('in workspace, passes --yolo because it is the only lever gemini offers', async () => {

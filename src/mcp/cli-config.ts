@@ -143,6 +143,45 @@ export function writeGeminiSettings(workingDir: string, conn: McpConnection): st
  */
 const geminiSettingsLocks = new Set<string>();
 
+/**
+ * Cleanups for settings files currently written into somebody's checkout.
+ *
+ * The per-turn `finally` only runs when the spawn promise settles, which it
+ * never does if the process is terminated — SIGTERM during a turn, a crash, a
+ * SIGKILL. The file would then survive in the developer's repository, show up
+ * in `git status`, and (because acquire refuses rather than overwrites) block
+ * every future Gemini turn in that checkout until somebody deleted it by hand.
+ *
+ * Releases are synchronous `rmSync`, so an `exit` handler is enough.
+ */
+const pendingGeminiCleanups = new Set<() => void>();
+
+let exitHookInstalled = false;
+
+function installExitHook(): void {
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+
+  process.on('exit', () => {
+    for (const cleanup of pendingGeminiCleanups) {
+      try {
+        cleanup();
+      } catch {
+        // Best-effort by definition: the process is already going away.
+      }
+    }
+    pendingGeminiCleanups.clear();
+  });
+}
+
+/** Test seam: run every pending cleanup, as process exit would. */
+export function releaseGeminiSettingsOnExit(): void {
+  for (const cleanup of pendingGeminiCleanups) {
+    cleanup();
+  }
+  pendingGeminiCleanups.clear();
+}
+
 /** Cleanup for one turn's Gemini settings file. Always call it, once. */
 export interface GeminiSettingsHandle {
   /** Absolute path of the settings file that was written. */
@@ -216,29 +255,39 @@ export function acquireGeminiSettings(
     throw err;
   }
 
+  const cleanup = (): void => {
+    geminiSettingsLocks.delete(workingDir);
+    // Only clean up what we put in someone else's directory. In the bridge's
+    // own scratch dir the file is ours to keep, and removing it every turn
+    // would just mean writing it again on the next one.
+    if (!managed) return;
+    try {
+      rmSync(path, { force: true });
+      // Take the `.gemini` directory too, but only if we created it and it
+      // is empty — a directory that held something else is not ours.
+      if (!dirExisted && readdirSync(settingsDir).length === 0) {
+        // rmdirSync, not rmSync: rmSync refuses a directory unless told to
+        // recurse, and recursing is exactly what must not happen here — the
+        // emptiness check above is the safety, and it would be pointless if
+        // the call could delete a non-empty directory anyway.
+        rmdirSync(settingsDir);
+      }
+    } catch {
+      // Best-effort. A leftover settings file is untidy; throwing here would
+      // turn a completed turn into a failed one, which is worse.
+    }
+  };
+
+  if (managed) {
+    installExitHook();
+    pendingGeminiCleanups.add(cleanup);
+  }
+
   return {
     path,
     release(): void {
-      geminiSettingsLocks.delete(workingDir);
-      // Only clean up what we put in someone else's directory. In the bridge's
-      // own scratch dir the file is ours to keep, and removing it every turn
-      // would just mean writing it again on the next one.
-      if (!managed) return;
-      try {
-        rmSync(path, { force: true });
-        // Take the `.gemini` directory too, but only if we created it and it
-        // is empty — a directory that held something else is not ours.
-        if (!dirExisted && readdirSync(settingsDir).length === 0) {
-          // rmdirSync, not rmSync: rmSync refuses a directory unless told to
-          // recurse, and recursing is exactly what must not happen here — the
-          // emptiness check above is the safety, and it would be pointless if
-          // the call could delete a non-empty directory anyway.
-          rmdirSync(settingsDir);
-        }
-      } catch {
-        // Best-effort. A leftover settings file is untidy; throwing here would
-        // turn a completed turn into a failed one, which is worse.
-      }
+      pendingGeminiCleanups.delete(cleanup);
+      cleanup();
     },
   };
 }

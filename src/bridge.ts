@@ -1429,6 +1429,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         signal,
         requestTimeoutSeconds: this.serverConfig.request_timeout,
         cliSessionId,
+        hasAttachments: saved.length > 0,
       };
 
       // The adapter emits its own `done`, but the CLI session id is only known

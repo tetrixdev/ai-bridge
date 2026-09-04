@@ -231,6 +231,47 @@ describe('fetchAttachments', () => {
     expect(readdirSync(attachmentDirFor(REQUEST_ID))).toEqual(['pwned.txt']);
   });
 
+  it('reads the token per file, so a refresh mid-turn does not 401 the rest', async () => {
+    // The server tops up long-lived tokens mid-connection. Downloads run in
+    // sequence with a two-minute timeout each, so a token captured once at the
+    // start would fail every remaining file on an opaque 401.
+    const a = Buffer.from('first');
+    const b = Buffer.from('second');
+    bodies.set('/one.txt', a);
+    bodies.set('/two.txt', b);
+
+    let current = 'tok-1';
+    await fetchAttachments({
+      attachments: [ref('/one.txt', a), ref('/two.txt', b)],
+      requestId: REQUEST_ID,
+      token: () => {
+        const value = current;
+        current = 'tok-2';
+
+        return value;
+      },
+      expectedOrigin: origin,
+      limits: LIMITS,
+      signal: new AbortController().signal,
+    });
+
+    expect(seenAuth).toContain('Bearer tok-1');
+    expect(seenAuth).toContain('Bearer tok-2');
+  });
+
+  it('refuses a turn carrying more files than the per-request count cap', async () => {
+    const body = Buffer.from('x');
+    bodies.set('/one.txt', body);
+    const many = Array.from({ length: 51 }, (_, i) => ref('/one.txt', body, { id: `att_${i}` }));
+
+    await expect(fetchAttachments({
+      attachments: many, requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
+      limits: LIMITS, signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: 'attachment_too_large' });
+    // Nothing fetched — the count is checked before the network is touched.
+    expect(seenAuth).toEqual([]);
+  });
+
   it('raises RequestRefusal, so the bridge reports a code instead of session_lost', async () => {
     const body = Buffer.from('x');
     const foreign = ref('/a.txt', body, { url: 'https://evil.example.com/a.txt' });
