@@ -236,16 +236,28 @@ export class BridgeMcpServer {
       });
     });
 
-    await new Promise<void>((resolve, reject) => {
-      this.httpServer!.once('error', reject);
-      // Loopback only — never 0.0.0.0 even by accident, since this endpoint
-      // is bearer-token-authed and not meant for off-host access.
-      this.httpServer!.listen(0, '127.0.0.1', () => {
-        const addr = this.httpServer!.address() as AddressInfo;
-        this.port = addr.port;
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.httpServer!.once('error', reject);
+        // Loopback only — never 0.0.0.0 even by accident, since this endpoint
+        // is bearer-token-authed and not meant for off-host access.
+        this.httpServer!.listen(0, '127.0.0.1', () => {
+          const addr = this.httpServer!.address() as AddressInfo;
+          this.port = addr.port;
+          resolve();
+        });
       });
-    });
+    } catch (err) {
+      // Put the object back the way it was, or a failed listen (EMFILE,
+      // EACCES, no loopback) is unrecoverable for the life of the process:
+      // `httpServer` stays set, so every later attempt hits the "already
+      // started" guard above and the operator sees that instead of the real
+      // cause, on every reconnect, with the tool channel never coming back.
+      this.httpServer?.close(() => undefined);
+      this.httpServer = null;
+      this.port = null;
+      throw err;
+    }
 
     log.info('Bridge MCP server listening', { url: this.getBaseUrl() });
   }

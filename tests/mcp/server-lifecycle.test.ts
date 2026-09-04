@@ -44,10 +44,16 @@ describe('isRunning', () => {
     await server.stop();
   });
 
-  it('is false again after stop', async () => {
+  it('is false again after stop, and can be started again', async () => {
     const server = new BridgeMcpServer(async () => null);
     await server.start();
     await server.stop();
     expect(server.isRunning()).toBe(false);
+
+    // Nothing is latched: the handshake starts the server on each reconnect
+    // that needs it, so a stopped server must be startable again.
+    await server.start();
+    expect(server.isRunning()).toBe(true);
+    await server.stop();
   });
 });
