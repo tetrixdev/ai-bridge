@@ -16,6 +16,21 @@ import { runLocalTool } from '../../src/local/executor.js';
 import { canIsolateNetwork, isNodeCommand, resetNetworkProbe, sandboxed } from '../../src/local/sandbox.js';
 
 const onLinux = process.platform === 'linux';
+
+/**
+ * Can this machine actually build the fence these tests are about?
+ *
+ * Being on Linux is not enough. Unprivileged user namespaces are a kernel
+ * setting, and plenty of hardened hosts — GitHub's runners among them — have
+ * them off. The three tests below assert what a namespace DOES, so on such a
+ * host they are not failing, they are unrunnable: `sandboxed()` refuses to run
+ * a `network: false` tool at all rather than hand it a network it asked not to
+ * have, which is the behaviour tested separately and on purpose.
+ *
+ * Probed once here rather than gated on the platform, so the coverage is kept
+ * everywhere it can run and skipped only where it genuinely cannot.
+ */
+const canFenceNetwork = onLinux && (await canIsolateNetwork());
 const dirs: string[] = [];
 
 function scratch(): string {
@@ -145,7 +160,7 @@ describe('the network, which the permission model does not cover at all', () => 
     expect(res.sandbox.network).toBe('open');
   }, 30_000);
 
-  it.skipIf(!onLinux)('is gone once the tool declares it needs none', async () => {
+  it.skipIf(!canFenceNetwork)('is gone once the tool declares it needs none', async () => {
     expect(await canIsolateNetwork()).toBe(true);
     const dir = scratch();
     writeFileSync(join(dir, 'tool.js'), `
@@ -166,7 +181,7 @@ describe('the network, which the permission model does not cover at all', () => 
     expect(res.stdout.trim()).not.toBe('RESOLVED');
   }, 30_000);
 
-  it.skipIf(!onLinux)('wraps the namespace around the command, not inside it', async () => {
+  it.skipIf(!canFenceNetwork)('wraps the namespace around the command, not inside it', async () => {
     const { command, args } = await sandboxed('node', ['tool.js'], { network: false, readDir: '/pkg' });
     // unshare has to be the process that spawns node, or node's flags apply to
     // a process that is already outside the namespace.
