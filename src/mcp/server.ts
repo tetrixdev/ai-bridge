@@ -82,6 +82,16 @@ export class BridgeMcpServer {
   private httpServer: Server | null = null;
   private port: number | null = null;
   private tools: ToolDefinition[] = [];
+  /**
+   * Tools the BRIDGE implements, offered alongside the server's.
+   *
+   * They are kept in their own list rather than merged into `tools` because
+   * they must not be routed the way a server tool is: a server tool round-trips
+   * over the WebSocket as a `tool_call` frame, while these are handled here, on
+   * this machine, by the bridge itself. The Bridge's call handler dispatches on
+   * the name.
+   */
+  private bridgeTools: ToolDefinition[] = [];
   private readonly handleCall: ToolCallHandler;
   /** Per-spawn bearer tokens → AI request_id they map to. */
   private readonly tokens = new Map<string, string>();
@@ -108,11 +118,11 @@ export class BridgeMcpServer {
       const ctx = this.callContext.getStore();
       log.info('MCP tools/list', {
         requestId: ctx?.requestId,
-        toolCount: this.tools.length,
-        tools: this.tools.map((t) => t.name),
+        toolCount: this.tools.length + this.bridgeTools.length,
+        tools: [...this.tools, ...this.bridgeTools].map((t) => t.name),
       });
       return {
-        tools: this.tools.map((t) => ({
+        tools: [...this.tools, ...this.bridgeTools].map((t) => ({
           name: t.name,
           description: t.description,
           inputSchema: this.normalizeInputSchema(t.parameters),
@@ -171,6 +181,28 @@ export class BridgeMcpServer {
   setTools(tools: ToolDefinition[]): void {
     this.tools = tools;
     log.debug('MCP tool set updated', { count: tools.length });
+  }
+
+  /**
+   * Register the tools the bridge implements itself.
+   *
+   * Set once at construction time in practice. Separate from setTools() so a
+   * welcome message carrying a fresh server tool list cannot drop them.
+   */
+  setBridgeTools(tools: ToolDefinition[]): void {
+    this.bridgeTools = tools;
+    log.debug('Bridge-owned tool set updated', { tools: tools.map((t) => t.name) });
+  }
+
+  /**
+   * True when the MCP server has anything at all to offer.
+   *
+   * The bridge starts this server lazily, and used to key that off "the server
+   * registered at least one tool". With bridge-owned tools in the picture that
+   * is no longer the same question.
+   */
+  hasTools(): boolean {
+    return this.tools.length > 0 || this.bridgeTools.length > 0;
   }
 
   /**

@@ -34,6 +34,53 @@ npx @tetrixdev/ai-bridge
 | `--device-mode <mode>` | | `transcript` or `isolated`. Self-reported |
 | `--identity-file <path>` | `ENGRAM_IDENTITY` | Where the device keypair lives (default `~/.engram/device.json`) |
 | `--local-data-dir <path>` | `AI_BRIDGE_DATA_DIR` | Where npm packages for local tools are installed, one directory per space (default `~/.ai-bridge`) |
+| `--allow-dir <path>[=<label>]` | `AI_BRIDGE_ALLOWED_DIRS` | Permit the server to run turns in this directory. Repeatable; the environment variable is `:`-separated. **Off unless you pass it.** Read [Working in a repository](#working-in-a-repository) first |
+| `--api <url>` | `AI_BRIDGE_API` | Base URL of the server's HTTP API for attachments, when it is not the same host as `--server`. Defaults to the `https://` origin of `--server` |
+| `--attachment-max-mb <n>` | | Largest single attachment to download (default `25`) |
+| `--attachment-total-mb <n>` | | Largest total of attachments per request (default `100`) |
+| `--keep-attachments` | | Keep downloaded attachments after a turn instead of deleting them. Debugging aid |
+
+## Working in a repository
+
+By default every CLI is spawned in a dedicated empty directory, so a chat can talk about code but cannot touch any. Pass `--allow-dir` and the server may ask the assistant to work inside a real checkout instead — read a repository, edit it, run the tests, commit.
+
+```bash
+npx @tetrixdev/ai-bridge \
+  --server wss://studio.example.com/api/ai-bridge/ws \
+  --token "$AI_BRIDGE_TOKEN" \
+  --allow-dir ~/zp-studio=Studio
+```
+
+The bridge advertises what you allowed in its handshake, so the app can show a picker of your checkouts rather than asking you to type a path. A request naming anything outside those roots is refused, and so is one naming a directory that does not exist — the bridge never creates it, because a typo that silently starts an empty session looks exactly like a session that worked.
+
+A working directory belongs to a CLI session for that session's life: a later turn on the same conversation that names a different directory is refused rather than resumed into a session whose history is about somewhere else.
+
+Once cwd is a real checkout, that repository's own `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` load. That is intended — it is the point of working in a checkout.
+
+### Read this before using it
+
+> Once a server may name a working directory and the CLI has shell, the bridge runs code chosen by the server, on this machine, as you. The allow-list bounds where the assistant **starts**, not what it can **reach**: `cd ..` and `~/.ssh` are one command away, and no flag in this table changes that.
+>
+> The controls that actually carry the weight are: the allow-list is opt-in and empty by default, so a bridge started without `--allow-dir` cannot be pointed anywhere; the connection token is per person and revocable; and you should only connect a bridge to a server you would give a shell to.
+
+`workspace` is a narrower blast radius than `native`, and a real one. It is **not** a sandbox, and nothing here should be read as claiming otherwise. Codex is bounded more tightly than the others (`sandbox_mode=workspace-write` rather than `danger-full-access`); Gemini is bounded least, because `--yolo` is the only lever it offers and there is no middle setting.
+
+### Gemini leaves a file in your checkout, briefly
+
+Gemini has no per-invocation MCP config flag — it reads `.gemini/settings.json` from its working directory. Pointed at a checkout, the bridge therefore writes one there. It handles that explicitly: it **refuses the turn rather than overwriting** a `.gemini/settings.json` your repository already has, deletes the one it wrote when the turn ends however the turn ended, and removes the `.gemini` directory too if it created it and left it empty. Two Gemini turns cannot run in one directory at the same time — the second is refused, because the file holds a per-spawn credential and the loser would read the winner's.
+
+Claude and Codex take their MCP configuration per invocation and never write anything into your checkout.
+
+## Attachments
+
+A file attached in the chat does not travel over the WebSocket — the server's frame cap is 1 MB, so a screenshot would not fit, and would not fit as a *dropped message* rather than an error. The server sends a reference instead and the bridge fetches it:
+
+- only from the origin it is connected to (or `--api`), only over HTTPS, and never following a redirect;
+- into `~/.cache/ai-bridge/attachments/<request_id>/`, **never into your checkout**;
+- verified against the declared size and SHA-256, failing the turn loudly on a mismatch rather than handing the model a truncated file it will describe as corrupt;
+- deleted when the turn ends, on success, error and cancel alike.
+
+The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
 
 ## Local tools
 

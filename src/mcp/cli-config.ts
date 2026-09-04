@@ -17,7 +17,7 @@
  * Authorization header is not readable by other local users.
  */
 
-import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, mkdirSync, readdirSync, rmSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -121,4 +121,112 @@ export function writeGeminiSettings(workingDir: string, conn: McpConnection): st
   // mode 0600 for the same reason as the Claude config file.
   writeFileSync(path, JSON.stringify(settings, null, 2), { mode: 0o600 });
   return path;
+}
+
+// ---------------------------------------------------------------------------
+// Gemini settings, when the working directory belongs to somebody else
+// ---------------------------------------------------------------------------
+
+/**
+ * Directories that currently have a bridge-written `.gemini/settings.json`.
+ *
+ * Gemini is the one CLI with no per-invocation MCP config flag: the settings
+ * have to be a file in cwd, and there is exactly one such path per directory.
+ * Two turns sharing a directory therefore cannot each have their own — and the
+ * file carries a PER-SPAWN bearer token, so the loser does not merely read
+ * stale config, it reads the other turn's credential and has its tool calls
+ * routed to the other turn's request id.
+ *
+ * That is silent and wrong, so the second turn is refused instead. It is a
+ * real narrowing — concurrent Gemini turns in one directory used to "work" —
+ * but what they were doing was racing on which token won.
+ */
+const geminiSettingsLocks = new Set<string>();
+
+/** Cleanup for one turn's Gemini settings file. Always call it, once. */
+export interface GeminiSettingsHandle {
+  /** Absolute path of the settings file that was written. */
+  path: string;
+  /** Remove the file if we own it, and release the directory lock. */
+  release(): void;
+}
+
+/**
+ * Write `.gemini/settings.json` for one turn, and hand back the way to undo it.
+ *
+ * @param workingDir  Where gemini will be spawned.
+ * @param conn        The MCP connection to register.
+ * @param managed     True when `workingDir` is a checkout the server named.
+ *
+ *   `managed` decides who owns the file. In the bridge's own scratch directory
+ *   (false) the file is ours, it is rewritten every turn and it stays there —
+ *   today's behaviour, unchanged. In a developer's checkout (true) it is a
+ *   file in somebody's repository: an existing one is never overwritten (the
+ *   turn is refused instead, because clobbering a developer's Gemini config is
+ *   not ours to do), and the one we write is removed when the turn ends so
+ *   `git status` is clean again.
+ *
+ * @throws Error when the directory is already in use by another turn, or when
+ *         a managed directory already has its own settings file.
+ */
+export function acquireGeminiSettings(
+  workingDir: string,
+  conn: McpConnection,
+  managed: boolean,
+): GeminiSettingsHandle {
+  const settingsDir = join(workingDir, '.gemini');
+  const path = join(settingsDir, 'settings.json');
+
+  if (geminiSettingsLocks.has(workingDir)) {
+    throw new Error(
+      `another Gemini turn is already running in "${workingDir}". Gemini reads its MCP `
+      + 'configuration from a file in the working directory, so two turns cannot share one. '
+      + 'Retry when the other turn finishes, or use a different workspace.',
+    );
+  }
+
+  const dirExisted = existsSync(settingsDir);
+  const fileExisted = existsSync(path);
+
+  if (managed && fileExisted) {
+    throw new Error(
+      `"${path}" already exists. The bridge will not overwrite a Gemini settings file in `
+      + 'your checkout. Move it aside, or use a provider that does not need one (Claude '
+      + 'and Codex take their MCP configuration per invocation).',
+    );
+  }
+
+  geminiSettingsLocks.add(workingDir);
+  try {
+    writeGeminiSettings(workingDir, conn);
+  } catch (err) {
+    geminiSettingsLocks.delete(workingDir);
+    throw err;
+  }
+
+  return {
+    path,
+    release(): void {
+      geminiSettingsLocks.delete(workingDir);
+      // Only clean up what we put in someone else's directory. In the bridge's
+      // own scratch dir the file is ours to keep, and removing it every turn
+      // would just mean writing it again on the next one.
+      if (!managed) return;
+      try {
+        rmSync(path, { force: true });
+        // Take the `.gemini` directory too, but only if we created it and it
+        // is empty — a directory that held something else is not ours.
+        if (!dirExisted && readdirSync(settingsDir).length === 0) {
+          // rmdirSync, not rmSync: rmSync refuses a directory unless told to
+          // recurse, and recursing is exactly what must not happen here — the
+          // emptiness check above is the safety, and it would be pointless if
+          // the call could delete a non-empty directory anyway.
+          rmdirSync(settingsDir);
+        }
+      } catch {
+        // Best-effort. A leftover settings file is untidy; throwing here would
+        // turn a completed turn into a failed one, which is worse.
+      }
+    },
+  };
 }

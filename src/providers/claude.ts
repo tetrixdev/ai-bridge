@@ -122,15 +122,35 @@ export class ClaudeAdapter extends ProviderAdapter {
     if (context.mcp) {
       const configPath = writeClaudeMcpConfig(context.mcp);
       args.push('--mcp-config', configPath);
-      if (context.cliIsolation === 'isolated') {
+      // `isolated` AND `workspace` both keep the operator's own MCP servers
+      // out. That is the half of isolation `workspace` does NOT relax: it
+      // widens what the model may do with the repository in front of it, not
+      // what else on this machine it can reach.
+      if (context.cliIsolation !== 'native') {
         args.push('--strict-mcp-config');
+      }
+      if (context.cliIsolation === 'isolated') {
         // Glob is supported in --allowedTools matchers (per Claude CLI docs,
         // e.g. "Bash(git *)"). `mcp__<server>__*` is the standard MCP tool
-        // namespace prefix Claude uses.
+        // namespace prefix Claude uses. Omitted in `workspace`, where the
+        // built-in Read / Edit / Write / Bash tools are exactly what we want.
         args.push('--allowedTools', `mcp__${BRIDGE_MCP_SERVER_NAME}__*`);
-      } else {
-        args.push('--permission-mode', 'bypassPermissions');
       }
+    }
+
+    // Permission mode, decided independently of whether any tools were
+    // registered — a `workspace` turn with no server tools still needs to be
+    // able to edit and run things, and a `native` turn was always meant to.
+    //
+    // `bypassPermissions` is what actually runs a real task, and saying
+    // otherwise would be misleading: in headless `-p` mode there is no
+    // interactive approver, so `acceptEdits` gets through file edits and then
+    // stalls the first time the model reaches for the shell. Running the tests
+    // is a shell command, so "edit the file and run the tests" stops halfway
+    // with no error anyone can see. See the security note in the README —
+    // this is not a sandbox and is not described as one.
+    if (context.cliIsolation !== 'isolated') {
+      args.push('--permission-mode', 'bypassPermissions');
     }
 
     // The user message is delivered via STDIN, not as a positional argument.
@@ -156,7 +176,7 @@ export class ClaudeAdapter extends ProviderAdapter {
       // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
       delete env['CLAUDECODE'];
 
-      const child = this.spawnCli('claude', args, env, userMessage);
+      const child = this.spawnCli('claude', args, env, userMessage, context.workingDir);
 
       // Enforce the server-configured request_timeout. Without this a stuck
       // CLI would run forever; with it the bridge bounds every turn.

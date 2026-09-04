@@ -36,7 +36,6 @@ import type {
 import { PROTOCOL_VERSION, BRIDGE_VERSION } from './protocol/version.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './providers/base.js';
 import { detectProviders } from './providers/detector.js';
-import { getBridgeWorkingDir } from './providers/env.js';
 import { ToolResolver } from './tools/resolver.js';
 import { LOCAL_EXECUTION_OFF, refusalReason, runsLocally, type LocalExecutionConfig } from './local/gate.js';
 import { runLocalTool } from './local/executor.js';
@@ -46,9 +45,27 @@ import { SpaceLimiter } from './local/limits.js';
 import type { Identity } from './local/identity.js';
 import type { Redaction } from './local/scrub.js';
 import { BridgeMcpServer } from './mcp/server.js';
+import { rootPaths, toWorkspaceRefs, type AllowedRoot } from './workspace/allowlist.js';
+import { resolveWorkingDir, WORKING_DIR_CHANGED } from './workspace/resolve.js';
+import { SessionWorkingDirs } from './workspace/sessions.js';
+import {
+  buildAttachmentPreamble,
+  fetchAttachments,
+  DEFAULT_ATTACHMENT_LIMITS,
+  type AttachmentLimits,
+  type SavedAttachment,
+} from './attachments/fetch.js';
+import { attachmentDirFor, removeAttachmentDir } from './attachments/store.js';
+import {
+  ATTACH_FILE_TOOL,
+  ATTACH_FILE_TOOL_DEFINITION,
+  uploadAttachment,
+  type UploadContext,
+} from './attachments/upload.js';
+import { resolveApiOrigin } from './attachments/origin.js';
 import { createLogger } from './utils/logger.js';
 import { clampRequestTimeout, clampHeartbeat } from './utils/clamp.js';
-import { FatalBridgeError } from './errors.js';
+import { FatalBridgeError, RequestRefusal } from './errors.js';
 
 export { FatalBridgeError } from './errors.js';
 
@@ -80,6 +97,23 @@ export interface BridgeOptions {
   engram?: EngramConfig;
   /** This device's keypair and its id at Engram. */
   identity?: Identity;
+  /**
+   * Directories a server may name in `ai_request.working_dir`.
+   *
+   * Absent or empty means none, and every request naming one is refused. Same
+   * posture as localExecution above: the operator opts in with `--allow-dir`,
+   * and no server can turn it on by sending a field.
+   */
+  allowedRoots?: AllowedRoot[];
+  /**
+   * Origin attachments are fetched from and uploaded to. Defaults to the HTTP
+   * origin of `serverUrl`; `--api` overrides it for split deployments.
+   */
+  apiOrigin?: string;
+  /** Per-file and per-request attachment size caps. */
+  attachmentLimits?: AttachmentLimits;
+  /** Keep downloaded attachments after the turn, for debugging. */
+  keepAttachments?: boolean;
 }
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
@@ -275,6 +309,29 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   /** Monotonic counter for synthesizing tool_call_ids for MCP-originated calls. */
   private mcpToolCallSeq = 0;
 
+  /** Directories a server may name. Empty means none — see BridgeOptions. */
+  private readonly allowedRoots: AllowedRoot[];
+  /** Cached `allowedRoots` paths, which is all the containment check needs. */
+  private readonly allowedRootPaths: string[];
+  /** Where attachments come from and go to. */
+  private readonly apiOrigin: string;
+  private readonly attachmentLimits: AttachmentLimits;
+  private readonly keepAttachments: boolean;
+  /**
+   * Which directory each CLI session was started in, so a resume that names a
+   * different one can be refused instead of silently running against a
+   * session whose whole history is about another checkout.
+   */
+  private readonly sessionWorkingDirs = new SessionWorkingDirs();
+  /**
+   * Per-request state the bridge-owned MCP tools need.
+   *
+   * Keyed by request id, which is what the MCP server resolves from the
+   * per-spawn bearer token — so a tool call always reads the state of the turn
+   * that made it, even with several CLIs running at once.
+   */
+  private readonly uploadContexts = new Map<string, UploadContext>();
+
   constructor(options: BridgeOptions) {
     super();
     this.serverUrl = options.serverUrl;
@@ -287,11 +344,24 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.identity = options.identity;
     this.testMode = options.testMode ?? false;
     this.onTestRequest = options.onTestRequest;
+    // Absent means no directory may be named. A server cannot widen this.
+    this.allowedRoots = options.allowedRoots ?? [];
+    this.allowedRootPaths = rootPaths(this.allowedRoots);
+    this.apiOrigin = options.apiOrigin ?? resolveApiOrigin(options.serverUrl);
+    this.attachmentLimits = options.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS;
+    this.keepAttachments = options.keepAttachments ?? false;
 
     // The MCP server's tool-call handler proxies through the existing
     // toolResolver → WebSocket round-trip. The requestId comes from the
     // per-spawn token the CLI presented, looked up by BridgeMcpServer.
     this.mcpServer = new BridgeMcpServer(async (requestId, toolName, args) => {
+      // Bridge-owned tools first, and by exact name. These never become a
+      // `tool_call` frame: the server has no idea what a path on this machine
+      // is, and asking it would be both useless and a disclosure.
+      if (toolName === ATTACH_FILE_TOOL) {
+        return this.handleAttachFile(requestId, args);
+      }
+
       const tool = this.currentTools.find((t) => t.name === toolName);
 
       // The one place local execution is decided. A tool the server marked
@@ -320,6 +390,57 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         args,
       );
     });
+
+    // Bridge-owned tools are registered once, here, rather than from the
+    // welcome handler — a welcome carrying a fresh server tool list must not
+    // be able to drop them.
+    this.mcpServer.setBridgeTools([ATTACH_FILE_TOOL_DEFINITION as unknown as import('./protocol/types.js').ToolDefinition]);
+  }
+
+  /**
+   * Handle the model calling `bridge__attach_file`.
+   *
+   * Runs entirely on this machine: the file is read here, uploaded to the
+   * server's HTTP API, and announced to the turn as an `attachment` stream
+   * event. What the model gets back is a plain sentence, because that is what
+   * it can act on — a JSON blob describing an upload tells it nothing useful
+   * about whether the user can now see the file.
+   */
+  private async handleAttachFile(
+    requestId: string,
+    args: Record<string, unknown>,
+  ): Promise<string> {
+    const ctx = this.uploadContexts.get(requestId);
+    if (!ctx) {
+      // The turn is over (or was never ours). Refusing beats uploading a file
+      // on behalf of a request nobody is listening to any more.
+      throw new Error('this turn is no longer active, so the file cannot be sent');
+    }
+
+    const rawPath = args['path'];
+    const description = typeof args['description'] === 'string' ? args['description'] : undefined;
+    if (typeof rawPath !== 'string') {
+      throw new Error('path is required and must be a string');
+    }
+
+    const uploaded = await uploadAttachment(rawPath, description, ctx);
+
+    this.sendStreamEvent(requestId, 'attachment', {
+      id: uploaded.id,
+      name: uploaded.name,
+      mime_type: uploaded.mimeType,
+      size: uploaded.size,
+      ...(description ? { description } : {}),
+    });
+
+    log.info('Attachment sent to server', {
+      requestId,
+      id: uploaded.id,
+      name: uploaded.name,
+      size: uploaded.size,
+    });
+
+    return `Sent "${uploaded.name}" to the user in the chat.`;
   }
 
   /**
@@ -694,11 +815,20 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       version: PROTOCOL_VERSION,
       bridge_version: BRIDGE_VERSION,
       providers: availableProviders,
+      // Advertise the operator's allow-list so the server can offer a picker
+      // rather than asking a developer to type an absolute path into a chat
+      // box. Omitted entirely when empty: "no workspaces" and "this bridge
+      // predates workspaces" should look the same to the server, because in
+      // both cases naming a directory is refused.
+      ...(this.allowedRoots.length > 0
+        ? { workspaces: toWorkspaceRefs(this.allowedRoots) }
+        : {}),
     };
     this.send(hello);
     log.info('Hello sent', {
       protocol: PROTOCOL_VERSION,
       providers: availableProviders.map((p) => p.name),
+      workspaces: this.allowedRoots.map((r) => r.label),
     });
 
     // If no welcome arrives within 15s the server silently dropped our hello;
@@ -854,7 +984,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // talk to it via per-spawn bearer tokens (see executeAiRequestInternal).
     // The server stays up across reconnects so an in-flight CLI never loses
     // its tool channel mid-turn.
-    if (message.tools.length > 0 && !this.mcpServer.isRunning()) {
+    // hasTools() rather than `message.tools.length > 0`: the bridge owns tools
+    // of its own now (bridge__attach_file), and a server that registers none
+    // must still get an MCP channel for those.
+    if (this.mcpServer.hasTools() && !this.mcpServer.isRunning()) {
       try {
         await this.mcpServer.start();
         log.info('MCP tool channel ready', {
@@ -1039,6 +1172,25 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         const errMessage = err instanceof Error ? err.message : String(err);
         const wasResumeAttempt = cliSessionId !== null;
 
+        // A refusal is terminal and carries its own code. It has to be handled
+        // BEFORE the resume branch below: that branch turns any failure on a
+        // resumed turn into `session_lost`, which tells the server to wipe the
+        // session and quietly re-issue the turn — so a refusal would be
+        // retried forever, and the reason would never reach anyone.
+        if (err instanceof RequestRefusal) {
+          log.warn('Refusing request', {
+            requestId: request_id,
+            code: err.code,
+            reason: errMessage,
+          });
+          this.sendStreamEvent(request_id, 'error', {
+            code: err.code,
+            message: errMessage,
+          });
+          this.sendStreamEvent(request_id, 'done', {});
+          return;
+        }
+
         log.error('Request execution failed', {
           requestId: request_id,
           resumeAttempt: wasResumeAttempt,
@@ -1085,7 +1237,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // token is mapped to this request_id so the MCP server can route
     // tools/call from the spawned CLI to the right WebSocket request frame.
     // Skipped when no tools are registered or the MCP server failed to start.
-    const mcpEnabled = this.currentTools.length > 0 && this.mcpServer.isRunning();
+    const mcpEnabled = this.mcpServer.hasTools() && this.mcpServer.isRunning();
     const mcpToken = mcpEnabled ? this.mcpServer.issueToken(request_id) : null;
     const mcp = mcpEnabled && mcpToken
       ? { url: this.mcpServer.getBaseUrl(), bearerToken: mcpToken }
@@ -1096,7 +1248,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         provider: request.provider,
         tokenTail: mcp.bearerToken.slice(-6),
       });
-    } else if (this.currentTools.length > 0) {
+    } else if (this.mcpServer.hasTools()) {
       log.warn('MCP unavailable for request (no token issued)', {
         requestId: request_id,
         provider: request.provider,
@@ -1104,15 +1256,84 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       });
     }
 
+    // Where this turn runs. A refusal here throws and the turn never spawns —
+    // there is deliberately no fallback to the scratch directory, because a
+    // turn that runs in the wrong place looks exactly like one that worked.
+    const workingDir = resolveWorkingDir(request.working_dir, this.allowedRootPaths);
+
+    // A working directory belongs to a CLI session for that session's whole
+    // life. Resuming a session that was started elsewhere is incoherent: the
+    // history is all about another checkout, and the model has no way to know
+    // the ground moved. Report it and let the server start a fresh session
+    // deliberately rather than papering over it here.
+    if (cliSessionId !== null) {
+      const startedIn = this.sessionWorkingDirs.get(cliSessionId);
+      if (startedIn !== undefined && startedIn !== workingDir) {
+        throw new RequestRefusal(
+          WORKING_DIR_CHANGED,
+          `This conversation's CLI session was started in "${startedIn}", but the request `
+          + `asks for "${workingDir}". A session cannot change working directory. `
+          + 'Start a new conversation, or send this turn without resuming.',
+        );
+      }
+    }
+
+    // Attachments land on disk before the CLI starts, so the preamble below
+    // can name paths that already exist.
+    let saved: SavedAttachment[] = [];
+    const attachments = request.attachments ?? [];
+    if (attachments.length > 0) {
+      try {
+        saved = await fetchAttachments({
+          attachments,
+          requestId: request_id,
+          token: this.token,
+          expectedOrigin: this.apiOrigin,
+          limits: this.attachmentLimits,
+          signal,
+        });
+      } catch (err) {
+        // A failure part-way through leaves whatever already downloaded on
+        // disk. The try/finally below never runs for this path — it has not
+        // been entered yet — so the partial files are cleared here instead of
+        // being left behind by every refused turn.
+        if (!this.keepAttachments) {
+          try {
+            removeAttachmentDir(request_id);
+          } catch {
+            // Best-effort: the original failure is the one worth reporting.
+          }
+        }
+        throw err;
+      }
+    }
+
     try {
+      // Tell the model what was saved and where. Without this the files are
+      // present and invisible, and the turn answers as if nothing had been
+      // attached.
+      const effectiveRequest: AiRequestMessage = saved.length > 0
+        ? { ...request, message: buildAttachmentPreamble(saved) + request.message }
+        : request;
+
+      // State the bridge-owned MCP tools read, keyed by request id so
+      // concurrent turns cannot read each other's.
+      this.uploadContexts.set(request_id, {
+        workingDir,
+        attachmentDir: saved.length > 0 ? attachmentDirFor(request_id) : null,
+        apiOrigin: this.apiOrigin,
+        token: this.token,
+        maxFileBytes: this.attachmentLimits.maxFileBytes,
+      });
+
       // Build execution context
       const context: ExecutionContext = {
-        request,
+        request: effectiveRequest,
         requestId: request_id,
         tools: this.currentTools,
         mcp,
         cliIsolation: this.cliIsolation,
-        workingDir: getBridgeWorkingDir(),
+        workingDir,
         signal,
         requestTimeoutSeconds: this.serverConfig.request_timeout,
         cliSessionId,
@@ -1151,6 +1372,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         return;
       }
 
+      // Remember where this session runs, so a later turn that names somewhere
+      // else is refused rather than resumed into the wrong checkout.
+      if (newCliSessionId) {
+        this.sessionWorkingDirs.remember(newCliSessionId, workingDir);
+      }
+
       this.sendStreamEvent(request_id, 'done', {
         ...doneData,
         cli_session_id: newCliSessionId,
@@ -1160,6 +1387,22 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // continue invoking tools on this request_id's behalf.
       if (mcpToken) {
         this.mcpServer.revokeToken(mcpToken);
+      }
+      // Drop the bridge-owned tools' view of this turn, so a CLI that outlives
+      // it cannot keep uploading files against a request nobody is reading.
+      this.uploadContexts.delete(request_id);
+      // Attachments go on every terminal outcome — done, error and cancelled
+      // alike. Cleaning up only on success would grow the cache without bound
+      // precisely on the machines where things go wrong most.
+      if (saved.length > 0 && !this.keepAttachments) {
+        try {
+          removeAttachmentDir(request_id);
+        } catch (err) {
+          log.warn('Could not remove attachment directory', {
+            requestId: request_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
     }
   }

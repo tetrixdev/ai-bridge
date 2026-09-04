@@ -150,6 +150,50 @@ export interface LocalCallTool {
   network?: boolean | string[];
 }
 
+/**
+ * A directory this bridge is allowed to work in, as advertised at the
+ * handshake so the server can show a picker instead of asking a developer to
+ * type an absolute path into a chat box.
+ *
+ * The list is built ENTIRELY from what the operator passed to `--allow-dir`
+ * (or AI_BRIDGE_ALLOWED_DIRS). A server cannot add to it, and naming a path
+ * that is not under one of these roots is refused — see src/workspace/.
+ */
+export interface WorkspaceRef {
+  /** Absolute, symlink-resolved path of the allowed root. */
+  path: string;
+  /** Human-readable name for a picker. Defaults to the directory's basename. */
+  label: string;
+}
+
+/**
+ * One file the server wants the assistant to be able to read this turn.
+ *
+ * The bytes are NOT on the wire: a screenshot already exceeds the server's
+ * 1 MB WebSocket frame cap, and base64 adds a third on top. The bridge fetches
+ * `url` over HTTPS with its own connection token, verifies `size` and
+ * `sha256`, writes the file under the bridge's own cache directory, and tells
+ * the model where it landed.
+ */
+export interface AttachmentRef {
+  /** Server-side identifier, echoed in errors and used to disambiguate names. */
+  id: string;
+  /** Original filename. NEVER trusted as a path — see sanitiseAttachmentName(). */
+  name: string;
+  mime_type: string;
+  /** Expected size in bytes. A mismatch after download fails the request. */
+  size: number;
+  /** Lowercase hex SHA-256 of the file. A mismatch fails the request. */
+  sha256: string;
+  /**
+   * Where to fetch it. Must be on the same origin as the server this bridge
+   * is connected to (or the explicit `--api` origin), or it is refused: a
+   * hostile server must not be able to turn a connected bridge into a fetcher
+   * for arbitrary hosts with a valid bearer token attached.
+   */
+  url: string;
+}
+
 // ---------------------------------------------------------------------------
 // Bridge -> Server Messages
 // ---------------------------------------------------------------------------
@@ -163,6 +207,12 @@ export interface HelloMessage {
   version: string;
   bridge_version: string;
   providers: ProviderCapability[];
+  /**
+   * Directories this bridge may be asked to work in. Absent or empty means
+   * the operator allowed none, and every `ai_request.working_dir` is refused.
+   * An older server ignores the field.
+   */
+  workspaces?: WorkspaceRef[];
 }
 
 /**
@@ -304,11 +354,24 @@ export type BridgeToServerMessage =
  *   plugins, default system prompt) intact. Never the right choice when the
  *   bridge is reachable by untrusted end users.
  *
+ * - `workspace`: the posture that makes a real coding task possible without
+ *   handing over the operator's whole environment. The CLI works inside the
+ *   server-named `working_dir` with its built-in file and shell tools
+ *   ENABLED, while the operator's own MCP servers, hooks, plugins, skills and
+ *   user-level instruction files stay out (`--strict-mcp-config` and friends
+ *   are kept exactly as in `isolated`), and the neutral fallback system prompt
+ *   still applies.
+ *
+ *   This is NOT a sandbox, and the README says so in as many words: once the
+ *   CLI has a shell, `cd ..` and `~/.ssh` are one command away. What bounds it
+ *   is that `--allow-dir` is opt-in and empty by default, so a bridge started
+ *   without it cannot be pointed anywhere at all.
+ *
  * Layer B (HOME / CODEX_HOME / GEMINI_HOME redirection with auth symlinks)
  * would further close `isolated`'s residual user-level leakage for Codex and
  * Gemini — see `tasks/open/cli-isolation-layer-b.md`.
  */
-export type CliIsolation = 'native' | 'isolated';
+export type CliIsolation = 'native' | 'isolated' | 'workspace';
 
 /** Server acknowledges the hello and provides configuration. */
 export interface WelcomeMessage {
@@ -368,6 +431,33 @@ export interface AiRequestMessage {
    * resuming — the resumed CLI session already holds the history.
    */
   history?: ConversationEntry[];
+  /**
+   * Absolute path the CLI should be spawned in.
+   *
+   * Absent means today's behaviour exactly: a freshly made empty directory
+   * under `~/.cache/ai-bridge/`, which is what keeps a chat-only turn from
+   * absorbing whatever happens to be on disk.
+   *
+   * Present means the server is asking the assistant to work in a real
+   * checkout. It is honoured ONLY when the operator passed `--allow-dir` and
+   * the path resolves inside one of those roots; otherwise the turn is
+   * refused with `working_dir_not_allowed`. There is deliberately no silent
+   * fallback to the scratch directory — a turn that appears to succeed while
+   * every answer is about an empty directory is the worst available outcome.
+   *
+   * Fixed for the life of a CLI session: a resume that names a different
+   * directory is refused with `working_dir_changed` rather than papered over.
+   */
+  working_dir?: string;
+  /**
+   * Files the server wants the assistant to be able to read this turn.
+   *
+   * The bridge downloads each one to its own cache directory (never into the
+   * working directory — the transport must not dirty a checkout), verifies it,
+   * and prepends a short preamble to the message naming the absolute paths.
+   * Deleted when the turn terminates.
+   */
+  attachments?: AttachmentRef[];
 }
 
 /**
@@ -473,6 +563,7 @@ export type StreamEventType =
   | 'block_delta'
   | 'block_stop'
   | 'tool_result'
+  | 'attachment'
   | 'done'
   | 'error';
 
@@ -506,6 +597,25 @@ export interface ToolResultData {
   result: string;
 }
 
+/**
+ * Data payload for `attachment` events — a file the assistant produced and
+ * chose to hand back, already uploaded to the server.
+ *
+ * Emitted only in response to the model calling the bridge-owned
+ * `bridge__attach_file` tool. The model nominates the file because nothing
+ * else can: a transport cannot guess which of a hundred files it just touched
+ * is the answer. A server that does not understand the event ignores it.
+ */
+export interface AttachmentEventData {
+  /** The id the server assigned when the bridge uploaded the file. */
+  id: string;
+  name: string;
+  mime_type: string;
+  size: number;
+  /** Whatever the model said the file is, when it said anything. */
+  description?: string;
+}
+
 /** Data payload for done events. */
 export interface DoneData {
   usage?: TokenUsage;
@@ -535,5 +645,6 @@ export type StreamEventData =
   | BlockDeltaData
   | BlockStopData
   | ToolResultData
+  | AttachmentEventData
   | DoneData
   | StreamErrorData;

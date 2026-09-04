@@ -251,3 +251,20 @@ describe('Environment Utilities', () => {
     });
   });
 });
+
+describe('resolveSystemPrompt() in workspace mode', () => {
+  it('uses the server prompt when there is one', () => {
+    expect(resolveSystemPrompt('be helpful', 'workspace')).toBe('be helpful');
+  });
+
+  it('falls back to the neutral prompt, exactly as isolated does', () => {
+    // `workspace` widens what the CLI may DO. It does not hand the CLI's own
+    // coding-agent persona to a product whose prompt the server owns.
+    expect(resolveSystemPrompt(null, 'workspace')).toBe(ISOLATED_FALLBACK_SYSTEM_PROMPT);
+    expect(resolveSystemPrompt('', 'workspace')).toBe(ISOLATED_FALLBACK_SYSTEM_PROMPT);
+  });
+
+  it('leaves only native to the CLI own default', () => {
+    expect(resolveSystemPrompt(null, 'native')).toBeNull();
+  });
+});
