@@ -122,6 +122,13 @@ program
     [] as string[],
   )
   .option(
+    '--allow-native',
+    'Permit the server to select `native` isolation — the CLI\'s full local environment, including '
+    + 'your own MCP servers, hooks, plugins and a shell. Off unless you pass it. Only for a bridge '
+    + 'you run against your own machine, never one reachable by end users.',
+    false,
+  )
+  .option(
     '--api <url>',
     'Base URL of the server HTTP API for attachments, when it is not the same host as --server '
     + '(or set AI_BRIDGE_API). Defaults to the https:// origin of --server.',
@@ -151,7 +158,7 @@ program
     token?: string; server?: string; debug: boolean; test: boolean; logFile?: string;
     localTools: boolean; engram?: string; engramToken?: string;
     deviceLabel: string; deviceMode: string; identityFile: string; localDataDir: string;
-    allowDir: string[]; api?: string; keepAttachments: boolean;
+    allowDir: string[]; api?: string; keepAttachments: boolean; allowNative: boolean;
     attachmentMaxMb: string; attachmentTotalMb: string;
   }) => {
     // Enable debug logging if requested
@@ -318,6 +325,13 @@ program
     // server names, so it is exactly as constrained as it was before this
     // feature existed.
 
+    if (opts.allowNative) {
+      log.warn(
+        'native isolation is PERMITTED: this server may run the CLI with your full local '
+        + 'environment — your MCP servers, hooks, plugins and a shell, as you.',
+      );
+    }
+
     let allowedRoots: AllowedRoot[] = [];
     try {
       allowedRoots = buildAllowedRoots(opts.allowDir, process.env['AI_BRIDGE_ALLOWED_DIRS']);
@@ -364,6 +378,7 @@ program
       apiOrigin,
       attachmentLimits,
       keepAttachments: opts.keepAttachments,
+      allowNative: opts.allowNative,
     });
 
     // Lifecycle logging

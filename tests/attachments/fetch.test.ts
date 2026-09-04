@@ -79,7 +79,7 @@ afterEach(() => {
 describe('fetchAttachments', () => {
   it('returns nothing and creates no directory when there are no attachments', async () => {
     const saved = await fetchAttachments({
-      attachments: [], requestId: REQUEST_ID, token: 't', expectedOrigin: origin,
+      attachments: [], requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
       limits: LIMITS, signal: new AbortController().signal,
     });
     expect(saved).toEqual([]);
@@ -93,7 +93,7 @@ describe('fetchAttachments', () => {
     bodies.set('/big.bin', body);
     const saved = await fetchAttachments({
       attachments: [ref('/big.bin', body)],
-      requestId: REQUEST_ID, token: 'tok-abc', expectedOrigin: origin,
+      requestId: REQUEST_ID, token: () => 'tok-abc', expectedOrigin: origin,
       limits: { maxFileBytes: 5_000_000, maxTotalBytes: 10_000_000 },
       signal: new AbortController().signal,
     });
@@ -109,7 +109,7 @@ describe('fetchAttachments', () => {
     const body = Buffer.from('hello');
     bodies.set('/a.txt', body);
     const saved = await fetchAttachments({
-      attachments: [ref('/a.txt', body)], requestId: REQUEST_ID, token: 't',
+      attachments: [ref('/a.txt', body)], requestId: REQUEST_ID, token: () => 't',
       expectedOrigin: origin, limits: LIMITS, signal: new AbortController().signal,
     });
     expect(saved[0]!.path.startsWith(attachmentDirFor(REQUEST_ID))).toBe(true);
@@ -123,7 +123,7 @@ describe('fetchAttachments', () => {
     // A half-downloaded or substituted file reads to the model as a genuinely
     // corrupt document, so it must fail loudly here instead.
     await expect(fetchAttachments({
-      attachments: [bad], requestId: REQUEST_ID, token: 't', expectedOrigin: origin,
+      attachments: [bad], requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
       limits: LIMITS, signal: new AbortController().signal,
     })).rejects.toThrow(/checksum/);
   });
@@ -133,7 +133,7 @@ describe('fetchAttachments', () => {
     bodies.set('/y.txt', body);
     const bad = ref('/y.txt', body, { size: 99 });
     await expect(fetchAttachments({
-      attachments: [bad], requestId: REQUEST_ID, token: 't', expectedOrigin: origin,
+      attachments: [bad], requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
       limits: LIMITS, signal: new AbortController().signal,
     })).rejects.toThrow(/bytes but the server said/);
   });
@@ -143,7 +143,7 @@ describe('fetchAttachments', () => {
     bodies.set('/z.txt', body);
     const lying = ref('/z.txt', body, { size: 50 * 1024 * 1024 });
     await expect(fetchAttachments({
-      attachments: [lying], requestId: REQUEST_ID, token: 't', expectedOrigin: origin,
+      attachments: [lying], requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
       limits: LIMITS, signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: 'attachment_too_large' });
     expect(seenAuth).toEqual([]);
@@ -158,7 +158,7 @@ describe('fetchAttachments', () => {
       ref('/1.txt', body, { id: 'c', size: 900 * 1024 }),
     ];
     await expect(fetchAttachments({
-      attachments: refs, requestId: REQUEST_ID, token: 't', expectedOrigin: origin,
+      attachments: refs, requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
       limits: LIMITS, signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: 'attachment_too_large' });
   });
@@ -170,7 +170,7 @@ describe('fetchAttachments', () => {
     bodies.set('/lie.bin', body);
     const understated = ref('/lie.bin', body, { size: 10 });
     await expect(fetchAttachments({
-      attachments: [understated], requestId: REQUEST_ID, token: 't', expectedOrigin: origin,
+      attachments: [understated], requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
       limits: { maxFileBytes: 100_000, maxTotalBytes: 100_000 },
       signal: new AbortController().signal,
     })).rejects.toThrow();
@@ -180,7 +180,7 @@ describe('fetchAttachments', () => {
     const body = Buffer.from('x');
     const foreign = ref('/a.txt', body, { url: 'https://evil.example.com/a.txt' });
     await expect(fetchAttachments({
-      attachments: [foreign], requestId: REQUEST_ID, token: 't', expectedOrigin: origin,
+      attachments: [foreign], requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
       limits: LIMITS, signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: 'attachment_refused' });
   });
@@ -191,7 +191,7 @@ describe('fetchAttachments', () => {
     const body = Buffer.from('x');
     const redirecting = ref('/redirect', body, { url: `${origin}/redirect` });
     await expect(fetchAttachments({
-      attachments: [redirecting], requestId: REQUEST_ID, token: 't', expectedOrigin: origin,
+      attachments: [redirecting], requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
       limits: LIMITS, signal: new AbortController().signal,
     })).rejects.toThrow();
   });
@@ -199,7 +199,7 @@ describe('fetchAttachments', () => {
   it('reports an HTTP failure rather than saving a 404 body', async () => {
     const body = Buffer.from('x');
     await expect(fetchAttachments({
-      attachments: [ref('/missing.txt', body)], requestId: REQUEST_ID, token: 't',
+      attachments: [ref('/missing.txt', body)], requestId: REQUEST_ID, token: () => 't',
       expectedOrigin: origin, limits: LIMITS, signal: new AbortController().signal,
     })).rejects.toThrow(/HTTP 404/);
   });
@@ -211,7 +211,7 @@ describe('fetchAttachments', () => {
     bodies.set('/two/shot.png', b);
     const saved = await fetchAttachments({
       attachments: [ref('/one/shot.png', a), ref('/two/shot.png', b)],
-      requestId: REQUEST_ID, token: 't', expectedOrigin: origin,
+      requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
       limits: LIMITS, signal: new AbortController().signal,
     });
     expect(saved.map((s) => s.name)).toEqual(['shot.png', 'shot-2.png']);
@@ -224,7 +224,7 @@ describe('fetchAttachments', () => {
     bodies.set('/evil', body);
     const traversal = ref('/evil', body, { name: '../../../../tmp/pwned.txt' });
     const saved = await fetchAttachments({
-      attachments: [traversal], requestId: REQUEST_ID, token: 't', expectedOrigin: origin,
+      attachments: [traversal], requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
       limits: LIMITS, signal: new AbortController().signal,
     });
     expect(saved[0]!.path.startsWith(attachmentDirFor(REQUEST_ID))).toBe(true);
@@ -235,7 +235,7 @@ describe('fetchAttachments', () => {
     const body = Buffer.from('x');
     const foreign = ref('/a.txt', body, { url: 'https://evil.example.com/a.txt' });
     await expect(fetchAttachments({
-      attachments: [foreign], requestId: REQUEST_ID, token: 't', expectedOrigin: origin,
+      attachments: [foreign], requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
       limits: LIMITS, signal: new AbortController().signal,
     })).rejects.toBeInstanceOf(RequestRefusal);
   });

@@ -114,6 +114,14 @@ export interface BridgeOptions {
   attachmentLimits?: AttachmentLimits;
   /** Keep downloaded attachments after the turn, for debugging. */
   keepAttachments?: boolean;
+  /**
+   * Permit the server to select `native` isolation.
+   *
+   * Absent means no. `native` is the broadest posture there is, and like
+   * `workspace` it must be the operator's choice rather than a field a server
+   * can send.
+   */
+  allowNative?: boolean;
 }
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
@@ -317,6 +325,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly apiOrigin: string;
   private readonly attachmentLimits: AttachmentLimits;
   private readonly keepAttachments: boolean;
+  /** Whether the operator permitted the server to select `native`. */
+  private readonly allowNative: boolean;
   /**
    * Which directory each CLI session was started in, so a resume that names a
    * different one can be refused instead of silently running against a
@@ -350,6 +360,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.apiOrigin = options.apiOrigin ?? resolveApiOrigin(options.serverUrl);
     this.attachmentLimits = options.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS;
     this.keepAttachments = options.keepAttachments ?? false;
+    this.allowNative = options.allowNative ?? false;
 
     // The MCP server's tool-call handler proxies through the existing
     // toolResolver → WebSocket round-trip. The requestId comes from the
@@ -358,7 +369,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // Bridge-owned tools first, and by exact name. These never become a
       // `tool_call` frame: the server has no idea what a path on this machine
       // is, and asking it would be both useless and a disclosure.
-      if (toolName === ATTACH_FILE_TOOL) {
+      //
+      // Gated on the tool actually being REGISTERED, not just on the name. Two
+      // things go wrong otherwise: in `isolated` the tool is withheld from
+      // tools/list but would still answer if invoked, and a server that
+      // declares a tool of its own called `bridge__attach_file` would have it
+      // silently hijacked into the bridge's uploader instead of round-tripping.
+      if (toolName === ATTACH_FILE_TOOL && this.mcpServer.hasBridgeTool(ATTACH_FILE_TOOL)) {
         return this.handleAttachFile(requestId, args);
       }
 
@@ -1123,6 +1140,22 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return 'isolated';
     }
 
+    // `native` is gated too, and for the same reason — more so, in fact, since
+    // it is strictly MORE permissive than `workspace`: it adds the bypass flags
+    // AND drops `--strict-mcp-config`, handing over the operator's own MCP
+    // servers, hooks and plugins as well as a shell.
+    //
+    // Gating only `workspace` would have been security theatre: a server denied
+    // the shell one way could simply ask for it the other way, and get more.
+    if (requested === 'native' && !this.allowNative) {
+      log.warn(
+        'Server asked for `native` isolation, which hands this machine\'s full CLI environment '
+        + '— shell, your MCP servers, hooks and plugins — to whatever the server sends. '
+        + 'Running `isolated` instead. Pass --allow-native if the server is one you would give a shell to.',
+      );
+      return 'isolated';
+    }
+
     return requested;
   }
 
@@ -1271,6 +1304,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
           // `done` is sent here; the re-issued turn produces its own terminal
           // events. (A genuinely unrelated failure simply resurfaces on the
           // fresh retry, so this broad treatment is safe.)
+          // The session is gone, so what we remember about where it ran is
+          // stale. Dropping it means the server's re-issued turn is judged on
+          // its own merits rather than against a directory that no longer has
+          // a session behind it.
+          if (cliSessionId !== null) {
+            this.sessionWorkingDirs.forget(cliSessionId);
+          }
           this.sendStreamEvent(request_id, 'error', {
             code: 'session_lost',
             message: `Could not resume CLI session: ${errMessage}`,
@@ -1352,7 +1392,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         saved = await fetchAttachments({
           attachments,
           requestId: request_id,
-          token: this.token,
+          token: () => this.token,
           expectedOrigin: this.apiOrigin,
           limits: this.attachmentLimits,
           signal,

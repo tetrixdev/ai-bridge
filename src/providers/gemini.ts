@@ -147,9 +147,17 @@ export class GeminiAdapter extends ProviderAdapter {
       '--skip-trust',                   // Required for headless/non-interactive mode
     ];
 
-    if (context.mcp) {
-      // Limit the visible MCP server set to ours, regardless of what the
-      // operator's user/project settings might contain elsewhere.
+    // Limit the visible MCP server set to ours, regardless of what the
+    // operator's user/project settings might contain elsewhere.
+    //
+    // Outside the `context.mcp` block deliberately. `mcp` is null exactly when
+    // the bridge's own MCP server failed to start — and the turn still runs.
+    // Inside the block, a `workspace` turn would then launch with `--yolo` and
+    // NO server restriction, so gemini would load the operator's
+    // `~/.gemini/settings.json` servers and the checkout's own
+    // `.gemini/settings.json`, auto-approving every tool they expose. Same
+    // shape as the Claude flags; same reason.
+    if (context.cliIsolation !== 'native') {
       args.push('--allowed-mcp-server-names', BRIDGE_MCP_SERVER_NAME);
     }
 

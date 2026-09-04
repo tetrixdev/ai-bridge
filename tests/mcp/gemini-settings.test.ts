@@ -93,6 +93,19 @@ describe('the bridge own scratch directory', () => {
     expect(existsSync(settingsPath)).toBe(true);
   });
 
+  it('allows two concurrent turns, which is what a default install does', () => {
+    // Locking the shared scratch directory would refuse the SECOND of any two
+    // concurrent Gemini turns on an install that never asked for workspaces —
+    // a visible regression in the default configuration.
+    const first = acquireGeminiSettings(checkout, conn, false);
+    try {
+      const second = acquireGeminiSettings(checkout, { ...conn, bearerToken: 'tok-2' }, false);
+      second.release();
+    } finally {
+      first.release();
+    }
+  });
+
   it('overwrites its own previous file rather than refusing', () => {
     acquireGeminiSettings(checkout, conn, false).release();
     const handle = acquireGeminiSettings(checkout, { ...conn, bearerToken: 'tok-2' }, false);

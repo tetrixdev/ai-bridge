@@ -280,7 +280,9 @@ How much of the operator's local environment the spawned CLI may see, and what i
 
 `--skip-git-repo-check` on Codex exists because the pinned scratch cwd is not a repository. Inside a real checkout it is a no-op; it is left in place because it is still correct for the scratch case.
 
-**`workspace` is refused unless the operator opted in.** A bridge started without `--allow-dir` runs `isolated` instead and logs why. This is not a formality: `workspace` is what enables the shell, and a shell in the empty scratch directory is still a shell — so if the allow-list bounded only the working directory, a server could switch the capability on by sending this field. It cannot. Same rule as `--local-tools`.
+**Both permissive postures are refused unless the operator opted in.** `workspace` requires `--allow-dir`; `native` requires `--allow-native`. A bridge started without them runs `isolated` instead and logs why.
+
+This is not a formality. `workspace` is what enables the shell, and a shell in the empty scratch directory is still a shell — so if the allow-list bounded only the working directory, a server could switch the capability on by sending this field. And gating `workspace` alone would have been theatre, because `native` is strictly broader: a server refused the shell one way would ask for it the other way and get the operator's own MCP servers, hooks and plugins as well. Same rule as `--local-tools`, in all three cases.
 
 An unrecognised value — a typo, a newer server — is also treated as `isolated` rather than passed to the adapters, which test it with `!== 'isolated'` and would otherwise land in the permissive branch on one CLI and the restrictive branch on another.
 

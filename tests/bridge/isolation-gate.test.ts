@@ -34,13 +34,18 @@ function bridgeToolNames(bridge: Bridge): string[] {
   return server.bridgeTools.map((t) => t.name);
 }
 
-async function welcomed(allowedRoots: AllowedRoot[], isolation?: string): Promise<Bridge> {
+async function welcomed(
+  allowedRoots: AllowedRoot[],
+  isolation?: string,
+  allowNative = false,
+): Promise<Bridge> {
   const bridge = new Bridge({
     serverUrl: 'wss://example.test/ws',
     token: 'tok',
     providers: [],
     adapters: new Map<string, ProviderAdapter>(),
     allowedRoots,
+    allowNative,
   });
 
   const welcome = {
@@ -84,10 +89,23 @@ describe('adopting the server posture', () => {
     expect(adopted(bridge)).toBe('isolated');
   });
 
-  it('still accepts native without an allow-list, since that is its own opt-in', async () => {
-    // `native` is configured server-side and has always meant "the operator is
-    // the user". Gating it on --allow-dir would change an unrelated posture.
-    expect(adopted(await welcomed([], 'native'))).toBe('native');
+  it('REFUSES native unless the operator passed --allow-native', async () => {
+    // `native` is strictly MORE permissive than `workspace` — the bypass flags
+    // plus the operator's own MCP servers, hooks and plugins. Gating only
+    // `workspace` would have been theatre: a server denied the shell one way
+    // could ask for it the other way and get more.
+    expect(adopted(await welcomed([], 'native'))).toBe('isolated');
+    expect(adopted(await welcomed([{ path: root, label: 'root' }], 'native'))).toBe('isolated');
+  });
+
+  it('accepts native once the operator opted in', async () => {
+    expect(adopted(await welcomed([], 'native', true))).toBe('native');
+  });
+
+  it('does not let --allow-native imply a workspace allow-list', async () => {
+    // The two opt-ins are separate: permitting `native` says nothing about
+    // which directories a server may name.
+    expect(adopted(await welcomed([], 'workspace', true))).toBe('isolated');
   });
 
   it('falls back to isolated for an unrecognised posture', async () => {

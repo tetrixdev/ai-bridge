@@ -83,6 +83,14 @@ describe('sanitiseAttachmentName', () => {
     expect(sanitiseAttachmentName('...hidden', 'att_1')).toBe('hidden');
   });
 
+  it('cannot be tricked into a hidden file by mixing dots and whitespace', () => {
+    // Stripping dots and trimming in two passes — in either order — lets the
+    // other character type re-expose what the first pass removed.
+    for (const name of [' .bashrc', '. .bashrc', ' . . .bashrc', '\t.bashrc', '. ..bashrc']) {
+      expect(sanitiseAttachmentName(name, 'att_1').startsWith('.')).toBe(false);
+    }
+  });
+
   it('falls back to the id when nothing usable survives', () => {
     expect(sanitiseAttachmentName('..', 'att_9f3c')).toBe('attachment-att_9f3c');
     expect(sanitiseAttachmentName('', 'att_9f3c')).toBe('attachment-att_9f3c');

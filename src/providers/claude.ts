@@ -116,9 +116,9 @@ export class ClaudeAdapter extends ProviderAdapter {
     // `-p` mode (no interactive approver), so the model can only reach our
     // tools — not shell.
     //
-    // In `native` mode the operator's other MCP servers stay loadable and we
-    // pass `--permission-mode bypassPermissions`, matching the legacy posture
-    // for the developer-runs-bridge-against-own-machine case.
+    // In `native` mode the operator's other MCP servers stay loadable. The
+    // permission mode is decided separately, below, because it must not depend
+    // on whether an MCP channel exists.
     // `isolated` AND `workspace` both keep the operator's own MCP servers out.
     // That is the half of isolation `workspace` does NOT relax: it widens what
     // the model may do with the repository in front of it, not what else on
@@ -135,16 +135,22 @@ export class ClaudeAdapter extends ProviderAdapter {
       args.push('--strict-mcp-config');
     }
 
+    // Also outside the `context.mcp` block, and for the same reason as
+    // `--strict-mcp-config`: without it, an `isolated` turn whose MCP channel
+    // failed to start would run with NO tool restriction at all — the flag
+    // dropped exactly where it matters most.
+    //
+    // Glob is supported in --allowedTools matchers (per Claude CLI docs, e.g.
+    // "Bash(git *)"). `mcp__<server>__*` is the standard MCP tool namespace
+    // prefix Claude uses. Omitted in `workspace`, where the built-in Read /
+    // Edit / Write / Bash tools are exactly what we want.
+    if (context.cliIsolation === 'isolated') {
+      args.push('--allowedTools', `mcp__${BRIDGE_MCP_SERVER_NAME}__*`);
+    }
+
     if (context.mcp) {
       const configPath = writeClaudeMcpConfig(context.mcp);
       args.push('--mcp-config', configPath);
-      if (context.cliIsolation === 'isolated') {
-        // Glob is supported in --allowedTools matchers (per Claude CLI docs,
-        // e.g. "Bash(git *)"). `mcp__<server>__*` is the standard MCP tool
-        // namespace prefix Claude uses. Omitted in `workspace`, where the
-        // built-in Read / Edit / Write / Bash tools are exactly what we want.
-        args.push('--allowedTools', `mcp__${BRIDGE_MCP_SERVER_NAME}__*`);
-      }
     }
 
     // Permission mode, decided independently of whether any tools were

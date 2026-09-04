@@ -100,7 +100,7 @@ function withTimeout(signal: AbortSignal, ms: number): { signal: AbortSignal; do
 async function downloadOne(
   ref: AttachmentRef,
   destPath: string,
-  token: string,
+  token: () => string,
   expectedOrigin: string,
   remainingBytes: number,
   perFileCap: number,
@@ -112,7 +112,7 @@ async function downloadOne(
   const { signal: fetchSignal, done } = withTimeout(signal, DOWNLOAD_TIMEOUT_MS);
   try {
     const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { Authorization: `Bearer ${token()}` },
       // A redirect is how the host binding above would otherwise be bypassed:
       // an allowed origin answering with a 302 to anywhere it likes. Refusing
       // to follow one keeps the check meaningful.
@@ -220,7 +220,12 @@ async function downloadOne(
 export async function fetchAttachments(opts: {
   attachments: AttachmentRef[];
   requestId: string;
-  token: string;
+  /**
+   * Read at use time, not captured. Each download may take up to two minutes
+   * and they run in sequence, so a token refresh part-way through a multi-file
+   * turn would otherwise fail every remaining file on an opaque 401.
+   */
+  token: () => string;
   expectedOrigin: string;
   limits: AttachmentLimits;
   signal: AbortSignal;
@@ -250,7 +255,20 @@ export async function fetchAttachments(opts: {
     }
   }
 
-  const dir = ensureAttachmentDir(requestId);
+  let dir: string;
+  try {
+    dir = ensureAttachmentDir(requestId);
+  } catch (err) {
+    // A local disk problem — ENOSPC, a permissions change on ~/.cache — is not
+    // a lost CLI session. Raised as a refusal because a bare Error on a resumed
+    // turn is translated into `session_lost`, which makes the server wipe a
+    // perfectly good session and re-issue the turn, so a transient full disk
+    // would cost the user their whole conversation.
+    throw new RequestRefusal(
+      ATTACHMENT_FAILED,
+      `Could not create the attachment directory: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   const taken = new Set<string>();
   const saved: SavedAttachment[] = [];
   let usedBytes = 0;

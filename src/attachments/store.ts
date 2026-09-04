@@ -102,12 +102,12 @@ export function sanitiseAttachmentName(name: string, id: string): string {
     // confusing in a prompt preamble the model is about to read.
     // eslint-disable-next-line no-control-regex
     .replace(/[\x00-\x1f\x7f]/g, '')
-    // Trim FIRST, then strip leading dots. The other order lets " .bashrc"
-    // through: the dot-stripper sees a leading space, does nothing, and the
-    // trim then exposes the dot it was supposed to have removed.
-    .trim()
-    .replace(/^\.+/, '')
-    .trim();
+    // Leading dots and whitespace stripped in ONE pass. Doing it in two —
+    // whichever order — leaves the other character type able to re-expose what
+    // the first pass removed: ". .bashrc" survives a trim-then-strip as
+    // ".bashrc", and " .bashrc" survives a strip-then-trim the same way.
+    .replace(/^[.\s]+/, '')
+    .trimEnd();
 
   if (cleaned === '' || cleaned === '.' || cleaned === '..') {
     return fallback;

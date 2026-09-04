@@ -38,6 +38,7 @@ npx @tetrixdev/ai-bridge
 | `--api <url>` | `AI_BRIDGE_API` | Base URL of the server's HTTP API for attachments, when it is not the same host as `--server`. Defaults to the `https://` origin of `--server` |
 | `--attachment-max-mb <n>` | | Largest single attachment to download (default `25`) |
 | `--attachment-total-mb <n>` | | Largest total of attachments per request (default `100`) |
+| `--allow-native` | | Permit the server to select `native` isolation — the CLI's full local environment, including your own MCP servers, hooks, plugins and a shell. **Off unless you pass it.** Only for a bridge you run against your own machine |
 | `--keep-attachments` | | Keep downloaded attachments after a turn instead of deleting them. Debugging aid |
 
 ## Working in a repository
@@ -62,12 +63,18 @@ handshake. [PROTOCOL.md](PROTOCOL.md) gives the per-CLI flags; the shape is:
 | `workspace` | **also use its own file and shell tools**, in the directory the server named. | stays out — your MCP servers, hooks and plugins are still excluded. |
 | `native` | do anything the CLI can do. | is fully in play. |
 
-**`workspace` requires `--allow-dir`.** A bridge started without it refuses that
-posture and runs `isolated` instead, saying so in the log. This matters more
-than it looks: `workspace` is what enables the shell, and a shell in an empty
-scratch directory is still a shell. If the allow-list bounded only the
-*directory*, a server could switch the capability on by sending a field. It
-cannot. Same rule as `--local-tools` — the operator opts in, never the server.
+**Both of the permissive postures require an operator opt-in.** `workspace`
+needs `--allow-dir`; `native` needs `--allow-native`. A bridge started without
+them refuses that posture and runs `isolated` instead, saying so in the log.
+
+This matters more than it looks. `workspace` is what enables the shell, and a
+shell in an empty scratch directory is still a shell — so if the allow-list
+bounded only the *directory*, a server could switch the capability on by
+sending a field. And gating `workspace` alone would have been theatre, because
+`native` is strictly broader: a server refused the shell one way would simply
+ask for it the other way and get the operator's own MCP servers, hooks and
+plugins along with it. Same rule as `--local-tools`, in all three cases: the
+operator opts in, never the server.
 
 The bridge advertises what you allowed in its handshake, so the app can show a picker of your checkouts rather than asking you to type a path. A request naming anything outside those roots is refused, and so is one naming a directory that does not exist — the bridge never creates it, because a typo that silently starts an empty session looks exactly like a session that worked.
 
@@ -93,11 +100,6 @@ Two Gemini turns *without* a working directory still share the bridge's scratch
 directory and so still race on that one file — a pre-existing wrinkle this
 release does not fix, because the fix is a per-turn scratch directory for every
 provider. Claude and Codex are unaffected.
-
-Two Gemini turns *without* a working directory still share the bridge's scratch
-directory and therefore still race on that one file — a pre-existing wrinkle
-this release does not fix, because the fix is a per-turn scratch directory for
-every provider. Claude and Codex are unaffected.
 
 ## Attachments
 

@@ -84,9 +84,15 @@ function isWithin(candidate: string, root: string): boolean {
  * Check a model-supplied path is one this turn is allowed to send.
  *
  * Same shape as the working-directory check, and for the same reason: the
- * comparison happens after `realpath`, so a symlink the model just created
- * pointing at `~/.ssh/id_ed25519` is caught rather than followed. The model
- * has a shell in `workspace` mode, so it can absolutely create one.
+ * comparison happens after `realpath`, so a symlink pointing at
+ * `~/.ssh/id_ed25519` is caught rather than followed.
+ *
+ * It is a containment check, not a boundary. The path is resolved and then
+ * read as two separate operations, so a model with a shell could swap one for
+ * a symlink in between — but a model with a shell can also just copy the file
+ * into the working directory, so nothing here is load-bearing against it. What
+ * this does carry weight against is a server naming a path it should not, and
+ * an `isolated` turn, which has no shell at all.
  */
 export function resolveUploadPath(rawPath: string, ctx: UploadContext): string {
   if (typeof rawPath !== 'string' || rawPath.length === 0) {

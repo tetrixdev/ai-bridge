@@ -138,6 +138,52 @@ describe('resolveWorkingDir', () => {
     expect(fake).toBe('working_dir_not_allowed');
   });
 
+  it('keeps the session directory when a resume names nothing', () => {
+    // Absent means "the default", and once a session exists its own directory
+    // IS the default. Reading it as the scratch dir would refuse the turn as
+    // working_dir_changed, naming a temp directory the request never mentioned.
+    expect(resolveWorkingDir(undefined, [allowed], checkout)).toBe(checkout);
+    expect(resolveWorkingDir(undefined, [], checkout)).toBe(checkout);
+  });
+
+  it('still uses the scratch directory when there is no session either', () => {
+    expect(resolveWorkingDir(undefined, [allowed], undefined)).toBe(getBridgeWorkingDir());
+  });
+
+  it('accepts a resume that names the same directory', () => {
+    expect(resolveWorkingDir(checkout, [allowed], checkout)).toBe(checkout);
+  });
+
+  it('accepts a resume naming the same directory through a symlink', () => {
+    // The comparison is on the RESOLVED path, so an equivalent spelling is not
+    // mistaken for a move.
+    const link = join(root, 'link-to-repo');
+    symlinkSync(checkout, link, 'dir');
+    try {
+      expect(resolveWorkingDir(link, [allowed, root], checkout)).toBe(checkout);
+    } finally {
+      rmSync(link, { force: true });
+    }
+  });
+
+  it('refuses a resume that names a different directory', () => {
+    const other = join(allowed, 'other-repo');
+    mkdirSync(other, { recursive: true });
+    let code: string | undefined;
+    try {
+      resolveWorkingDir(other, [allowed], checkout);
+    } catch (err) {
+      code = (err as RequestRefusal).code;
+    }
+    expect(code).toBe('working_dir_changed');
+  });
+
+  it('checks the allow-list before the session, so a disallowed resume is not accepted', () => {
+    // Otherwise a session recorded against a directory the operator has since
+    // removed from --allow-dir would keep running there.
+    expect(() => resolveWorkingDir(outside, [allowed], outside)).toThrow(RequestRefusal);
+  });
+
   it('accepts a path under any one of several roots', () => {
     expect(resolveWorkingDir(checkout, [outside, allowed])).toBe(checkout);
   });

@@ -195,6 +195,17 @@ export class BridgeMcpServer {
   }
 
   /**
+   * Whether a given bridge-owned tool is currently registered.
+   *
+   * The call handler consults this before dispatching by name, so a tool that
+   * is withheld from tools/list is also refused when invoked, and a
+   * server-declared tool cannot shadow a bridge one.
+   */
+  hasBridgeTool(name: string): boolean {
+    return this.bridgeTools.some((t) => t.name === name);
+  }
+
+  /**
    * True when the MCP server has anything at all to offer.
    *
    * The bridge starts this server lazily, and used to key that off "the server
