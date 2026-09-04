@@ -54,6 +54,9 @@ npx @tetrixdev/ai-bridge \
 
 ### The posture is server-sent; the capability is yours
 
+> Full detail — how `isolated` is enforced, what it does not stop, and how to
+> check it on your own machine — is in [docs/isolation.md](docs/isolation.md).
+
 The server chooses how much the CLI may do, by sending `cli_isolation` on the
 handshake. [PROTOCOL.md](PROTOCOL.md) gives the per-CLI flags; the shape is:
 
