@@ -145,19 +145,30 @@ export class ClaudeAdapter extends ProviderAdapter {
     // prefix Claude uses. Omitted in `workspace`, where the built-in Read /
     // Edit / Write / Bash tools are exactly what we want.
     if (context.cliIsolation === 'isolated') {
-      // A turn carrying attachments also needs the read-only file tools, or
-      // the preamble names paths the model is not permitted to open and the
-      // turn ends with it saying it cannot see a file the user just attached —
-      // with nothing in the logs pointing at this flag. Read-only only: no
-      // Write, no Edit, no Bash. The files live in the bridge's own cache
-      // directory, so this does not widen what an isolated turn can reach on
-      // the rest of the machine.
+      // A turn carrying attachments needs to be able to read them: the
+      // preamble names absolute paths outside cwd, and without a rule covering
+      // them the turn ends with the model saying it cannot see a file the user
+      // just attached, with nothing in the logs pointing at this flag.
+      //
+      // SCOPED TO THE ATTACHMENT DIRECTORY, and nothing else. A bare `Read`
+      // here would be a whole-filesystem read grant — verified against Claude
+      // 2.1.260: `--allowedTools "…,Read"` reads `/etc`, `~/.ssh` and anything
+      // else, because the entry pre-approves the tool rather than bounding it.
+      // A server controls both the attachments and the message, so that would
+      // hand any server arbitrary file read in the DEFAULT posture, switched
+      // on by sending a field — the exact thing --allow-dir and --local-tools
+      // exist to prevent.
+      //
+      // The `Read(/<abs path>/**)` form is a gitignore-style absolute matcher
+      // (the doubled slash is load-bearing). Verified to allow the attachment
+      // and to deny a path outside it. Glob and Grep are deliberately NOT
+      // granted: the preamble gives absolute paths, so nothing needs to search.
       //
       // Comma-separated in ONE argv value rather than several: this flag is
       // variadic, and a bare list would let it swallow the flag that follows.
       const allowed = [`mcp__${BRIDGE_MCP_SERVER_NAME}__*`];
-      if (context.hasAttachments) {
-        allowed.push('Read', 'Glob', 'Grep');
+      if (context.attachmentDir) {
+        allowed.push(`Read(/${context.attachmentDir}/**)`);
       }
       args.push('--allowedTools', allowed.join(','));
     }

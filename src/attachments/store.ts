@@ -49,13 +49,53 @@ export function attachmentDirFor(requestId: string): string {
   return join(attachmentsRoot(), safeRequestDirName(requestId));
 }
 
+/**
+ * Request directories with files currently on disk.
+ *
+ * The per-turn `finally` only runs when the turn settles, which it never does
+ * if the process is terminated — the shutdown handler aborts the requests and
+ * calls process.exit without waiting for async cleanup. Without this the
+ * files, which are whatever a colleague sent into a chat, would sit in the
+ * cache indefinitely, contrary to the unqualified promise that they are
+ * deleted when the turn ends.
+ */
+const liveAttachmentDirs = new Set<string>();
+
+let exitHookInstalled = false;
+
+function installExitHook(): void {
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+
+  process.on('exit', () => {
+    for (const requestId of liveAttachmentDirs) {
+      try {
+        rmSync(attachmentDirFor(requestId), { recursive: true, force: true });
+      } catch {
+        // Best-effort by definition: the process is already going away.
+      }
+    }
+    liveAttachmentDirs.clear();
+  });
+}
+
 /** Create the request's attachment directory, private to this user. */
 export function ensureAttachmentDir(requestId: string): string {
   const dir = attachmentDirFor(requestId);
   // 0700: the files are whatever a colleague sent into a chat, and there is no
   // reason for another local account to read them.
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  installExitHook();
+  liveAttachmentDirs.add(requestId);
   return dir;
+}
+
+/** Test seam: run the exit-time cleanup, as process termination would. */
+export function removeAttachmentDirsOnExit(): void {
+  for (const requestId of liveAttachmentDirs) {
+    rmSync(attachmentDirFor(requestId), { recursive: true, force: true });
+  }
+  liveAttachmentDirs.clear();
 }
 
 /**
@@ -66,6 +106,7 @@ export function ensureAttachmentDir(requestId: string): string {
  * without bound precisely on the machines where things go wrong most.
  */
 export function removeAttachmentDir(requestId: string): void {
+  liveAttachmentDirs.delete(requestId);
   rmSync(attachmentDirFor(requestId), { recursive: true, force: true });
 }
 

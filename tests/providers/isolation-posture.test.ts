@@ -48,7 +48,7 @@ async function launch(
   AdapterClass: new () => ClaudeAdapter | CodexAdapter | GeminiAdapter,
   isolation: CliIsolation,
   withMcp = true,
-  hasAttachments = false,
+  attachmentDir: string | null = null,
 ): Promise<Launch> {
   const recorded: Launch = { command: '', args: [] };
 
@@ -92,7 +92,7 @@ async function launch(
     signal: new AbortController().signal,
     requestTimeoutSeconds: 30,
     cliSessionId: null,
-    hasAttachments,
+    attachmentDir,
   };
 
   await new Probe().execute(context, (_e: AdapterStreamEvent) => undefined);
@@ -141,18 +141,24 @@ describe('claude', () => {
     // only `mcp__bridge__*` allowed, Read is denied in headless mode and the
     // turn ends with the model saying it cannot see a file the user just
     // attached — and nothing in the logs points at this flag.
-    const { args } = await launch(ClaudeAdapter, 'isolated', true, true);
+    const attachDir = '/home/dev/.cache/ai-bridge/attachments/req-1';
+    const { args } = await launch(ClaudeAdapter, 'isolated', true, attachDir);
     const allowed = args[args.indexOf('--allowedTools') + 1] ?? '';
 
     expect(allowed).toContain(`mcp__${BRIDGE_MCP_SERVER_NAME}__*`);
-    expect(allowed.split(',')).toContain('Read');
-    // Read-only: the files are in the bridge's cache, not the machine at large.
+    // Scoped to the attachment directory and nothing else. A bare `Read` here
+    // is a whole-filesystem read grant — verified against the real CLI — which
+    // a server could switch on by sending a field.
+    expect(allowed).toContain(`Read(/${attachDir}/**)`);
+    expect(allowed.split(',')).not.toContain('Read');
+    expect(allowed.split(',')).not.toContain('Glob');
+    expect(allowed.split(',')).not.toContain('Grep');
     expect(allowed.split(',')).not.toContain('Write');
     expect(allowed.split(',')).not.toContain('Bash');
   });
 
   it('does not widen the tool surface on a turn with no attachments', async () => {
-    const { args } = await launch(ClaudeAdapter, 'isolated', true, false);
+    const { args } = await launch(ClaudeAdapter, 'isolated', true, null);
     const allowed = args[args.indexOf('--allowedTools') + 1] ?? '';
 
     expect(allowed).toBe(`mcp__${BRIDGE_MCP_SERVER_NAME}__*`);

@@ -90,10 +90,21 @@ export function buildSpawnEnv(
       env[key] = value;
     }
   }
-  // Remove bridge credential variables from the child process environment so
-  // the token does not leak into /proc/<pid>/environ or the CLI's own logging.
+  // Remove credential variables from the child process environment so they do
+  // not leak into /proc/<pid>/environ or the CLI's own logging.
+  //
+  // ENGRAM_TOKEN belongs on this list as much as the bridge's own token — it
+  // is the vault credential, and it defaults to the bridge token when unset.
+  // It was survivable while `isolated` was the only posture a server could
+  // ask for, because that CLI has no shell. `workspace` gives every provider
+  // one, so a single `printenv ENGRAM_TOKEN` would hand the vault credential
+  // back to the server in the assistant's own transcript. src/local/executor.ts
+  // makes the same argument for local tools and solves it with an allowlist.
   delete env['AI_BRIDGE_TOKEN'];
   delete env['AI_BRIDGE_SERVER'];
+  delete env['ENGRAM_TOKEN'];
+  delete env['ENGRAM_URL'];
+  delete env['ENGRAM_IDENTITY'];
   return env;
 }
 

@@ -6,6 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   attachmentDirFor,
@@ -13,6 +14,9 @@ import {
   disambiguate,
   safeRequestDirName,
   sanitiseAttachmentName,
+  ensureAttachmentDir,
+  removeAttachmentDir,
+  removeAttachmentDirsOnExit,
 } from '../../src/attachments/store.js';
 
 describe('safeRequestDirName', () => {
@@ -61,6 +65,30 @@ describe('attachmentDirFor', () => {
   it('cannot be escaped by a hostile request id', () => {
     const dir = attachmentDirFor('../../../etc');
     expect(dir.startsWith(attachmentsRoot())).toBe(true);
+  });
+});
+
+describe('cleanup when the process dies mid-turn', () => {
+  it('takes the attachment directory with it', () => {
+    // The per-turn `finally` never runs on SIGTERM: the shutdown handler
+    // aborts the requests and calls process.exit without waiting for async
+    // cleanup. The files are whatever a colleague sent into a chat.
+    const id = 'req_exit_probe';
+    const dir = ensureAttachmentDir(id);
+    writeFileSync(join(dir, 'secret.pdf'), 'bytes');
+    expect(existsSync(dir)).toBe(true);
+
+    removeAttachmentDirsOnExit();
+
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it('does not try to remove a directory already cleaned up normally', () => {
+    const id = 'req_exit_probe_2';
+    ensureAttachmentDir(id);
+    removeAttachmentDir(id);
+
+    expect(() => removeAttachmentDirsOnExit()).not.toThrow();
   });
 });
 

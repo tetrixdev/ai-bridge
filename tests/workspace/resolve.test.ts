@@ -11,7 +11,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { resolveWorkingDir } from '../../src/workspace/resolve.js';
 import { RequestRefusal } from '../../src/errors.js';
 import { getBridgeWorkingDir } from '../../src/providers/env.js';
@@ -143,7 +143,30 @@ describe('resolveWorkingDir', () => {
     // IS the default. Reading it as the scratch dir would refuse the turn as
     // working_dir_changed, naming a temp directory the request never mentioned.
     expect(resolveWorkingDir(undefined, [allowed], checkout)).toBe(checkout);
-    expect(resolveWorkingDir(undefined, [], checkout)).toBe(checkout);
+  });
+
+  it('refuses a remembered directory the operator has since revoked', () => {
+    // The record outlives the configuration. An operator who narrows
+    // --allow-dir has revoked a directory, and a resumed session that kept
+    // running there — with `workspace` still granted, so with a shell — would
+    // make the revocation meaningless.
+    let code: string | undefined;
+    try {
+      resolveWorkingDir(undefined, [], checkout);
+    } catch (err) {
+      code = (err as RequestRefusal).code;
+    }
+    expect(code).toBe('working_dir_not_allowed');
+  });
+
+  it('sends a chat-only session to the current scratch directory, not a stale one', () => {
+    // A scratch dir is made fresh per process, so a remembered one is a stale
+    // sibling that no longer exists — and is inside no allowed root, so a bare
+    // containment check would refuse every chat-only conversation that
+    // outlived a bridge restart.
+    const stale = join(dirname(getBridgeWorkingDir()), 'workdir-fromLastRun');
+    expect(resolveWorkingDir(undefined, [allowed], stale)).toBe(getBridgeWorkingDir());
+    expect(resolveWorkingDir(undefined, [], stale)).toBe(getBridgeWorkingDir());
   });
 
   it('still uses the scratch directory when there is no session either', () => {

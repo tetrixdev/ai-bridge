@@ -47,7 +47,7 @@ import type { Redaction } from './local/scrub.js';
 import { BridgeMcpServer } from './mcp/server.js';
 import { rootPaths, toWorkspaceRefs, type AllowedRoot } from './workspace/allowlist.js';
 import { resolveWorkingDir, WORKING_DIR_CHANGED } from './workspace/resolve.js';
-import { SessionWorkingDirs } from './workspace/sessions.js';
+import { SessionWorkingDirs, sessionStorePath } from './workspace/sessions.js';
 import {
   buildAttachmentPreamble,
   fetchAttachments,
@@ -114,6 +114,15 @@ export interface BridgeOptions {
   attachmentLimits?: AttachmentLimits;
   /** Keep downloaded attachments after the turn, for debugging. */
   keepAttachments?: boolean;
+  /**
+   * Where the session→working-directory record is persisted.
+   *
+   * `null` disables persistence. Exists so the test suite does not write into
+   * the operator's real `~/.cache/ai-bridge/sessions.json` — running the tests
+   * on a machine with a live bridge used to overwrite that bridge's map with
+   * temp paths from the suite.
+   */
+  sessionStorePath?: string | null;
   /**
    * Permit the server to select `native` isolation.
    *
@@ -332,7 +341,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * different one can be refused instead of silently running against a
    * session whose whole history is about another checkout.
    */
-  private readonly sessionWorkingDirs = new SessionWorkingDirs();
+  private readonly sessionWorkingDirs: SessionWorkingDirs;
   /**
    * Per-request state the bridge-owned MCP tools need.
    *
@@ -361,6 +370,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.attachmentLimits = options.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS;
     this.keepAttachments = options.keepAttachments ?? false;
     this.allowNative = options.allowNative ?? false;
+    this.sessionWorkingDirs = new SessionWorkingDirs(
+      undefined,
+      options.sessionStorePath === undefined ? sessionStorePath() : options.sessionStorePath,
+    );
 
     // The MCP server's tool-call handler proxies through the existing
     // toolResolver → WebSocket round-trip. The requestId comes from the
@@ -1429,7 +1442,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         signal,
         requestTimeoutSeconds: this.serverConfig.request_timeout,
         cliSessionId,
-        hasAttachments: saved.length > 0,
+        attachmentDir: saved.length > 0 ? attachmentDirFor(request_id) : null,
       };
 
       // The adapter emits its own `done`, but the CLI session id is only known

@@ -10,7 +10,7 @@
  */
 
 import { realpathSync, statSync } from 'node:fs';
-import { isAbsolute, resolve as resolvePath, sep } from 'node:path';
+import { dirname, isAbsolute, resolve as resolvePath, sep } from 'node:path';
 import { RequestRefusal } from '../errors.js';
 import { getBridgeWorkingDir } from '../providers/env.js';
 
@@ -28,6 +28,17 @@ export const WORKING_DIR_CHANGED = 'working_dir_changed';
  */
 function isWithin(candidate: string, root: string): boolean {
   return candidate === root || candidate.startsWith(root + sep);
+}
+
+/**
+ * Is this one of the bridge's own scratch directories?
+ *
+ * They are siblings — `mkdtemp` under a fixed cache root, one per process — so
+ * a path recorded by an earlier run is recognisable even though it no longer
+ * exists and is not the one this process would use.
+ */
+function isBridgeScratchDir(candidate: string): boolean {
+  return dirname(candidate) === dirname(getBridgeWorkingDir());
 }
 
 /** Render the allow-list for an error message, or say there isn't one. */
@@ -70,7 +81,36 @@ export function resolveWorkingDir(
   //    then quietly run in that empty directory — the outcome this whole
   //    module exists to prevent.
   if (requested === undefined || requested === null || requested === '') {
-    return sessionDir ?? getBridgeWorkingDir();
+    if (sessionDir === undefined) {
+      return getBridgeWorkingDir();
+    }
+
+    // A remembered scratch directory means the session was an ordinary chat.
+    // Return the CURRENT one rather than the remembered path: the scratch dir
+    // is made fresh per process, so after a restart the recorded path is a
+    // stale sibling that no longer exists — and it is inside no allowed root,
+    // so the check below would refuse every chat-only conversation that
+    // outlived a restart.
+    if (isBridgeScratchDir(sessionDir)) {
+      return getBridgeWorkingDir();
+    }
+
+    // Any other remembered directory is checked against the allow-list AS IT
+    // IS NOW. The record outlives the configuration: an operator who narrows
+    // --allow-dir and restarts has revoked a directory, and a resumed session
+    // that silently kept running there — with `workspace` still granted, so
+    // with a shell — would make the revocation meaningless. The record is a
+    // convenience, never a permission.
+    if (!allowedRoots.some((root) => isWithin(sessionDir, root))) {
+      throw new RequestRefusal(
+        WORKING_DIR_NOT_ALLOWED,
+        `This conversation's CLI session runs in "${sessionDir}", which is no longer inside a `
+        + `permitted root (${describeRoots(allowedRoots)}). `
+        + 'Start a new conversation, or restart the bridge with that directory allowed.',
+      );
+    }
+
+    return sessionDir;
   }
 
   // 2. The operator never opted in. Reported before anything is touched on

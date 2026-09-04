@@ -76,6 +76,8 @@ async function startBridge(allowedRoots: AllowedRoot[], adapter: RecordingAdapte
       supports_tools: true, supports_thinking: false, supports_session_resume: true,
     }],
     adapters: new Map([['fake', adapter as unknown as ProviderAdapter]]),
+    // Never the operator\'s real store — the suite must not overwrite it.
+    sessionStorePath: null,
     allowedRoots,
   });
   bridge.connect();

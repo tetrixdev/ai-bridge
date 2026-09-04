@@ -36,6 +36,13 @@ export function sessionStorePath(): string {
 export class SessionWorkingDirs {
   /** Insertion-ordered, which is what makes the eviction below oldest-first. */
   private readonly map = new Map<string, string>();
+  /**
+   * Every session id this process has recorded or dropped.
+   *
+   * The merge in save() protects another bridge's entries; without this it
+   * would also protect our OWN deleted ones, quietly undoing every forget().
+   */
+  private readonly seen = new Set<string>();
 
   /**
    * @param capacity  How many sessions to remember.
@@ -61,6 +68,7 @@ export class SessionWorkingDirs {
       this.map.delete(sessionId);
     }
     this.map.set(sessionId, workingDir);
+    this.seen.add(sessionId);
 
     while (this.map.size > this.capacity) {
       const oldest = this.map.keys().next();
@@ -78,7 +86,9 @@ export class SessionWorkingDirs {
 
   /** Drop a session — used when the server tells us the session is gone. */
   forget(sessionId: string): void {
-    if (this.map.delete(sessionId)) {
+    const had = this.map.delete(sessionId);
+    this.seen.add(sessionId);
+    if (had) {
       this.save();
     }
   }
@@ -93,26 +103,45 @@ export class SessionWorkingDirs {
    * unreadable or corrupt file simply means an empty map, which is the
    * position a first run is in. This must never stop the bridge starting.
    */
-  private load(): void {
-    if (this.storePath === null) return;
+  private readRaw(): Record<string, string> {
+    if (this.storePath === null) return {};
 
     let raw: string;
     try {
       raw = readFileSync(this.storePath, 'utf-8');
     } catch {
-      return; // No file yet, or unreadable. Either way, start empty.
+      return {}; // No file yet, or unreadable. Either way, nothing to merge.
     }
 
     try {
       const parsed: unknown = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
 
+      const out: Record<string, string> = {};
       for (const [sessionId, workingDir] of Object.entries(parsed as Record<string, unknown>)) {
         // Values are paths this process will later hand to `spawn` as cwd, so
         // anything that is not a plain string is dropped rather than trusted.
         if (typeof workingDir === 'string' && workingDir !== '') {
-          this.map.set(sessionId, workingDir);
+          out[sessionId] = workingDir;
         }
+      }
+
+      return out;
+    } catch {
+      log.warn('Session working-directory store is unreadable — starting empty', {
+        path: this.storePath,
+      });
+
+      return {};
+    }
+  }
+
+  private load(): void {
+    if (this.storePath === null) return;
+
+    try {
+      for (const [sessionId, workingDir] of Object.entries(this.readRaw())) {
+        this.map.set(sessionId, workingDir);
       }
 
       // Honour the cap on load too, in case it shrank between runs.
@@ -142,9 +171,24 @@ export class SessionWorkingDirs {
 
     try {
       mkdirSync(dirname(this.storePath), { recursive: true });
+
+      // Merge rather than overwrite. One operator can run several bridges —
+      // one per server — and they share this file. A whole-file write would
+      // make each drop the others' sessions, so after a restart their resumes
+      // would land in the empty scratch directory: the precise failure this
+      // store exists to prevent, reintroduced by the store itself. Our own
+      // entries win, because they are the ones this process just observed.
+      const onDisk = this.readRaw();
+      // Anything this process has ever known about is ours to decide, so a
+      // forget() removes it rather than being undone by the merge below.
+      for (const sessionId of this.seen) {
+        delete onDisk[sessionId];
+      }
+      const merged = { ...onDisk, ...Object.fromEntries(this.map) };
+
       const tmp = `${this.storePath}.${process.pid}.tmp`;
       // 0600: these are paths into the operator's own filesystem.
-      writeFileSync(tmp, JSON.stringify(Object.fromEntries(this.map)), { mode: 0o600 });
+      writeFileSync(tmp, JSON.stringify(merged), { mode: 0o600 });
       renameSync(tmp, this.storePath);
     } catch (err) {
       log.warn('Could not persist the session working-directory store', {

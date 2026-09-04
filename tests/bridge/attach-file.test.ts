@@ -105,6 +105,8 @@ async function runTurn(
     token: 'tok-1',
     providers: [],
     adapters: new Map([['fake', adapter as unknown as ProviderAdapter]]),
+    // Never the operator\'s real store — the suite must not overwrite it.
+    sessionStorePath: null,
     allowedRoots: [{ path: root, label: 'root' }],
     apiOrigin,
   });

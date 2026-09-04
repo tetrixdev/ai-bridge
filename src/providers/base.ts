@@ -65,13 +65,16 @@ export interface ExecutionContext {
   /** CLI session ID if resuming, or null for new session. */
   cliSessionId: string | null;
   /**
-   * Whether this turn has attachment files on disk for the model to read.
+   * The directory this turn's attachments were written to, or null.
    *
-   * Adapters that restrict the tool surface need to know: telling a model
-   * "the user attached a file, read it at this path" while its file-reading
-   * tool is denied produces a turn that fails for a reason nothing reports.
+   * The PATH, not a boolean, because adapters that restrict the tool surface
+   * need to grant read access to exactly this directory and nowhere else.
+   * Telling a model "the user attached a file, read it at this path" while its
+   * file-reading tool is denied produces a turn that fails for a reason
+   * nothing reports — and granting it the file-reading tool outright grants
+   * the whole filesystem, which is a great deal worse.
    */
-  hasAttachments: boolean;
+  attachmentDir: string | null;
 }
 
 /**

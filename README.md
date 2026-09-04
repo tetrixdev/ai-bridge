@@ -59,9 +59,27 @@ handshake. [PROTOCOL.md](PROTOCOL.md) gives the per-CLI flags; the shape is:
 
 | Posture | The CLI may... | Your own environment... |
 |---|---|---|
-| `isolated` (the default, and what an older server gets) | reach server-declared tools only. No shell, no edits. | stays out. |
+| `isolated` (the default, and what an older server gets) | reach server-declared tools only. No shell, no edits — **subject to the caveat below**. | stays out, except your permission settings. |
 | `workspace` | **also use its own file and shell tools**, in the directory the server named. | stays out — your MCP servers, hooks and plugins are still excluded. |
 | `native` | do anything the CLI can do. | is fully in play. |
+
+> **`isolated` is enforced by the CLI, not by the bridge, and your own settings
+> can switch it off.** The bridge passes `--allowedTools mcp__bridge__*` and
+> relies on Claude Code denying everything else. That denial comes from Claude's
+> permission system, which reads `~/.claude/settings.json` — and the bridge does
+> not suppress it (`--bare` would, but it breaks subscription auth; see the note
+> in `src/providers/claude.ts`).
+>
+> So if your user-level settings set `permissions.defaultMode` to `auto`,
+> `acceptEdits` or `bypassPermissions`, an `isolated` turn gets shell, read and
+> write on your machine regardless of what the bridge asked for. Verified
+> against Claude 2.1.260: with `defaultMode: "auto"` an `isolated` turn read
+> `~/.bashrc` and ran `cat` on an arbitrary path; with the default mode both
+> were denied.
+>
+> Check with `cat ~/.claude/settings.json` before pointing a bridge at a server
+> you do not fully trust. This applies on `main` too — it is not something this
+> feature introduced.
 
 **Both of the permissive postures require an operator opt-in.** `workspace`
 needs `--allow-dir`; `native` needs `--allow-native`. A bridge started without
@@ -108,9 +126,9 @@ A file attached in the chat does not travel over the WebSocket — the server's 
 - only from the origin it is connected to (or `--api`), only over HTTPS, and never following a redirect;
 - into a per-request directory under `~/.cache/ai-bridge/attachments/`, **never into your checkout**;
 - verified against the declared size and SHA-256, failing the turn loudly on a mismatch rather than handing the model a truncated file it will describe as corrupt;
-- deleted when the turn ends, on success, error and cancel alike.
+- deleted when the turn ends — on success, error, cancel, and on the bridge process exiting.
 
-The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
+The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. That tool is offered in `workspace` and `native` only — in `isolated` the CLI reaches server-declared tools and nothing else. It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
 
 ## Local tools
 

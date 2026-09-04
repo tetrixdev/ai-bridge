@@ -268,3 +268,33 @@ describe('resolveSystemPrompt() in workspace mode', () => {
     expect(resolveSystemPrompt(null, 'native')).toBeNull();
   });
 });
+
+
+describe('credentials are stripped from the spawned CLI environment', () => {
+  const vars = ['AI_BRIDGE_TOKEN', 'AI_BRIDGE_SERVER', 'ENGRAM_TOKEN', 'ENGRAM_URL', 'ENGRAM_IDENTITY'];
+
+  it('removes the vault credential too, not just the bridge token', () => {
+    // ENGRAM_TOKEN defaults to the bridge token and is the vault credential.
+    // It was survivable while `isolated` was the only posture a server could
+    // ask for, because that CLI has no shell. `workspace` gives every provider
+    // one, so `printenv ENGRAM_TOKEN` would hand it back to the server in the
+    // assistant's own transcript.
+    const saved: Record<string, string | undefined> = {};
+    for (const key of vars) {
+      saved[key] = process.env[key];
+      process.env[key] = `secret-${key}`;
+    }
+
+    try {
+      const env = buildSpawnEnv();
+      for (const key of vars) {
+        expect(env[key]).toBeUndefined();
+      }
+    } finally {
+      for (const key of vars) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+    }
+  });
+});
