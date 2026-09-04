@@ -44,7 +44,7 @@ async function welcomed(
     token: 'tok',
     providers: [],
     adapters: new Map<string, ProviderAdapter>(),
-    // Never the operator\'s real store — the suite must not overwrite it.
+    // Never the operator's real store — the suite must not overwrite it.
     sessionStorePath: null,
     allowedRoots,
     allowNative,

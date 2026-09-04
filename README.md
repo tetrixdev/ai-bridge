@@ -128,7 +128,7 @@ A file attached in the chat does not travel over the WebSocket — the server's 
 - verified against the declared size and SHA-256, failing the turn loudly on a mismatch rather than handing the model a truncated file it will describe as corrupt;
 - deleted when the turn ends — on success, error, cancel, and on the bridge process exiting.
 
-The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. That tool is offered in `workspace` and `native` only — in `isolated` the CLI reaches server-declared tools and nothing else. It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
+The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. That tool is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools, plus — on a turn that has attachments — permission to read that turn's attachment directory and nothing else. It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
 
 ## Local tools
 

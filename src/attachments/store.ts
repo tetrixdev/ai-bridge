@@ -80,13 +80,22 @@ function installExitHook(): void {
 }
 
 /** Create the request's attachment directory, private to this user. */
-export function ensureAttachmentDir(requestId: string): string {
+export function ensureAttachmentDir(requestId: string, keep = false): string {
   const dir = attachmentDirFor(requestId);
   // 0700: the files are whatever a colleague sent into a chat, and there is no
   // reason for another local account to read them.
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  installExitHook();
-  liveAttachmentDirs.add(requestId);
+
+  // `keep` stays out of the exit hook's list entirely. The operator's whole
+  // debugging flow with --keep-attachments is: reproduce, Ctrl-C the bridge,
+  // go and look at the files. An exit hook that deleted them on the way out
+  // would make the flag do the opposite of what it says, and only on the exit
+  // path — so it would look like it worked right up until you went looking.
+  if (!keep) {
+    installExitHook();
+    liveAttachmentDirs.add(requestId);
+  }
+
   return dir;
 }
 

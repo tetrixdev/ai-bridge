@@ -337,6 +337,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   /** Whether the operator permitted the server to select `native`. */
   private readonly allowNative: boolean;
   /**
+   * In-flight MCP server startup from the current handshake, if any.
+   *
+   * Requests await it, so a turn sent immediately after `welcome` gets the
+   * tool channel rather than racing it.
+   */
+  private mcpStarting: Promise<void> | null = null;
+  /**
    * Which directory each CLI session was started in, so a resume that names a
    * different one can be refused instead of silently running against a
    * session whose whole history is about another checkout.
@@ -1035,7 +1042,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // must still get an MCP channel for those.
     if (this.mcpServer.hasTools() && !this.mcpServer.isRunning()) {
       try {
-        await this.mcpServer.start();
+        this.mcpStarting = this.mcpServer.start();
+        await this.mcpStarting;
         log.info('MCP tool channel ready', {
           url: this.mcpServer.getBaseUrl(),
           tools: message.tools.map((t) => t.name),
@@ -1356,6 +1364,20 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // token is mapped to this request_id so the MCP server can route
     // tools/call from the spawned CLI to the right WebSocket request frame.
     // Skipped when no tools are registered or the MCP server failed to start.
+    // Wait for the handshake's MCP startup to finish before deciding whether
+    // there is a channel. Without this, a server that sends `ai_request`
+    // immediately after `welcome` — which is the normal thing for a server
+    // with a queued turn to do — races the listener and the turn runs with no
+    // tools at all, silently, because `mcp` is simply null.
+    if (this.mcpStarting) {
+      try {
+        await this.mcpStarting;
+      } catch {
+        // start() already reported its own failure to the server; a turn
+        // without tools is still better than no turn.
+      }
+    }
+
     const mcpEnabled = this.mcpServer.hasTools() && this.mcpServer.isRunning();
     const mcpToken = mcpEnabled ? this.mcpServer.issueToken(request_id) : null;
     const mcp = mcpEnabled && mcpToken
@@ -1409,6 +1431,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
           expectedOrigin: this.apiOrigin,
           limits: this.attachmentLimits,
           signal,
+          keep: this.keepAttachments,
         });
       }
 

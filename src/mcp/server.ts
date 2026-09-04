@@ -269,9 +269,18 @@ export class BridgeMcpServer {
     log.info('Bridge MCP server stopped');
   }
 
-  /** True once start() has resolved and stop() has not been called. */
+  /**
+   * True once the listener is actually bound, and stop() has not been called.
+   *
+   * The port, not just the server object. `start()` assigns `httpServer`
+   * synchronously and only learns the port when `listen` calls back, so a
+   * check on the object alone is true during a window in which `getBaseUrl()`
+   * still throws. A server that sends `welcome` and `ai_request` back to back
+   * lands in exactly that window, and the turn dies with
+   * "BridgeMcpServer not started" reported as a provider error.
+   */
   isRunning(): boolean {
-    return this.httpServer !== null;
+    return this.httpServer !== null && this.port !== null;
   }
 
   /** Base URL CLIs connect to. Throws if start() has not been called. */

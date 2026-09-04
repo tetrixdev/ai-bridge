@@ -76,7 +76,7 @@ async function startBridge(allowedRoots: AllowedRoot[], adapter: RecordingAdapte
       supports_tools: true, supports_thinking: false, supports_session_resume: true,
     }],
     adapters: new Map([['fake', adapter as unknown as ProviderAdapter]]),
-    // Never the operator\'s real store — the suite must not overwrite it.
+    // Never the operator's real store — the suite must not overwrite it.
     sessionStorePath: null,
     allowedRoots,
   });
@@ -136,6 +136,49 @@ afterEach(async () => {
   bridge = null;
   await new Promise<void>((resolve) => wss.close(() => resolve()));
   rmSync(root, { recursive: true, force: true });
+});
+
+describe('a turn sent immediately after the welcome', () => {
+  it('gets the tool channel instead of racing it', async () => {
+    // A server with a queued turn sends `ai_request` in the same breath as it
+    // answers `hello`. The MCP server assigns its listener synchronously but
+    // only learns its port on the listen callback, so a readiness check on the
+    // object alone is true during a window where getBaseUrl() still throws —
+    // and the turn died with `provider_error: BridgeMcpServer not started`.
+    // Found by the manual end-to-end harness; every unit test paused after the
+    // welcome and so could not see it.
+    const adapter = new RecordingAdapter();
+    bridge = new Bridge({
+      serverUrl: url,
+      token: 'tok',
+      providers: [],
+      adapters: new Map([['fake', adapter as unknown as ProviderAdapter]]),
+      allowedRoots: [{ path: root, label: 'root' }],
+      sessionStorePath: null,
+    });
+    bridge.connect();
+    await waitFor((f) => f['type'] === 'hello', 'hello');
+
+    // Welcome and request back to back, with no pause between them.
+    socket.send(JSON.stringify({
+      type: 'welcome',
+      session_id: 'conn-1',
+      tools: [],
+      config: { heartbeat_interval: 30, request_timeout: 30 },
+      cli_isolation: 'workspace',
+    }));
+    const id = sendRequest({ working_dir: checkout });
+
+    await waitFor(
+      (f) => f['type'] === 'stream' && f['request_id'] === id && f['event'] === 'done',
+      'done',
+    );
+
+    expect(streamEvents(id).map((e) => e.event)).toEqual(['done']);
+    expect(adapter.seen).toHaveLength(1);
+    // The turn got its MCP channel rather than silently running without tools.
+    expect(adapter.seen[0]!.mcp).not.toBeNull();
+  });
 });
 
 describe('hello', () => {

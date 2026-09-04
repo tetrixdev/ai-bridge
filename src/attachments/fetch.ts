@@ -231,6 +231,8 @@ async function downloadOne(
 export async function fetchAttachments(opts: {
   attachments: AttachmentRef[];
   requestId: string;
+  /** Operator asked to keep the files after the turn (--keep-attachments). */
+  keep?: boolean;
   /**
    * Read at use time, not captured. Each download may take up to two minutes
    * and they run in sequence, so a token refresh part-way through a multi-file
@@ -241,7 +243,7 @@ export async function fetchAttachments(opts: {
   limits: AttachmentLimits;
   signal: AbortSignal;
 }): Promise<SavedAttachment[]> {
-  const { attachments, requestId, token, expectedOrigin, limits, signal } = opts;
+  const { attachments, requestId, token, expectedOrigin, limits, signal, keep = false } = opts;
   if (attachments.length === 0) {
     return [];
   }
@@ -275,7 +277,7 @@ export async function fetchAttachments(opts: {
 
   let dir: string;
   try {
-    dir = ensureAttachmentDir(requestId);
+    dir = ensureAttachmentDir(requestId, keep);
   } catch (err) {
     // A local disk problem — ENOSPC, a permissions change on ~/.cache — is not
     // a lost CLI session. Raised as a refusal because a bare Error on a resumed

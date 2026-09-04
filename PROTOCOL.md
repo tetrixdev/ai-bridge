@@ -564,7 +564,7 @@ It is honoured **only** when the operator started the bridge with `--allow-dir` 
 | Condition | Result |
 |---|---|
 | Absent, on a fresh session | The empty scratch directory, as before. |
-| Absent, on a resume | The directory that session already runs in. Servers **should** resend `working_dir` on every turn anyway — see the note below. |
+| Absent, on a resume | The directory that session already runs in — re-checked against the allow-list as it stands now, so a revoked directory is refused rather than reused. Servers **should** resend `working_dir` on every turn anyway — see the note below. |
 | Bridge started without `--allow-dir` | `working_dir_not_allowed` |
 | Not absolute, or contains a null byte | `working_dir_not_allowed` |
 | Resolves outside every allowed root (after `realpath`, so a symlink inside a root that points out of it is caught) | `working_dir_not_allowed` |
@@ -577,7 +577,11 @@ A path outside the allow-list is reported identically whether or not it exists, 
 
 **A working directory belongs to a CLI session for that session's life.** Resuming a session started elsewhere is incoherent — its history is all about another checkout — so it is refused with `working_dir_changed` and the server starts a fresh session deliberately.
 
-A resume that names nothing keeps the directory the session already has. The bridge remembers that mapping across restarts (it persists to `~/.cache/ai-bridge/sessions.json`, shared by every bridge that user runs on the machine), but it is still a local record, bounded and advisory: a session evicted by age, or one started on another machine, is one it has no record of. A remembered directory is re-checked against the allow-list as it stands now, so narrowing `--allow-dir` revokes it rather than being outlived by the record. It then resumes in the scratch directory, which for a workspace conversation is the wrong answer.
+A resume that names nothing keeps the directory the session already has. The bridge remembers that mapping across restarts (it persists to `~/.cache/ai-bridge/sessions.json`, shared by every bridge that user runs on the machine), but it is still a local record, bounded and advisory. Two cases follow from that:
+
+- **A session it has no record of** — evicted by age, or started on another machine — resumes in the scratch directory, which for a workspace conversation is the wrong answer.
+- **A remembered directory that is no longer permitted** — the operator narrowed `--allow-dir` — is refused with `working_dir_not_allowed`, and the turn does not run. The record never outlives the revocation.
+
 
 So a server that supports workspaces **should send `working_dir` on every turn**, not only the first. It costs nothing, and it is the only thing that makes the outcome independent of what the bridge happens to remember.
 
@@ -1032,7 +1036,7 @@ The server also tracks heartbeats. If no `ping` is received for 2x the heartbeat
 | `rate_limited` | CLI provider rate limit hit | Exponential backoff, notify user |
 | `provider_warning` | Non-fatal provider warning (e.g. content policy notice). The request continues; the message is informational | Surface to user as informational notice |
 | `invalid_request` | Malformed request from server | Log and respond with error |
-| `working_dir_not_allowed` | The named `working_dir` is not inside a root the operator permitted with `--allow-dir` (or none were permitted) | Operator restarts the bridge with `--allow-dir`, or the server offers only the `workspaces` from `hello`. Terminal: `done` follows |
+| `working_dir_not_allowed` | The `working_dir` is not inside a root the operator permitted with `--allow-dir` (or none were permitted). Also emitted on a turn that named NOTHING, when the directory its CLI session is remembered in has since been revoked | Operator restarts the bridge with `--allow-dir`, or the server offers only the `workspaces` from `hello`. Terminal: `done` follows |
 | `working_dir_not_found` | The named `working_dir` is inside an allowed root but does not exist, or is not a directory. The bridge never creates it | Check the path. Terminal: `done` follows |
 | `working_dir_changed` | A resume named a different directory from the one its CLI session was started in | Server starts a fresh session deliberately. Terminal: `done` follows |
 | `attachment_refused` | An attachment URL is not on the connected server's origin, or is not HTTPS | Server fixes the URL (or the operator sets `--api`). Terminal: `done` follows |

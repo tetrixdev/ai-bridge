@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   attachmentDirFor,
@@ -81,6 +81,21 @@ describe('cleanup when the process dies mid-turn', () => {
     removeAttachmentDirsOnExit();
 
     expect(existsSync(dir)).toBe(false);
+  });
+
+  it('leaves --keep-attachments directories alone, which is the point of the flag', () => {
+    // The operator's debugging flow is: reproduce, Ctrl-C the bridge, go look
+    // at the files. An exit hook that deleted them would make the flag do the
+    // opposite of what it says, and only on the exit path — so it would look
+    // like it worked right up until you went looking.
+    const id = 'req_keep_probe';
+    const dir = ensureAttachmentDir(id, true);
+    writeFileSync(join(dir, 'invoice.pdf'), 'bytes');
+
+    removeAttachmentDirsOnExit();
+
+    expect(existsSync(dir)).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
   });
 
   it('does not try to remove a directory already cleaned up normally', () => {
