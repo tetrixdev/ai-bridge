@@ -273,7 +273,7 @@ How much of the operator's local environment the spawned CLI may see, and what i
 
 | Value | The CLI may... | The operator's environment... |
 |---|---|---|
-| `isolated` (default) | reach server-declared tools only, through the bridge's MCP server. No shell, no edits — enforced by the CLI's own permission system, which the operator's `~/.claude/settings.json` can override; see the bridge README. | stays out: other MCP servers ignored, neutral fallback system prompt. |
+| `isolated` (default) | reach server-declared tools through the bridge's MCP server. No edits. Per-CLI, though — see the flag table below: Claude's built-ins are denied outright, while Codex keeps its own `shell` bounded by a read-only, no-network sandbox and Gemini's built-ins stall on an approval nothing can answer. And the denial is the CLI's own permission system, which the operator's `~/.claude/settings.json` can override; see the bridge README. | stays out: other MCP servers ignored, neutral fallback system prompt. |
 | `workspace` | **also use its own file and shell tools**, inside `working_dir`. | stays out, exactly as in `isolated`. |
 | `native` | do anything the CLI can do. | is fully in play: user `CLAUDE.md`, skills, hooks, configured MCP servers, plugins, the CLI's own default prompt. |
 
