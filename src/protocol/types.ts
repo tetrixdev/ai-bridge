@@ -313,6 +313,53 @@ export interface SandboxReportFrame {
   notes: string[];
 }
 
+/**
+ * Why the posture in force is not the one the server asked for.
+ *
+ * Absent when they match. Each value maps to an operator action, because the
+ * whole point of reporting this is that somebody can fix it: the server can
+ * say what to do rather than showing a connection that looks healthy while the
+ * assistant silently has no tools.
+ */
+export type PostureReason =
+  /** The server sent no `cli_isolation`, so the safe default applies. */
+  | 'not_requested'
+  /** The server sent a value this bridge does not recognise. */
+  | 'unrecognised'
+  /** `workspace` needs the operator to have passed `--allow-dir`. */
+  | 'requires_allow_dir'
+  /** `native` needs the operator to have passed `--allow-native`. */
+  | 'requires_allow_native';
+
+/**
+ * The isolation posture actually in force, reported once per handshake.
+ *
+ * The server asks for a posture in `welcome`, and the bridge may decline it:
+ * `workspace` and `native` are gated on operator flags, and a bridge started
+ * without them runs `isolated` instead. That refusal used to be visible only
+ * in a log on the operator's own machine, which made the failure it causes
+ * genuinely hard to diagnose — an operator who forgot `--allow-native` gets a
+ * connection that looks healthy in every screen while the assistant has no
+ * tools at all, and nothing anywhere explains why.
+ *
+ * Sent whether or not the posture matches, so a server always knows what is in
+ * force. Absence of the frame means an older bridge, not agreement.
+ *
+ * Sent AFTER `welcome`, necessarily: at `hello` time the bridge has not been
+ * told what to adopt yet.
+ */
+export interface PostureMessage {
+  type: 'posture';
+  /** The posture actually in force. */
+  cli_isolation: CliIsolation;
+  /** What the server asked for. Null when it asked for nothing. */
+  requested: CliIsolation | string | null;
+  /** Present only when the two differ. */
+  reason?: PostureReason;
+  /** A sentence naming the operator action that would change it. */
+  message?: string;
+}
+
 /** Union of all messages the bridge sends to the server. */
 export type BridgeToServerMessage =
   | HelloMessage
@@ -322,6 +369,7 @@ export type BridgeToServerMessage =
   | ToolCallMessage
   | BridgeErrorMessage
   | ProvidersUpdateMessage
+  | PostureMessage
   | LocalResultMessage;
 
 // ---------------------------------------------------------------------------

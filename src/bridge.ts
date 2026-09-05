@@ -24,6 +24,7 @@ import type {
   ServerToBridgeMessage,
   AiRequestMessage,
   CliIsolation,
+  PostureReason,
   ConnectionErrorMessage,
   ConversationEntry,
   WelcomeMessage,
@@ -246,6 +247,14 @@ function foldHistoryIntoMessage(
 // ---------------------------------------------------------------------------
 // Bridge Class
 // ---------------------------------------------------------------------------
+
+/** What `adoptIsolation` decided, and why, so the server can be told. */
+interface AdoptedPosture {
+  adopted: CliIsolation;
+  requested: CliIsolation | string | null;
+  reason?: PostureReason;
+  message?: string;
+}
 
 export class Bridge extends EventEmitter<BridgeEvents> {
   private ws: WebSocket | null = null;
@@ -1023,11 +1032,24 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // Adopt the server's CLI isolation posture. Older servers that don't
     // send the field get the safe default (`isolated`) — never the legacy
     // native behaviour.
-    this.cliIsolation = this.adoptIsolation(message.cli_isolation);
+    const posture = this.adoptIsolation(message.cli_isolation);
+    this.cliIsolation = posture.adopted;
     this.currentTools = message.tools;
     this.mcpServer.setTools(message.tools);
     // After the posture is known — it decides whether they are offered at all.
     this.registerBridgeTools();
+
+    // Tell the server what is actually in force. Sent whether or not it
+    // matches what was asked for: a server needs to know the posture, not just
+    // be told when it was declined, and absence of this frame means an older
+    // bridge rather than agreement.
+    this.send({
+      type: 'posture',
+      cli_isolation: posture.adopted,
+      requested: posture.requested,
+      ...(posture.reason ? { reason: posture.reason } : {}),
+      ...(posture.message ? { message: posture.message } : {}),
+    });
     log.info('Welcome registered tools', {
       count: message.tools.length,
       cliIsolation: this.cliIsolation,
@@ -1138,27 +1160,28 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * This mirrors the `--local-tools` gate exactly: the operator opts in, and
    * no server can turn it on by sending a field.
    */
-  private adoptIsolation(requested: CliIsolation | undefined): CliIsolation {
+  private adoptIsolation(requested: CliIsolation | undefined): AdoptedPosture {
     if (requested === undefined) {
       // An older server that does not send the field gets the safe default,
       // never the legacy native behaviour.
-      return 'isolated';
+      return { adopted: 'isolated', requested: null, reason: 'not_requested' };
     }
 
     if (requested !== 'isolated' && requested !== 'native' && requested !== 'workspace') {
-      log.warn('Server sent an unrecognised cli_isolation — falling back to isolated', {
-        received: String(requested),
-      });
-      return 'isolated';
+      const message = `Server sent an unrecognised cli_isolation (${String(requested)}) — running \`isolated\`.`;
+      log.warn(message);
+
+      return { adopted: 'isolated', requested: String(requested), reason: 'unrecognised', message };
     }
 
     if (requested === 'workspace' && this.allowedRoots.length === 0) {
-      log.warn(
+      const message =
         'Server asked for `workspace` isolation, but this bridge was started without --allow-dir. '
         + 'Running `isolated` instead: workspace mode gives the CLI a shell on this machine, and '
-        + 'that is the operator\'s decision to make, not the server\'s. Pass --allow-dir <path> to enable it.',
-      );
-      return 'isolated';
+        + 'that is the operator\'s decision to make, not the server\'s. Pass --allow-dir <path> to enable it.';
+      log.warn(message);
+
+      return { adopted: 'isolated', requested, reason: 'requires_allow_dir', message };
     }
 
     // `native` is gated too, and for the same reason — more so, in fact, since
@@ -1169,15 +1192,16 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // Gating only `workspace` would have been security theatre: a server denied
     // the shell one way could simply ask for it the other way, and get more.
     if (requested === 'native' && !this.allowNative) {
-      log.warn(
+      const message =
         'Server asked for `native` isolation, which hands this machine\'s full CLI environment '
         + '— shell, your MCP servers, hooks and plugins — to whatever the server sends. '
-        + 'Running `isolated` instead. Pass --allow-native if the server is one you would give a shell to.',
-      );
-      return 'isolated';
+        + 'Running `isolated` instead. Pass --allow-native if the server is one you would give a shell to.';
+      log.warn(message);
+
+      return { adopted: 'isolated', requested, reason: 'requires_allow_native', message };
     }
 
-    return requested;
+    return { adopted: requested, requested };
   }
 
   /**

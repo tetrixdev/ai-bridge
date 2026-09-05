@@ -88,6 +88,8 @@ handshake. [PROTOCOL.md](PROTOCOL.md) gives the per-CLI flags; the shape is:
 > the operator's own configuration rather than something a server chooses, but
 > they do shape the turn.
 
+The bridge tells the server which posture it settled on, so an app can show "running `isolated`, because this bridge was started without `--allow-native`" rather than leaving you to find it in this machine's log.
+
 **Both of the permissive postures require an operator opt-in.** `workspace`
 needs `--allow-dir`; `native` needs `--allow-native`. A bridge started without
 them refuses that posture and runs `isolated` instead, saying so in the log.
