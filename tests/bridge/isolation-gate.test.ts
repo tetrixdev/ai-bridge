@@ -20,6 +20,16 @@ import type { CliIsolation, WelcomeMessage } from '../../src/protocol/types.js';
 
 let root: string;
 
+/** Frames the bridge tried to send during the handshake. */
+function sentFrames(bridge: Bridge): Record<string, unknown>[] {
+  return (bridge as unknown as { sentForTest: Record<string, unknown>[] }).sentForTest ?? [];
+}
+
+/** The `posture` frame, which is sent once per handshake. */
+function postureFrame(bridge: Bridge): Record<string, unknown> | undefined {
+  return sentFrames(bridge).find((f) => f['type'] === 'posture');
+}
+
 /** The posture the bridge actually adopted, reading its private field. */
 function adopted(bridge: Bridge): CliIsolation {
   return (bridge as unknown as { cliIsolation: CliIsolation }).cliIsolation;
@@ -57,6 +67,14 @@ async function welcomed(
     config: { heartbeat_interval: 30, request_timeout: 30 },
     ...(isolation !== undefined ? { cli_isolation: isolation } : {}),
   } as unknown as WelcomeMessage;
+
+  // No socket is open in these tests, so `send()` would drop everything.
+  // Record what it was asked to send instead.
+  const recorded: Record<string, unknown>[] = [];
+  (bridge as unknown as { sentForTest: unknown[] }).sentForTest = recorded;
+  (bridge as unknown as { send(m: unknown): void }).send = (m) => {
+    recorded.push(m as Record<string, unknown>);
+  };
 
   await (bridge as unknown as {
     handleWelcome(m: WelcomeMessage): Promise<void>;
@@ -136,5 +154,61 @@ describe('the bridge-owned tool set', () => {
     // The posture was downgraded, so the tool set must follow it.
     const bridge = await welcomed([], 'workspace');
     expect(bridgeToolNames(bridge)).toEqual([]);
+  });
+});
+
+
+describe('reporting the posture back to the server', () => {
+  it('reports the posture even when it is exactly what was asked for', async () => {
+    // A server needs to know what is in force, not merely be told when it was
+    // declined — and absence of the frame has to mean "older bridge".
+    const frame = postureFrame(await welcomed([{ path: root, label: 'root' }], 'workspace'));
+
+    expect(frame).toBeDefined();
+    expect(frame!['cli_isolation']).toBe('workspace');
+    expect(frame!['requested']).toBe('workspace');
+    expect(frame!['reason']).toBeUndefined();
+  });
+
+  it('names the operator flag when workspace was declined', async () => {
+    // The failure this exists to prevent: a connection that looks healthy in
+    // every screen while the assistant silently has no tools at all.
+    const frame = postureFrame(await welcomed([], 'workspace'));
+
+    expect(frame!['cli_isolation']).toBe('isolated');
+    expect(frame!['requested']).toBe('workspace');
+    expect(frame!['reason']).toBe('requires_allow_dir');
+    expect(String(frame!['message'])).toContain('--allow-dir');
+  });
+
+  it('names the operator flag when native was declined', async () => {
+    const frame = postureFrame(await welcomed([], 'native'));
+
+    expect(frame!['cli_isolation']).toBe('isolated');
+    expect(frame!['requested']).toBe('native');
+    expect(frame!['reason']).toBe('requires_allow_native');
+    expect(String(frame!['message'])).toContain('--allow-native');
+  });
+
+  it('says so when the server asked for nothing', async () => {
+    const frame = postureFrame(await welcomed([], undefined));
+
+    expect(frame!['cli_isolation']).toBe('isolated');
+    expect(frame!['requested']).toBeNull();
+    expect(frame!['reason']).toBe('not_requested');
+  });
+
+  it('reports an unrecognised value as the string the server sent', async () => {
+    const frame = postureFrame(await welcomed([{ path: root, label: 'root' }], 'Workspace'));
+
+    expect(frame!['cli_isolation']).toBe('isolated');
+    expect(frame!['requested']).toBe('Workspace');
+    expect(frame!['reason']).toBe('unrecognised');
+  });
+
+  it('is sent once per handshake', async () => {
+    const bridge = await welcomed([{ path: root, label: 'root' }], 'workspace');
+
+    expect(sentFrames(bridge).filter((f) => f['type'] === 'posture')).toHaveLength(1);
   });
 });

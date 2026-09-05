@@ -223,6 +223,33 @@ The server refreshes the connection's advertised providers from this message, so
 
 The bridge re-probes its CLIs after every handshake and after a provider spawn failure (a request routed to a since-removed CLI), and emits this message only when the available set actually changed.
 
+### Bridge → Server: `posture`
+
+Sent once per handshake, immediately after the bridge adopts a CLI isolation posture — so after `welcome`, necessarily: at `hello` time it has not been told what to adopt.
+
+```json
+{
+  "type": "posture",
+  "cli_isolation": "isolated",
+  "requested": "native",
+  "reason": "requires_allow_native",
+  "message": "Server asked for `native` isolation, which hands this machine's full CLI environment … Pass --allow-native if the server is one you would give a shell to."
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `cli_isolation` | The posture actually in force. |
+| `requested` | What the server asked for, or `null` if it asked for nothing. |
+| `reason` | Present **only** when the two differ: `not_requested`, `unrecognised`, `requires_allow_dir`, `requires_allow_native`. |
+| `message` | A sentence naming the operator action that would change it. |
+
+The server asks for a posture; the bridge may decline it, because `workspace` and `native` are gated on flags the bridge's operator passes. That refusal is correct and a server cannot override it — the gate exists precisely so a server cannot. What this frame adds is that the server can **show** it.
+
+Without it the refusal is visible only in a log on the operator's own machine, and the failure that produces is nasty in a specific way: an operator who forgot `--allow-native` gets a connection that looks perfectly healthy in every screen, while the assistant silently has no tools at all, and nothing anywhere explains why.
+
+Sent whether or not the posture matches the request, so a server always knows what is in force. **Absence of the frame means an older bridge, not agreement.** Additive and optional: a server that ignores it loses nothing.
+
 ### Server → Bridge: `welcome`
 
 ```json
