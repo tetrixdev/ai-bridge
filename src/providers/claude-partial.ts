@@ -169,7 +169,7 @@ export class ClaudePartialStreamMapper {
 
     switch (str(event, 'type')) {
       case 'message_start':
-        return this.onMessageStart(event);
+        return this.onMessageStart(event, emit);
       case 'content_block_start':
         return this.onBlockStart(event, emit);
       case 'content_block_delta':
@@ -183,16 +183,29 @@ export class ClaudePartialStreamMapper {
     }
   }
 
-  private onMessageStart(event: Record<string, unknown>): void {
+  private onMessageStart(event: Record<string, unknown>, emit: (e: AdapterStreamEvent) => void): void {
     const id = str(obj(event, 'message'), 'id');
     if (id !== undefined) this.streamedMessageIds.add(id);
 
-    // Per-message state only. The CLI reuses indices from 0 for each message,
+    // CLOSE the previous message's blocks rather than merely forgetting them.
+    //
+    // A message that ended without `content_block_stop` — a mid-stream error
+    // the CLI retried past, a compaction boundary — would otherwise leave an
+    // announced block orphaned with its state already discarded, so nothing
+    // downstream could close it and closeOpenBlocks() would have nothing left
+    // to repair. That is the same defect as an abandoned turn, reached through
+    // a message boundary instead of the end of the turn, and it takes a
+    // buffered tool call's arguments with it.
+    //
+    // It also keeps hasOpenBlock() honest: reporting "nothing open" while a
+    // block really is open would let the adapter flush deferred whole-message
+    // events straight into it, producing exactly the overlap the deferral
+    // queue exists to prevent.
+    //
+    // Per-message state only: the CLI reuses indices from 0 for each message,
     // so anything keyed on a CLI index must not outlive the message.
-    this.bridgeIndex.clear();
-    this.blockType.clear();
-    this.toolJson.clear();
-    this.pending.clear();
+    // closeOpenBlocks() clears all of it.
+    this.closeOpenBlocks(emit);
   }
 
   private onBlockStart(event: Record<string, unknown>, emit: (e: AdapterStreamEvent) => void): void {

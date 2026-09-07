@@ -23,6 +23,9 @@ const DISABLE_ENV_VAR = 'AI_BRIDGE_DISABLE_PARTIAL_STREAMING';
 
 const PARTIAL_FLAG = '--include-partial-messages';
 
+/** How the common CLI argument parsers word an unknown option. */
+const OPTION_REJECTION = /(unknown|unrecognized|unrecognised|invalid|unexpected) (option|argument|flag)/i;
+
 /**
  * Hard ceiling on the probe, enforced by us rather than by execFile.
  *
@@ -64,10 +67,14 @@ export function resetPartialMessageSupportCache(): void {
  * restarted the bridge — reintroducing precisely the failure the probe exists
  * to prevent. Clearing the cache turns that into a single failed turn.
  */
-export function noteCliRejectedPartialFlag(stderr: string): void {
-  if (!stderr.includes(PARTIAL_FLAG)) return;
+export function noteCliRejectedPartialFlag(stderr: string): boolean {
+  // Both halves are required. A CLI that DOES support the flag and prints its
+  // own option list on an unrelated failure mentions the flag too, and taking
+  // that as a rejection would re-probe after every such turn.
+  if (!stderr.includes(PARTIAL_FLAG) || !OPTION_REJECTION.test(stderr)) return false;
   log.warn(`Claude CLI rejected ${PARTIAL_FLAG} — re-probing before the next turn`);
   resetPartialMessageSupportCache();
+  return true;
 }
 
 async function probe(): Promise<boolean> {
@@ -106,9 +113,13 @@ function runHelpProbe(): Promise<boolean> {
 
     const child = execFile('claude', ['--help'], {
       // SIGKILL rather than the default SIGTERM, so a child that traps TERM
-      // cannot outlive its own timeout.
+      // cannot outlive its own timeout. Note this reaches the child only —
+      // hence the process-group kill below, for a `claude` that is a shell
+      // wrapper whose grandchildren would otherwise survive the probe.
       timeout: PROBE_TIMEOUT_MS,
       killSignal: 'SIGKILL',
+      // Own process group, so the whole tree can be signalled at once.
+      ...(process.platform === 'win32' ? {} : { detached: true }),
       env,
       // Pinned like every other Claude spawn, so `--help` cannot walk a project
       // tree the operator did not point us at.
@@ -127,11 +138,35 @@ function runHelpProbe(): Promise<boolean> {
       if (settled) return;
       settled = true;
       log.warn(`claude --help did not finish within ${PROBE_TIMEOUT_MS}ms — assuming no partial message support`);
-      child.kill('SIGKILL');
+      killTree(child);
       resolve(false);
     }, PROBE_TIMEOUT_MS + 500);
 
     // Nothing should keep the process alive for a probe.
     timer.unref?.();
   });
+}
+
+/**
+ * Kill a probe and anything it started.
+ *
+ * A negative pid signals the whole process group, which is the only way to
+ * reach a wrapper script's children — measured: with a `claude` that traps
+ * SIGTERM and runs `sleep`, killing just the child left the sleep running
+ * after both the probe and the bridge had exited.
+ */
+function killTree(child: { pid?: number; kill: (signal: NodeJS.Signals) => boolean }): void {
+  try {
+    if (process.platform !== 'win32' && child.pid !== undefined) {
+      process.kill(-child.pid, 'SIGKILL');
+      return;
+    }
+  } catch {
+    // The group may already be gone, or never became a group leader.
+  }
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    // Already dead.
+  }
 }

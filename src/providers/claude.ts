@@ -326,6 +326,10 @@ export class ClaudeAdapter extends ProviderAdapter {
 
       // Track stderr in a variable so the finalizer closure can access it.
       let stderrBuffer = '';
+      // appendStderr keeps the FIRST 10KB, so once a rejection appears in the
+      // buffer every later chunk still matches it. Latch, or one turn invalidates
+      // the probe cache once per stderr chunk.
+      let noticedFlagRejection = false;
 
       const finalizer = createFinalizer({
         providerName: 'claude',
@@ -372,6 +376,9 @@ export class ClaudeAdapter extends ProviderAdapter {
         // block_start / block_delta / block_stop trio the whole-message path
         // produces, just finer grained.
         if (type === 'stream_event') {
+          // Nothing may follow `done`. Today's CLI puts `result` last, but a
+          // late frame would otherwise emit block events onto a finished turn.
+          if (settled) return;
           mapper.handle(parsed, onEvent);
           if (!mapper.hasOpenBlock()) flushDeferred();
           return;
@@ -381,9 +388,8 @@ export class ClaudeAdapter extends ProviderAdapter {
           // A late readline-buffered assistant event can arrive after the
           // stream is already settled; log it for diagnosis.
           if (settled) {
-            log.debug('Assistant event received after stream settled — block events would be emitted post-done', {
-              sessionId,
-            });
+            log.debug('Assistant event received after stream settled — dropping', { sessionId });
+            return;
           }
 
           // The assistant message contains the content blocks
@@ -509,6 +515,10 @@ export class ClaudeAdapter extends ProviderAdapter {
         }
 
         if (type === 'result') {
+          // A second `result` would otherwise emit a second `done`, completing
+          // the server's request twice.
+          if (settled) return;
+
           // Extract final session ID and usage from result
           sessionId = (parsed['session_id'] as string) ?? sessionId;
 
@@ -580,7 +590,9 @@ export class ClaudeAdapter extends ProviderAdapter {
         // A CLI downgraded under a running bridge rejects the flag we cached as
         // supported. Clear the cache so the next turn re-probes instead of
         // failing identically until someone restarts the bridge.
-        if (partialMessages) noteCliRejectedPartialFlag(stderrBuffer);
+        if (partialMessages && !noticedFlagRejection) {
+          noticedFlagRejection = noteCliRejectedPartialFlag(stderrBuffer);
+        }
       });
 
       child.on('error', (err: NodeJS.ErrnoException) => {
@@ -594,6 +606,10 @@ export class ClaudeAdapter extends ProviderAdapter {
 
         if (!settled) {
           settled = true;
+          // Setting `settled` here makes the finalizer skip onBeforeFinalize,
+          // so this path has to close its own blocks. Reachable when 'error'
+          // fires after streaming began — a failed kill(), say.
+          settleBlocks();
           onEvent({
             event: 'error',
             data: {

@@ -28,6 +28,10 @@ import type { AiRequestMessage } from '../../src/protocol/types.js';
 vi.mock('../../src/providers/claude-capabilities.js', () => ({
   supportsPartialMessages: () => Promise.resolve(true),
   resetPartialMessageSupportCache: () => {},
+  // Must mirror the real module's exports: claude.ts calls this from a stderr
+  // 'data' handler, where a missing export throws OUTSIDE any try/catch and
+  // vitest reports the file as passing with a stray process-level error.
+  noteCliRejectedPartialFlag: () => false,
 }));
 
 const FIXTURES = join(fileURLToPath(new URL('./fixtures/', import.meta.url)));
@@ -178,6 +182,59 @@ describe('ClaudePartialStreamMapper', () => {
     const secondDelta = events.filter((e) => e.event === 'block_delta')
       .find((e) => (e.data as { content: string }).content === 'second');
     expect((secondDelta!.data as { block_index: number }).block_index).toBe(1);
+  });
+
+  it('closes a block the previous message left open, before opening the next', () => {
+    // A message that ends without content_block_stop — a mid-stream error the
+    // CLI retried past, a compaction boundary — must not leave an announced
+    // block orphaned. Forgetting its state instead of closing it puts it
+    // beyond the reach of closeOpenBlocks() too.
+    const events = run([
+      messageStart('msg_1'),
+      blockStart(0, { type: 'text', text: '' }),
+      blockDelta(0, { type: 'text_delta', text: 'first' }),
+      messageStart('msg_2'),
+      blockStart(0, { type: 'text', text: '' }),
+      blockDelta(0, { type: 'text_delta', text: 'second' }),
+      blockStop(0),
+    ]);
+
+    expect(events.map((e) => `${e.event}:${(e.data as { block_index: number }).block_index}`)).toEqual([
+      'block_start:0', 'block_delta:0', 'block_stop:0',
+      'block_start:1', 'block_delta:1', 'block_stop:1',
+    ]);
+  });
+
+  it('flushes a tool call the previous message left open', () => {
+    const events = run([
+      messageStart('msg_1'),
+      blockStart(0, { type: 'tool_use', id: 'toolu_1', name: 'Bash' }),
+      blockDelta(0, { type: 'input_json_delta', partial_json: '{"command":"ls"}' }),
+      messageStart('msg_2'),
+    ]);
+
+    // Without this the tool call is announced with a name and an id and then
+    // never says what it was called with — indistinguishable from no arguments.
+    expect(events.map((e) => e.event)).toEqual(['block_start', 'block_delta', 'block_stop']);
+    expect((events[1]!.data as { content: string }).content).toBe(JSON.stringify({ command: 'ls' }));
+  });
+
+  it('reports nothing open once a message boundary has closed it', () => {
+    // hasOpenBlock() drives the adapter's deferral queue. Reporting "nothing
+    // open" while a block is still logically open would flush whole-message
+    // events straight into it.
+    const mapper = new ClaudePartialStreamMapper();
+    const events: AdapterStreamEvent[] = [];
+    const emit = (e: AdapterStreamEvent) => events.push(e);
+
+    mapper.handle(messageStart('msg_1'), emit);
+    mapper.handle(blockStart(0, { type: 'text', text: '' }), emit);
+    mapper.handle(blockDelta(0, { type: 'text_delta', text: 'open' }), emit);
+    expect(mapper.hasOpenBlock()).toBe(true);
+
+    mapper.handle(messageStart('msg_2'), emit);
+    expect(mapper.hasOpenBlock()).toBe(false);
+    expect(events.at(-1)).toEqual({ event: 'block_stop', data: { block_index: 0 } });
   });
 
   it('drops a stray delta left over from an unterminated message', () => {
@@ -802,5 +859,73 @@ describe('a whole-message frame arriving while a partial block is open', () => {
 
     // Held back, not dropped: the sub-agent's text still arrives.
     expect(textOfBlocks(events, 'text')).toEqual(['main answer', 'from the sub-agent']);
+  });
+});
+
+describe('frames arriving after the turn has ended', () => {
+  /** Drive the adapter with arbitrary NDJSON lines. */
+  async function feed(lines: unknown[]): Promise<AdapterStreamEvent[]> {
+    const ndjson = lines.map((l) => JSON.stringify(l)).join('\n') + '\n';
+
+    class Feeder extends ClaudeAdapter {
+      protected override spawnCli(): ChildProcessByStdio<Writable | null, Readable, Readable> {
+        return spawn(process.execPath, ['-e', `process.stdout.write(${JSON.stringify(ndjson)})`],
+          { stdio: ['ignore', 'pipe', 'pipe'] }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
+      }
+    }
+
+    const events: AdapterStreamEvent[] = [];
+    await new Feeder().execute({
+      request: {
+        type: 'ai_request', request_id: 'req_late', conversation_id: 'c', provider: 'claude',
+        message: 'go', system_prompt: null, options: {}, cli_session_id: null,
+      },
+      requestId: 'req_late',
+      tools: [],
+      mcp: null,
+      cliIsolation: 'native',
+      workingDir: process.cwd(),
+      signal: new AbortController().signal,
+      requestTimeoutSeconds: 30,
+      cliSessionId: null,
+      attachmentDir: null,
+    }, (e) => events.push(e));
+    return events;
+  }
+
+  const result = { type: 'result', subtype: 'success', session_id: 's', usage: {} };
+
+  it('completes the turn exactly once when the CLI reports two results', async () => {
+    // A second `done` completes the server's request twice.
+    const events = await feed([result, result]);
+    expect(events.filter((e) => e.event === 'done')).toHaveLength(1);
+  });
+
+  it('emits one done when an error result is followed by a success result', async () => {
+    const events = await feed([
+      { type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 's', errors: ['boom'] },
+      result,
+    ]);
+    expect(events.filter((e) => e.event === 'done')).toHaveLength(1);
+    expect(events.filter((e) => e.event === 'error')).toHaveLength(1);
+  });
+
+  it('drops block events that arrive after done', async () => {
+    const events = await feed([
+      result,
+      { type: 'stream_event', event: { type: 'message_start', message: { id: 'late' } } },
+      { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } },
+      { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'AFTER-DONE' } } },
+    ]);
+
+    expect(events.map((e) => e.event)).toEqual(['done']);
+  });
+
+  it('drops a whole-message frame that arrives after done', async () => {
+    const events = await feed([
+      result,
+      { type: 'assistant', message: { id: 'late', content: [{ type: 'text', text: 'AFTER-DONE' }] } },
+    ]);
+    expect(events.map((e) => e.event)).toEqual(['done']);
   });
 });

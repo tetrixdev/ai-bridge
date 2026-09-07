@@ -159,6 +159,31 @@ describe('recovering from a CLI downgraded under a running bridge', () => {
     await expect(supportsPartialMessages()).resolves.toBe(false);
   });
 
+  it('reports whether it fired, so the caller can latch it', async () => {
+    // appendStderr keeps the FIRST 10KB, so once a rejection is in the buffer
+    // every later chunk still matches. Without a latch driven by this return
+    // value, one turn re-probes once per stderr chunk.
+    fakeClaude(HELP_WITH_FLAG);
+    await supportsPartialMessages();
+
+    expect(noteCliRejectedPartialFlag('error: unknown option --include-partial-messages')).toBe(true);
+    expect(noteCliRejectedPartialFlag('Error: rate limit exceeded')).toBe(false);
+  });
+
+  it('does not treat a CLI printing its own option list as a rejection', async () => {
+    // A CLI that SUPPORTS the flag still names it when it dumps usage on an
+    // unrelated failure. Taking that as a rejection re-probes after every such
+    // turn, for nothing.
+    fakeClaude(HELP_WITH_FLAG);
+    await expect(supportsPartialMessages()).resolves.toBe(true);
+
+    const usageDump = 'Error: request failed\n\nOptions:\n  --include-partial-messages   Include partial message chunks\n';
+    expect(noteCliRejectedPartialFlag(usageDump)).toBe(false);
+
+    fakeClaude(HELP_WITHOUT_FLAG);  // would report false if the cache had been dropped
+    await expect(supportsPartialMessages()).resolves.toBe(true);
+  });
+
   it('ignores unrelated stderr, so one bad turn does not disable streaming', async () => {
     fakeClaude(HELP_WITH_FLAG);
     await expect(supportsPartialMessages()).resolves.toBe(true);
