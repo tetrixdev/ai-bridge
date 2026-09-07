@@ -113,23 +113,26 @@ describe('supportsPartialMessages', () => {
 ${HELP_WITH_FLAG}
 sleep 30`);
 
-    await expect(supportsPartialMessages()).resolves.toBe(false);
+    // true, not false: the flag WAS printed. Having to kill a CLI that will not
+    // exit is not a reason to discard what it already told us.
+    await expect(supportsPartialMessages()).resolves.toBe(true);
 
     // Past when the grandchild would have written it, had it survived.
     await delay(3_000);
     expect(existsSync(marker), 'a process the probe started outlived it').toBe(false);
   }, 20_000);
 
-  it('leaves an already-exited child alone rather than signalling a recycled pid', async () => {
-    // The group kill is guarded on the child still running. Once a process is
-    // reaped its pid can be recycled onto an unrelated process, and `-pid`
-    // would then signal THAT process's group.
-    setProbeTimeoutForTests(5_000);
-    fakeClaude(HELP_WITH_FLAG);
+  it('uses what the CLI printed when a background child holds stdout open', async () => {
+    // The shape that breaks the obvious implementation, and the one an earlier
+    // version of this file missed: the wrapper EXITS and is reaped, but a child
+    // it backgrounded inherited stdout, so the pipe never closes and the probe
+    // runs to its timeout with the complete help text already read. Answering
+    // `false` there caches "unsupported" for the life of the process on a CLI
+    // that plainly supports the flag.
+    setProbeTimeoutForTests(1_000);
+    fakeClaude(`( sleep 20 ) &\n${HELP_WITH_FLAG}\nexit 0`);
     await expect(supportsPartialMessages()).resolves.toBe(true);
-    // The probe settled on close, so nothing was signalled at all; reaching
-    // here without an unhandled rejection is the assertion.
-  });
+  }, 15_000);
 
   it('strips credentials from the environment it hands the binary', async () => {
     // The probe runs a binary off PATH. ENGRAM_TOKEN is the vault credential
@@ -322,7 +325,54 @@ describe('the adapter noticing a rejected flag', () => {
   });
 });
 
+/** setsid is not present on macOS; the tests that need it skip there. */
+const HAS_SETSID = existsSync('/usr/bin/setsid') || existsSync('/bin/setsid');
+
 describe('a bridge that exits while a probe is in flight', () => {
+  /** Run a probe in a child process and report how long that process took to exit. */
+  async function probeInChildProcess(cliScript: string, dir: string): Promise<number> {
+    writeFileSync(join(dir, 'claude'), `#!/bin/sh\n${cliScript}\n`);
+    chmodSync(join(dir, 'claude'), 0o755);
+
+    const script = join(dir, 'run.ts');
+    writeFileSync(script, `
+      import { supportsPartialMessages, setProbeTimeoutForTests } from ${JSON.stringify(CAPABILITIES_MODULE)};
+      setProbeTimeoutForTests(1_000);
+      await supportsPartialMessages();
+    `);
+
+    const started = Date.now();
+    await new Promise<void>((resolve) => {
+      const child = spawn(VITE_NODE, [script], {
+        env: { ...process.env, PATH: `${dir}:${process.env['PATH'] ?? ''}` },
+        stdio: 'ignore',
+      });
+      child.on('close', () => resolve());
+      child.on('error', () => resolve());
+    });
+    return Date.now() - started;
+  }
+
+  it.skipIf(!HAS_SETSID)('exits rather than hanging on a pipe a background child still holds', async () => {
+    // A wrapper that exits leaves its backgrounded child holding the inherited
+    // stdout. The pipe stays open, libuv keeps the handle referenced, and the
+    // event loop never drains — so the process hangs forever with its work
+    // already done.
+    //
+    // `setsid` puts that child in its OWN process group, where the group kill
+    // cannot reach it. That is what makes this test specific to destroying the
+    // pipes: with a plain `( … ) &` the group kill closes them as a side effect
+    // and the test passes whether the teardown is there or not.
+    const dir = mkdtempSync(join(tmpdir(), 'pipehold-'));
+    try {
+      const elapsed = await probeInChildProcess(`setsid sleep 25 &\n${HELP_WITH_FLAG}\nexit 0`, dir);
+      expect(elapsed, 'the process did not exit once the probe was done').toBeLessThan(15_000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+
   it('takes the probe and its children down with it', async () => {
     // Detaching the probe means it no longer shares the bridge's process group,
     // so the operator's Ctrl-C reaches the bridge and not the probe. Without an

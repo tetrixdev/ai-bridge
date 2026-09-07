@@ -187,9 +187,14 @@ function runHelpProbe(): Promise<boolean> {
     child.on('close', () => settle(() => resolve(found)));
 
     const timer = setTimeout(() => {
-      log.warn(`claude --help did not finish within ${probeTimeoutMs}ms — assuming no partial message support`);
+      // `found` is used, not `false`. The help text is often complete long
+      // before the process is: a wrapper that exits while a background child
+      // holds the inherited stdout open keeps the pipe from closing, and
+      // answering `false` there would cache "unsupported" for the life of the
+      // process even though the flag had already been read.
+      log.warn(`claude --help did not finish within ${probeTimeoutMs}ms — using what it printed so far`);
       killTree(child);
-      settle(() => resolve(false));
+      settle(() => resolve(found));
     }, probeTimeoutMs);
 
     // Nothing should keep the process alive for a probe.
@@ -198,30 +203,49 @@ function runHelpProbe(): Promise<boolean> {
 }
 
 /**
- * Kill a probe and everything it started.
+ * Kill a probe and everything it started, and let the event loop go.
  *
- * A negative pid signals the whole process group, which is the only way to
- * reach a wrapper script's children.
+ * Two separate jobs, because either one alone leaves a failure standing.
  *
- * Guarded on the child not having exited. Once a process is reaped its pid can
- * be recycled onto an unrelated process — and `-pid` would then signal THAT
- * process's group. While the child is alive the kernel cannot recycle its pid,
- * so checking first is what keeps this from ever being aimed at a stranger.
+ * The KILL uses a negative pid to signal the whole process group, which is the
+ * only way to reach a wrapper script's children.
+ *
+ * The PIPE TEARDOWN is what actually lets the bridge exit. A wrapper that exits
+ * while a background child still holds the inherited stdout leaves the child
+ * reaped but the pipe open, and libuv keeps the handle referenced, so the loop
+ * never drains and the process hangs — measured, and worse than the execFile
+ * version this replaced, which destroyed the pipes on its own timeout path.
+ * The exit hook cannot save this: `process.once('exit')` only fires once the
+ * loop has drained, which is exactly what is not happening.
+ *
+ * Deliberately NOT guarded on the child having exited. That guard looked
+ * prudent — a reaped pid can in principle be recycled, and `-pid` would then
+ * signal a stranger's group — but it disabled the kill in the one shape that
+ * needs it, and the premise is wrong anyway: while any member of the group is
+ * alive the group id keeps the leader's pid reserved, so it cannot be recycled.
+ * This is only ever called from the timeout path, before the probe settles.
  */
 function killTree(child: ChildProcess): void {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-
+  let signalled = false;
   try {
     if (process.platform !== 'win32' && child.pid !== undefined) {
       process.kill(-child.pid, 'SIGKILL');
-      return;
+      signalled = true;
     }
   } catch {
     // Never became a group leader, or the group is already gone.
   }
-  try {
-    child.kill('SIGKILL');
-  } catch {
-    // Already dead.
+
+  if (!signalled) {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // Already dead.
+    }
   }
+
+  // Unconditional: a grandchild that put itself in another process group
+  // survives the kill above, and its inherited pipe would still pin the loop.
+  child.stdout?.destroy();
+  child.stderr?.destroy();
 }
