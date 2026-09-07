@@ -237,6 +237,40 @@ describe('ClaudePartialStreamMapper', () => {
     expect(events.at(-1)).toEqual({ event: 'block_stop', data: { block_index: 0 } });
   });
 
+  it('closes the previous block when an index is announced twice', () => {
+    // open() overwrites the mapping for a CLI index, so a second
+    // content_block_start for one already in use would strand the first block:
+    // never stopped, and no longer reachable by closeOpenBlocks(). Malformed
+    // output only, but it defeats the safety nets built around it.
+    const events = run([
+      messageStart('msg_1'),
+      blockStart(0, { type: 'text', text: '' }),
+      blockDelta(0, { type: 'text_delta', text: 'stranded?' }),
+      blockStart(0, { type: 'tool_use', id: 'toolu_1', name: 'Read' }),
+      blockDelta(0, { type: 'input_json_delta', partial_json: '{"file_path":"/a"}' }),
+      blockStop(0),
+    ]);
+
+    expect(events.map((e) => `${e.event}:${(e.data as { block_index: number }).block_index}`)).toEqual([
+      'block_start:0', 'block_delta:0', 'block_stop:0',
+      'block_start:1', 'block_delta:1', 'block_stop:1',
+    ]);
+    expect(events[3]!.data).toMatchObject({ block_type: 'tool_call', tool_name: 'Read' });
+  });
+
+  it('gives away no index when a re-announced block never opened', () => {
+    const events = run([
+      messageStart('msg_1'),
+      blockStart(0, { type: 'text', text: '' }),       // announced, no content
+      blockStart(0, { type: 'tool_use', id: 't1', name: 'Read' }),
+      blockDelta(0, { type: 'input_json_delta', partial_json: '{}' }),
+      blockStop(0),
+    ]);
+
+    expect(events[0]!.data).toMatchObject({ block_index: 0, block_type: 'tool_call' });
+    expect(events.filter((e) => e.event === 'block_stop')).toHaveLength(1);
+  });
+
   it('drops a stray delta left over from an unterminated message', () => {
     // Message 1 never closes its block; message 2 then sends a delta for the
     // same CLI index with no content_block_start of its own. If the per-message

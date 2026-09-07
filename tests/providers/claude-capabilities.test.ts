@@ -15,6 +15,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, existsSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
@@ -22,6 +23,7 @@ import {
   supportsPartialMessages,
   resetPartialMessageSupportCache,
   noteCliRejectedPartialFlag,
+  setProbeTimeoutForTests,
 } from '../../src/providers/claude-capabilities.js';
 import { ClaudeAdapter } from '../../src/providers/claude.js';
 import type { AiRequestMessage } from '../../src/protocol/types.js';
@@ -47,6 +49,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs();
   resetPartialMessageSupportCache();
+  setProbeTimeoutForTests(10_000);
   rmSync(binDir, { recursive: true, force: true });
 });
 
@@ -79,13 +82,50 @@ describe('supportsPartialMessages', () => {
   });
 
   it('does not hang on a CLI that ignores the kill signal', async () => {
-    // execFile's own `timeout` only SENDS a signal; the promise settles on the
-    // child's close. A child that traps SIGTERM would leave it pending forever,
-    // and because the answer is cached and awaited before the request timeout
-    // is armed, that would stall every Claude turn for the life of the process.
+    // A child that traps SIGTERM must not be able to stall the probe. Because
+    // the answer is cached and awaited before the request timeout is armed,
+    // that would stop every Claude turn for the life of the process.
+    setProbeTimeoutForTests(1_000);
     fakeClaude('trap "" TERM\nsleep 30');
     await expect(supportsPartialMessages()).resolves.toBe(false);
+  }, 15_000);
+
+  it('kills what the CLI started, not just the CLI', async () => {
+    // A `claude` that is a shell wrapper leaves descendants that SIGKILL on the
+    // child alone never reaches, and they outlive the probe AND the bridge.
+    //
+    // This is the test the first attempt at this did not have: that version
+    // passed `detached: true` to execFile, which silently drops it — the option
+    // whitelist is cwd/env/gid/shell/signal/uid/windowsHide/
+    // windowsVerbatimArguments — so the child stayed in the bridge's own group,
+    // the group kill threw ESRCH, and it quietly did nothing.
+    setProbeTimeoutForTests(1_000);
+    const marker = join(binDir, 'grandchild-survived.txt');
+
+    // Backgrounds a grandchild that will write the marker, holds stdout open so
+    // the probe cannot finish on its own, and ignores SIGTERM.
+    fakeClaude(`trap "" TERM
+( sleep 2; touch ${marker} ) &
+${HELP_WITH_FLAG}
+sleep 30`);
+
+    await expect(supportsPartialMessages()).resolves.toBe(false);
+
+    // Past when the grandchild would have written it, had it survived.
+    await delay(3_000);
+    expect(existsSync(marker), 'a process the probe started outlived it').toBe(false);
   }, 20_000);
+
+  it('leaves an already-exited child alone rather than signalling a recycled pid', async () => {
+    // The group kill is guarded on the child still running. Once a process is
+    // reaped its pid can be recycled onto an unrelated process, and `-pid`
+    // would then signal THAT process's group.
+    setProbeTimeoutForTests(5_000);
+    fakeClaude(HELP_WITH_FLAG);
+    await expect(supportsPartialMessages()).resolves.toBe(true);
+    // The probe settled on close, so nothing was signalled at all; reaching
+    // here without an unhandled rejection is the assertion.
+  });
 
   it('strips credentials from the environment it hands the binary', async () => {
     // The probe runs a binary off PATH. ENGRAM_TOKEN is the vault credential

@@ -12,7 +12,7 @@
  * process and shared by every concurrent request through the cached promise.
  */
 
-import { execFile } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createLogger } from '../utils/logger.js';
 import { getBridgeWorkingDir, stripCredentials } from './env.js';
 
@@ -23,21 +23,33 @@ const DISABLE_ENV_VAR = 'AI_BRIDGE_DISABLE_PARTIAL_STREAMING';
 
 const PARTIAL_FLAG = '--include-partial-messages';
 
+/** Ceiling on how much probe output is buffered while waiting for the timeout. */
+const MAX_PROBE_OUTPUT = 1_000_000;
+
 /** How the common CLI argument parsers word an unknown option. */
-const OPTION_REJECTION = /(unknown|unrecognized|unrecognised|invalid|unexpected) (option|argument|flag)/i;
+const OPTION_REJECTION = /(unknown|unrecognized|unrecognised|invalid|unexpected) (option|argument|flag)|not defined|no such option/i;
 
 /**
- * Hard ceiling on the probe, enforced by us rather than by execFile.
+ * Hard ceiling on the probe, enforced by us.
  *
- * `execFile`'s own `timeout` only SENDS a signal; the promise settles when the
- * child's `close` fires. A child that ignores SIGTERM therefore leaves it
- * pending forever — measured, not assumed. That matters far more here than it
- * looks: the result is cached, and the adapter awaits it before the per-request
- * timeout is armed, so a single hung probe would silently stall every Claude
- * turn for the life of the process with no error, no `done`, and nothing in the
- * logs pointing at `claude --help`.
+ * The probe must never be able to stall a turn: the answer is cached, and the
+ * adapter awaits it before the per-request timeout is armed, so one probe that
+ * never settles would silently stop every Claude turn for the life of the
+ * process — no error, no `done`, and nothing in the logs pointing at
+ * `claude --help`.
  */
-const PROBE_TIMEOUT_MS = 10_000;
+let probeTimeoutMs = 10_000;
+
+/**
+ * Shorten the probe timeout. TESTS ONLY.
+ *
+ * Exists because the behaviour worth testing here — that a wedged CLI and its
+ * children are killed rather than waited on — can only be observed by letting
+ * the timeout fire, and a ten-second unit test is one nobody runs.
+ */
+export function setProbeTimeoutForTests(ms: number): void {
+  probeTimeoutMs = ms;
+}
 
 let cached: Promise<boolean> | null = null;
 
@@ -102,45 +114,63 @@ async function probe(): Promise<boolean> {
 function runHelpProbe(): Promise<boolean> {
   return new Promise<boolean>((resolve, reject) => {
     // The probe runs a binary off PATH, so it gets the same credential
-    // stripping every other spawn does. CLAUDECODE additionally has to go:
-    // the CLI refuses to run when it is set, so a bridge running inside Claude
-    // Code would probe as "unsupported" and quietly disable streaming
-    // everywhere.
+    // stripping every other spawn does. CLAUDECODE additionally has to go: the
+    // CLI refuses to run when it is set, so a bridge running inside Claude Code
+    // would probe as "unsupported" and quietly disable streaming everywhere.
     const env = stripCredentials({ ...process.env });
     delete env['CLAUDECODE'];
 
+    let child: ChildProcess;
+    try {
+      // spawn, NOT execFile. execFile does not forward `detached` — its option
+      // whitelist is cwd/env/gid/shell/signal/uid/windowsHide/
+      // windowsVerbatimArguments — so a child started through it stays in the
+      // bridge's own process group and a group kill throws ESRCH. An earlier
+      // version of this file did exactly that and silently fell back to killing
+      // the child alone, which is the case that does not need killing.
+      //
+      // The group matters for a `claude` that is a shell wrapper: SIGKILL
+      // reaches the child, never its descendants, so a wrapper's background
+      // work outlives the probe and the bridge.
+      child = spawn('claude', ['--help'], {
+        env,
+        // Pinned like every other Claude spawn, so `--help` cannot walk a
+        // project tree the operator did not point us at.
+        cwd: getBridgeWorkingDir(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+        ...(process.platform === 'win32' ? {} : { detached: true }),
+      });
+    } catch (err) {
+      reject(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+
+    let output = '';
     let settled = false;
 
-    const child = execFile('claude', ['--help'], {
-      // SIGKILL rather than the default SIGTERM, so a child that traps TERM
-      // cannot outlive its own timeout. Note this reaches the child only —
-      // hence the process-group kill below, for a `claude` that is a shell
-      // wrapper whose grandchildren would otherwise survive the probe.
-      timeout: PROBE_TIMEOUT_MS,
-      killSignal: 'SIGKILL',
-      // Own process group, so the whole tree can be signalled at once.
-      ...(process.platform === 'win32' ? {} : { detached: true }),
-      env,
-      // Pinned like every other Claude spawn, so `--help` cannot walk a project
-      // tree the operator did not point us at.
-      cwd: getBridgeWorkingDir(),
-    }, (err, stdout, stderr) => {
+    const settle = (act: () => void): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (err) return void reject(err);
-      resolve(((stdout || '') + (stderr || '')).includes(PARTIAL_FLAG));
-    });
+      act();
+    };
 
-    // The backstop for the case execFile's own timeout cannot handle. Resolves
-    // rather than rejects, so the answer is the safe one either way.
+    // Help text is small; the cap is only so a misbehaving binary streaming
+    // forever cannot grow this without bound before the timeout fires.
+    const onData = (chunk: Buffer): void => {
+      if (output.length < MAX_PROBE_OUTPUT) output += chunk.toString();
+    };
+    child.stdout?.on('data', onData);
+    child.stderr?.on('data', onData);
+
+    child.on('error', (err) => settle(() => reject(err)));
+    child.on('close', () => settle(() => resolve(output.includes(PARTIAL_FLAG))));
+
     const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      log.warn(`claude --help did not finish within ${PROBE_TIMEOUT_MS}ms — assuming no partial message support`);
+      log.warn(`claude --help did not finish within ${probeTimeoutMs}ms — assuming no partial message support`);
       killTree(child);
-      resolve(false);
-    }, PROBE_TIMEOUT_MS + 500);
+      settle(() => resolve(false));
+    }, probeTimeoutMs);
 
     // Nothing should keep the process alive for a probe.
     timer.unref?.();
@@ -148,21 +178,26 @@ function runHelpProbe(): Promise<boolean> {
 }
 
 /**
- * Kill a probe and anything it started.
+ * Kill a probe and everything it started.
  *
  * A negative pid signals the whole process group, which is the only way to
- * reach a wrapper script's children — measured: with a `claude` that traps
- * SIGTERM and runs `sleep`, killing just the child left the sleep running
- * after both the probe and the bridge had exited.
+ * reach a wrapper script's children.
+ *
+ * Guarded on the child not having exited. Once a process is reaped its pid can
+ * be recycled onto an unrelated process — and `-pid` would then signal THAT
+ * process's group. While the child is alive the kernel cannot recycle its pid,
+ * so checking first is what keeps this from ever being aimed at a stranger.
  */
-function killTree(child: { pid?: number; kill: (signal: NodeJS.Signals) => boolean }): void {
+function killTree(child: ChildProcess): void {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+
   try {
     if (process.platform !== 'win32' && child.pid !== undefined) {
       process.kill(-child.pid, 'SIGKILL');
       return;
     }
   } catch {
-    // The group may already be gone, or never became a group leader.
+    // Never became a group leader, or the group is already gone.
   }
   try {
     child.kill('SIGKILL');

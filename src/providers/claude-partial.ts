@@ -129,23 +129,31 @@ export class ClaudePartialStreamMapper {
     // In bridge-index order, so a consumer sees them close in the order it saw
     // them open.
     const open = [...this.bridgeIndex.entries()].sort((a, b) => a[1] - b[1]);
+    for (const [cliIndex] of open) this.closeBlock(cliIndex, emit);
 
-    for (const [cliIndex, index] of open) {
-      if (this.blockType.get(cliIndex) === 'tool_call') {
-        emit({
-          event: 'block_delta',
-          data: { block_index: index, content: normaliseToolArguments(this.toolJson.get(cliIndex)) },
-        });
-      }
-      emit({ event: 'block_stop', data: { block_index: index } });
-    }
-
-    this.bridgeIndex.clear();
-    this.blockType.clear();
-    this.toolJson.clear();
     // Blocks still pending never emitted a block_start, so there is nothing to
     // close for them — but they must not survive into anything that follows.
     this.pending.clear();
+  }
+
+  /** Emit the closing events for one open block, and forget it. */
+  private closeBlock(cliIndex: number, emit: (event: AdapterStreamEvent) => void): void {
+    this.pending.delete(cliIndex);
+
+    const index = this.bridgeIndex.get(cliIndex);
+    if (index === undefined) return;
+
+    if (this.blockType.get(cliIndex) === 'tool_call') {
+      emit({
+        event: 'block_delta',
+        data: { block_index: index, content: normaliseToolArguments(this.toolJson.get(cliIndex)) },
+      });
+    }
+    emit({ event: 'block_stop', data: { block_index: index } });
+
+    this.bridgeIndex.delete(cliIndex);
+    this.blockType.delete(cliIndex);
+    this.toolJson.delete(cliIndex);
   }
 
   /** Handle one `stream_event` frame, emitting whatever bridge events it maps to. */
@@ -211,6 +219,16 @@ export class ClaudePartialStreamMapper {
   private onBlockStart(event: Record<string, unknown>, emit: (e: AdapterStreamEvent) => void): void {
     const cliIndex = event['index'];
     if (typeof cliIndex !== 'number') return;
+
+    // A second content_block_start for an index already in use would otherwise
+    // strand the first block: open() OVERWRITES the mapping, so the earlier
+    // block's entry is lost, it is never stopped, and closeOpenBlocks() can no
+    // longer find it. Close it properly first. Malformed output only — 2.1.261
+    // does not do this — but it defeats the very safety nets around it.
+    if (this.bridgeIndex.has(cliIndex) || this.pending.has(cliIndex)) {
+      log.debug('content_block_start reused an open index — closing the previous block', { cliIndex });
+      this.closeBlock(cliIndex, emit);
+    }
 
     const block = obj(event, 'content_block');
     const rawType = str(block, 'type');
@@ -314,24 +332,9 @@ export class ClaudePartialStreamMapper {
     if (typeof cliIndex !== 'number') return;
 
     // A block that was announced and never produced content is dropped whole,
-    // exactly as the whole-message path drops one whose text is empty.
-    this.pending.delete(cliIndex);
-
-    const index = this.bridgeIndex.get(cliIndex);
-    if (index === undefined) return;
-
-    if (this.blockType.get(cliIndex) === 'tool_call') {
-      emit({
-        event: 'block_delta',
-        data: { block_index: index, content: normaliseToolArguments(this.toolJson.get(cliIndex)) },
-      });
-    }
-
-    emit({ event: 'block_stop', data: { block_index: index } });
-
-    this.bridgeIndex.delete(cliIndex);
-    this.blockType.delete(cliIndex);
-    this.toolJson.delete(cliIndex);
+    // exactly as the whole-message path drops one whose text is empty —
+    // closeBlock() forgets a pending entry without emitting anything for it.
+    this.closeBlock(cliIndex, emit);
   }
 }
 
