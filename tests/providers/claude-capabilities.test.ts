@@ -16,6 +16,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, existsSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
@@ -27,6 +28,9 @@ import {
 } from '../../src/providers/claude-capabilities.js';
 import { ClaudeAdapter } from '../../src/providers/claude.js';
 import type { AiRequestMessage } from '../../src/protocol/types.js';
+
+const CAPABILITIES_MODULE = fileURLToPath(new URL('../../src/providers/claude-capabilities.ts', import.meta.url));
+const VITE_NODE = fileURLToPath(new URL('../../node_modules/.bin/vite-node', import.meta.url));
 
 let binDir: string;
 
@@ -316,4 +320,47 @@ describe('the adapter noticing a rejected flag', () => {
     fakeClaude(HELP_WITHOUT_FLAG);
     await expect(supportsPartialMessages()).resolves.toBe(false);
   });
+});
+
+describe('a bridge that exits while a probe is in flight', () => {
+  it('takes the probe and its children down with it', async () => {
+    // Detaching the probe means it no longer shares the bridge's process group,
+    // so the operator's Ctrl-C reaches the bridge and not the probe. Without an
+    // exit hook the probe — and for a wrapper CLI everything it started —
+    // outlives the bridge, with nothing left running to time it out.
+    //
+    // Survival is detected by a file the fake CLI writes AFTER the bridge is
+    // gone. Deliberately not by inspecting process lists: `pgrep -f` matches
+    // the invoking shell's own command line, which reports a survivor that
+    // isn't there.
+    const dir = mkdtempSync(join(tmpdir(), 'orphan-'));
+    try {
+      const survived = join(dir, 'SURVIVED');
+      writeFileSync(join(dir, 'claude'), `#!/bin/sh\ntrap "" TERM\nsleep 2\ntouch ${survived}\n`);
+      chmodSync(join(dir, 'claude'), 0o755);
+
+      const script = join(dir, 'run.ts');
+      writeFileSync(script, `
+        import { supportsPartialMessages, setProbeTimeoutForTests } from ${JSON.stringify(CAPABILITIES_MODULE)};
+        setProbeTimeoutForTests(60_000);   // must not settle on its own
+        supportsPartialMessages().then(() => {});
+        setTimeout(() => process.exit(0), 400);
+      `);
+
+      await new Promise<void>((resolve) => {
+        const child = spawn(VITE_NODE, [script], {
+          env: { ...process.env, PATH: `${dir}:${process.env['PATH'] ?? ''}` },
+          stdio: 'ignore',
+        });
+        child.on('close', () => resolve());
+        child.on('error', () => resolve());
+      });
+
+      // Past when the fake CLI would have written the marker, had it lived.
+      await delay(3_000);
+      expect(existsSync(survived), 'the probe outlived the bridge that started it').toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });

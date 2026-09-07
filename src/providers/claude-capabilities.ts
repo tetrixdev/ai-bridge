@@ -23,8 +23,6 @@ const DISABLE_ENV_VAR = 'AI_BRIDGE_DISABLE_PARTIAL_STREAMING';
 
 const PARTIAL_FLAG = '--include-partial-messages';
 
-/** Ceiling on how much probe output is buffered while waiting for the timeout. */
-const MAX_PROBE_OUTPUT = 1_000_000;
 
 /** How the common CLI argument parsers word an unknown option. */
 const OPTION_REJECTION = /(unknown|unrecognized|unrecognised|invalid|unexpected) (option|argument|flag)|not defined|no such option/i;
@@ -145,26 +143,48 @@ function runHelpProbe(): Promise<boolean> {
       return;
     }
 
-    let output = '';
+    // Scan for the flag as output arrives rather than buffering it all.
+    //
+    // Buffering with a cap gets this WRONG rather than merely large: a CLI that
+    // prints past the cap before reaching the flag reports "unsupported", and
+    // the operator loses streaming with nothing to explain it. Keeping only
+    // enough tail to catch a match split across two chunks is both correct for
+    // any output size and O(flag length) in memory.
+    let found = false;
+    let tail = '';
     let settled = false;
+
+    // Detaching means the child no longer shares the bridge's process group, so
+    // the operator's Ctrl-C reaches the bridge and not the probe. Without this,
+    // a probe in flight — and, for a wrapper CLI, everything it started — would
+    // outlive the bridge, with nothing left running to time it out. Measured:
+    // before this, a wedged fake CLI was still running after its parent exited.
+    const killOnExit = (): void => killTree(child);
+    process.once('exit', killOnExit);
 
     const settle = (act: () => void): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      process.removeListener('exit', killOnExit);
       act();
     };
 
-    // Help text is small; the cap is only so a misbehaving binary streaming
-    // forever cannot grow this without bound before the timeout fires.
     const onData = (chunk: Buffer): void => {
-      if (output.length < MAX_PROBE_OUTPUT) output += chunk.toString();
+      if (found) return;
+      const text = tail + chunk.toString();
+      if (text.includes(PARTIAL_FLAG)) {
+        found = true;
+        tail = '';
+        return;
+      }
+      tail = text.slice(-(PARTIAL_FLAG.length - 1));
     };
     child.stdout?.on('data', onData);
     child.stderr?.on('data', onData);
 
     child.on('error', (err) => settle(() => reject(err)));
-    child.on('close', () => settle(() => resolve(output.includes(PARTIAL_FLAG))));
+    child.on('close', () => settle(() => resolve(found)));
 
     const timer = setTimeout(() => {
       log.warn(`claude --help did not finish within ${probeTimeoutMs}ms — assuming no partial message support`);
