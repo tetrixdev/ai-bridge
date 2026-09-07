@@ -10,8 +10,21 @@
  *
  * Output format (NDJSON):
  *   {"type":"system","subtype":"init","session_id":"...","model":"..."}
+ *   {"type":"stream_event","event":{"type":"content_block_delta","index":0,...}}
  *   {"type":"assistant","message":{"content":[{"type":"text","text":"..."}],...}}
  *   {"type":"result","subtype":"success","session_id":"...","usage":{...},"total_cost_usd":...}
+ *
+ * Two paths produce blocks, and both run in the same turn:
+ *
+ *   - `stream_event` frames, when the CLI supports `--include-partial-messages`.
+ *     Text arrives in chunks as the model writes it. Mapped by
+ *     claude-partial.ts.
+ *   - `assistant` frames, which carry a whole message at once. Still the only
+ *     form for sub-agent (Task tool) messages, and the only form at all on a
+ *     CLI without the flag.
+ *
+ * A message delivered by the first path ALSO arrives via the second. The
+ * duplicate is suppressed by message id — see the `wasStreamed` check below.
  */
 
 import { createInterface } from 'node:readline';
@@ -21,6 +34,8 @@ import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt }
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
+import { ClaudePartialStreamMapper } from './claude-partial.js';
+import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
@@ -54,6 +69,30 @@ export class ClaudeAdapter extends ProviderAdapter {
       '--output-format', 'stream-json', // NDJSON streaming output
       '--verbose',                       // Required for stream-json in print mode
     ];
+
+    // Stream text as the model writes it, rather than one lump per content
+    // block. Without this the CLI reports an assistant message only once the
+    // block is complete, so a long answer lands as a paragraph at a time and a
+    // slow turn is indistinguishable from a stalled one.
+    //
+    // Gated on a probe because the flag is fatal on a CLI that does not have
+    // it (see claude-capabilities.ts). When it is absent the whole-message
+    // path below runs exactly as before.
+    const partialMessages = await supportsPartialMessages();
+    if (partialMessages) {
+      args.push('--include-partial-messages');
+    }
+
+    // The probe above is the first await in this method, so a cancellation that
+    // lands during it would otherwise be missed: the abort listener is only
+    // registered further down, and adding one to an ALREADY-aborted signal
+    // never fires. Without this check the CLI is spawned for a request nobody
+    // is reading, and runs until the request timeout.
+    if (context.signal.aborted) {
+      log.info('Request aborted before spawn', { requestId });
+      onEvent({ event: 'done', data: {} });
+      return null;
+    }
 
     // Resume an existing session if we have a session ID. `--resume <id>`
     // continues the conversation under the SAME session id (unlike
@@ -227,8 +266,36 @@ export class ClaudeAdapter extends ProviderAdapter {
 
     return new Promise<string | null>((resolve, reject) => {
       let sessionId: string | null = null;
-      let blockIndex = 0;
       let settled = false;
+
+      // Owns the turn's block indices. Both paths allocate from it: partial
+      // streaming handles the main agent, while sub-agent messages arrive only
+      // as whole `assistant` frames and are mapped below.
+      const mapper = new ClaudePartialStreamMapper();
+
+      // Whole-message blocks that arrived while a partial block was still open.
+      //
+      // Nothing in the protocol forbids overlapping blocks, but every consumer
+      // tracks exactly one open block — the reference chat UI and the recorder
+      // both do — so a block_start arriving inside another one silently
+      // discards the outer block's text. It cannot happen with today's CLI (a
+      // sub-agent runs only while the main agent is blocked on the tool call,
+      // so no main block is open), but a backgrounded sub-agent would change
+      // that, and holding these back costs nothing.
+      const deferred: AdapterStreamEvent[] = [];
+      const emitWholeMessage = (event: AdapterStreamEvent) => {
+        if (mapper.hasOpenBlock()) deferred.push(event);
+        else onEvent(event);
+      };
+      const flushDeferred = () => {
+        while (deferred.length > 0) onEvent(deferred.shift()!);
+      };
+
+      /** Close anything the CLI left open, then release anything held back. */
+      const settleBlocks = () => {
+        mapper.closeOpenBlocks(onEvent);
+        flushDeferred();
+      };
 
       const env = buildSpawnEnv(context.requestId);
       // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
@@ -259,6 +326,10 @@ export class ClaudeAdapter extends ProviderAdapter {
 
       // Track stderr in a variable so the finalizer closure can access it.
       let stderrBuffer = '';
+      // appendStderr keeps the FIRST 10KB, so once a rejection appears in the
+      // buffer every later chunk still matches it. Latch, or one turn invalidates
+      // the probe cache once per stderr chunk.
+      let noticedFlagRejection = false;
 
       const finalizer = createFinalizer({
         providerName: 'claude',
@@ -271,6 +342,10 @@ export class ClaudeAdapter extends ProviderAdapter {
         resolve,
         signal,
         onAbort,
+        // A cancelled turn, a timeout or a CLI crash abandons whatever block
+        // was mid-stream. Close them, or a consumer that commits a block on
+        // block_stop drops the last chunk of every cancelled answer.
+        onBeforeFinalize: settleBlocks,
       });
 
       // Parse NDJSON from stdout line by line
@@ -296,18 +371,45 @@ export class ClaudeAdapter extends ProviderAdapter {
           return;
         }
 
+        // Partial message chunks, when the CLI supports them. Each frame wraps
+        // one raw Anthropic SSE event; the mapper turns them into the same
+        // block_start / block_delta / block_stop trio the whole-message path
+        // produces, just finer grained.
+        if (type === 'stream_event') {
+          // Nothing may follow `done`. Today's CLI puts `result` last, but a
+          // late frame would otherwise emit block events onto a finished turn.
+          if (settled) return;
+          mapper.handle(parsed, onEvent);
+          if (!mapper.hasOpenBlock()) flushDeferred();
+          return;
+        }
+
         if (type === 'assistant') {
           // A late readline-buffered assistant event can arrive after the
           // stream is already settled; log it for diagnosis.
           if (settled) {
-            log.debug('Assistant event received after stream settled — block events would be emitted post-done', {
-              sessionId,
-            });
+            log.debug('Assistant event received after stream settled — dropping', { sessionId });
+            return;
           }
 
           // The assistant message contains the content blocks
           const message = parsed['message'] as Record<string, unknown> | undefined;
           if (!message) return;
+
+          // In partial mode this frame is the twin of a stream we have ALREADY
+          // emitted — the CLI sends both, and this one arrives mid-stream,
+          // between the last delta and content_block_stop. Emitting it too
+          // would duplicate every block of the answer.
+          //
+          // Matched on the message id rather than on "partial mode is on",
+          // because sub-agent turns (the Task tool) are delivered only as whole
+          // assistant frames: the CLI emits no stream_event for a sidechain. A
+          // blanket rule would drop that output entirely, and the turn would
+          // read as the sub-agent having done nothing.
+          const messageId = typeof message['id'] === 'string' ? message['id'] : undefined;
+          if (mapper.wasStreamed(messageId)) {
+            return;
+          }
 
           const content = message['content'] as Array<Record<string, unknown>> | undefined;
           if (!content || !Array.isArray(content)) return;
@@ -319,60 +421,60 @@ export class ClaudeAdapter extends ProviderAdapter {
               const text = block['text'] as string;
               if (!text) continue;
 
+              const index = mapper.nextIndex();
+
               // Emit block_start + block_delta + block_stop for text
-              onEvent({
+              emitWholeMessage({
                 event: 'block_start',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   block_type: 'text',
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_delta',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   content: text,
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_stop',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                 },
               });
-
-              blockIndex++;
             } else if (blockType === 'thinking') {
               const thinking = block['thinking'] as string;
               if (!thinking) continue;
 
+              const index = mapper.nextIndex();
+
               // Emit thinking block
-              onEvent({
+              emitWholeMessage({
                 event: 'block_start',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   block_type: 'thinking',
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_delta',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   content: thinking,
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_stop',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                 },
               });
-
-              blockIndex++;
             } else if (blockType === 'tool_use') {
               // Claude emits tool_use blocks when the model wants to call a tool
               const toolName = block['name'] as string;
@@ -381,38 +483,42 @@ export class ClaudeAdapter extends ProviderAdapter {
 
               if (!toolName || !toolId) continue;
 
-              onEvent({
+              const index = mapper.nextIndex();
+
+              emitWholeMessage({
                 event: 'block_start',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   block_type: 'tool_call',
                   tool_name: toolName,
                   tool_call_id: toolId,
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_delta',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   content: JSON.stringify(toolInput ?? {}),
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_stop',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                 },
               });
-
-              blockIndex++;
             }
           }
           return;
         }
 
         if (type === 'result') {
+          // A second `result` would otherwise emit a second `done`, completing
+          // the server's request twice.
+          if (settled) return;
+
           // Extract final session ID and usage from result
           sessionId = (parsed['session_id'] as string) ?? sessionId;
 
@@ -427,6 +533,10 @@ export class ClaudeAdapter extends ProviderAdapter {
               ? errs.join('; ')
               : String(parsed['subtype'] ?? 'Claude reported an error');
 
+            // Blocks first: this path sets `settled` and returns, so the
+            // finalizer's onBeforeFinalize never runs and anything still open
+            // would never be closed.
+            settleBlocks();
             onEvent({
               event: 'error',
               data: {
@@ -443,6 +553,7 @@ export class ClaudeAdapter extends ProviderAdapter {
           const inputTokens = usage ? (usage['input_tokens'] as number) ?? null : null;
           const outputTokens = usage ? (usage['output_tokens'] as number) ?? null : null;
 
+          settleBlocks();
           onEvent({
             event: 'done',
             data: {
@@ -476,6 +587,12 @@ export class ClaudeAdapter extends ProviderAdapter {
       // Capture stderr for error logging (capped at 10KB)
       child.stderr.on('data', (chunk: Buffer) => {
         stderrBuffer = appendStderr(stderrBuffer, chunk.toString());
+        // A CLI downgraded under a running bridge rejects the flag we cached as
+        // supported. Clear the cache so the next turn re-probes instead of
+        // failing identically until someone restarts the bridge.
+        if (partialMessages && !noticedFlagRejection) {
+          noticedFlagRejection = noteCliRejectedPartialFlag(stderrBuffer);
+        }
       });
 
       child.on('error', (err: NodeJS.ErrnoException) => {
@@ -489,6 +606,10 @@ export class ClaudeAdapter extends ProviderAdapter {
 
         if (!settled) {
           settled = true;
+          // Setting `settled` here makes the finalizer skip onBeforeFinalize,
+          // so this path has to close its own blocks. Reachable when 'error'
+          // fires after streaming began — a failed kill(), say.
+          settleBlocks();
           onEvent({
             event: 'error',
             data: {

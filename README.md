@@ -36,6 +36,7 @@ npx @tetrixdev/ai-bridge
 | `--local-data-dir <path>` | `AI_BRIDGE_DATA_DIR` | Where npm packages for local tools are installed, one directory per space (default `~/.ai-bridge`) |
 | `--allow-dir <path>[=<label>]` | `AI_BRIDGE_ALLOWED_DIRS` | Permit the server to run turns in this directory. Repeatable; the environment variable is path-separator delimited (`:` on POSIX, `;` on Windows). **Off unless you pass it** — without it a named working directory is refused, and so is `workspace` isolation. Read [Working in a repository](#working-in-a-repository) first |
 | `--api <url>` | `AI_BRIDGE_API` | Base URL of the server's HTTP API for attachments, when it is not the same host as `--server`. Defaults to the `https://` origin of `--server` |
+| _(no flag)_ | `AI_BRIDGE_DISABLE_PARTIAL_STREAMING` | Set to `1` to make Claude answers arrive one block at a time instead of streaming in chunks. An escape hatch for a CLI whose partial output misbehaves; the bridge already falls back on its own when the CLI does not support partial messages at all |
 | `--attachment-max-mb <n>` | | Largest single attachment to download (default `25`) |
 | `--attachment-total-mb <n>` | | Largest total of attachments per request (default `100`) |
 | `--allow-native` | | Permit the server to select `native` isolation — the CLI's full local environment, including your own MCP servers, hooks, plugins and a shell. **Off unless you pass it.** Only for a bridge you run against your own machine |

@@ -9,6 +9,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ProviderCapability } from '../protocol/types.js';
+import { stripCredentials } from './env.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('Detector');
@@ -86,11 +87,10 @@ async function probeOne(probe: CliProbe): Promise<ProviderCapability> {
   };
 
   try {
-    // Remove bridge credential variables from the probe environment — version
-    // probes run arbitrary binaries from PATH that must not see the token.
-    const probeEnv = { ...process.env };
-    delete probeEnv['AI_BRIDGE_TOKEN'];
-    delete probeEnv['AI_BRIDGE_SERVER'];
+    // Strip credentials from the probe environment — version probes run
+    // arbitrary binaries from PATH that must not see the bridge token or the
+    // vault credential.
+    const probeEnv = stripCredentials({ ...process.env });
 
     const { stdout, stderr } = await execFileAsync(probe.binary, probe.versionArgs, {
       timeout: 5_000,

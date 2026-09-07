@@ -100,6 +100,20 @@ export function buildSpawnEnv(
   // one, so a single `printenv ENGRAM_TOKEN` would hand the vault credential
   // back to the server in the assistant's own transcript. src/local/executor.ts
   // makes the same argument for local tools and solves it with an allowlist.
+  stripCredentials(env);
+  return env;
+}
+
+/**
+ * Remove every credential variable from an environment about to be handed to a
+ * child process. Mutates and returns the object it is given.
+ *
+ * Exported so that anything spawning a binary off PATH — a version probe, a
+ * capability probe — strips the same list. Two probes that each remembered a
+ * different subset is how ENGRAM_TOKEN ends up in `/proc/<pid>/environ` of a
+ * process nobody thought of as handling credentials.
+ */
+export function stripCredentials(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   delete env['AI_BRIDGE_TOKEN'];
   delete env['AI_BRIDGE_SERVER'];
   delete env['ENGRAM_TOKEN'];
