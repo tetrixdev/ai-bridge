@@ -74,6 +74,7 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
     wss.on('connection', (ws) => {
       ws.on('message', (raw) => {
         const msg = JSON.parse(raw.toString());
+        msg.__at = Date.now();
         frames.push(msg);
 
         if (msg.type === 'hello') {
@@ -123,6 +124,18 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
     sawDone: stream.some((f) => f.event === 'done'),
     spawned: bridgeLog.join('').includes('Executing Claude request'),
     text: stream.filter((f) => f.event === 'block_delta').map((f) => f.data.content).join(''),
+    // Arrival times of the text deltas, relative to the first stream frame.
+    // Counting deltas alone cannot tell streaming apart from a CLI that
+    // buffered the whole answer and flushed it in pieces at the end.
+    textDeltaTimes: (() => {
+      const textBlocks = new Set(stream.filter((f) => f.event === 'block_start'
+        && (f.data.block_type ?? 'text') === 'text').map((f) => f.data.block_index));
+      const first = stream[0]?.__at ?? 0;
+      return stream
+        .filter((f) => f.event === 'block_delta' && textBlocks.has(f.data.block_index))
+        .map((f) => f.__at - first);
+    })(),
+    turnMs: stream.length ? (stream.at(-1).__at - stream[0].__at) : 0,
   };
 }
 
@@ -284,6 +297,32 @@ try {
     check('...while server-declared tools still work in isolated',
       r.toolCalled && /4471|Director/.test(r.text),
       `called=${r.toolCalled}, said: ${r.text.slice(0, 160)}`);
+
+    // Partial streaming. The unit tests replay captured output, so they prove
+    // the mapping and nothing about whether the CLI actually chunks for us.
+    r = await turn({
+      isolation: 'isolated',
+      request: aiRequest({
+        message: 'Write roughly 400 words of prose about the history of the barometer. No lists, no headings.',
+      }),
+      timeoutMs: 300_000,
+    });
+
+    const times = r.textDeltaTimes;
+    check('a long answer arrives in many chunks, not one lump',
+      times.length > 5, `${times.length} text delta(s) for ${r.text.length} chars`);
+
+    // The span the deltas cover, against the span of the whole turn. A CLI
+    // that buffered and flushed at the end would still produce many deltas,
+    // but they would all land in the last moment.
+    const span = times.length > 1 ? times.at(-1) - times[0] : 0;
+    check('...spread across the turn rather than flushed at the end',
+      span > 1000 && span > r.turnMs * 0.25,
+      `deltas spanned ${span}ms of a ${r.turnMs}ms turn`);
+
+    check('...and the first chunk arrives well before the turn ends',
+      times.length > 0 && times[0] < r.turnMs * 0.9,
+      `first delta at ${times[0]}ms of ${r.turnMs}ms`);
   }
 } finally {
   rmSync(root, { recursive: true, force: true });

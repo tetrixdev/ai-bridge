@@ -10,8 +10,21 @@
  *
  * Output format (NDJSON):
  *   {"type":"system","subtype":"init","session_id":"...","model":"..."}
+ *   {"type":"stream_event","event":{"type":"content_block_delta","index":0,...}}
  *   {"type":"assistant","message":{"content":[{"type":"text","text":"..."}],...}}
  *   {"type":"result","subtype":"success","session_id":"...","usage":{...},"total_cost_usd":...}
+ *
+ * Two paths produce blocks, and both run in the same turn:
+ *
+ *   - `stream_event` frames, when the CLI supports `--include-partial-messages`.
+ *     Text arrives in chunks as the model writes it. Mapped by
+ *     claude-partial.ts.
+ *   - `assistant` frames, which carry a whole message at once. Still the only
+ *     form for sub-agent (Task tool) messages, and the only form at all on a
+ *     CLI without the flag.
+ *
+ * A message delivered by the first path ALSO arrives via the second. The
+ * duplicate is suppressed by message id — see the `wasStreamed` check below.
  */
 
 import { createInterface } from 'node:readline';
@@ -21,6 +34,8 @@ import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt }
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
+import { ClaudePartialStreamMapper } from './claude-partial.js';
+import { supportsPartialMessages } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
@@ -54,6 +69,19 @@ export class ClaudeAdapter extends ProviderAdapter {
       '--output-format', 'stream-json', // NDJSON streaming output
       '--verbose',                       // Required for stream-json in print mode
     ];
+
+    // Stream text as the model writes it, rather than one lump per content
+    // block. Without this the CLI reports an assistant message only once the
+    // block is complete, so a long answer lands as a paragraph at a time and a
+    // slow turn is indistinguishable from a stalled one.
+    //
+    // Gated on a probe because the flag is fatal on a CLI that does not have
+    // it (see claude-capabilities.ts). When it is absent the whole-message
+    // path below runs exactly as before.
+    const partialMessages = await supportsPartialMessages();
+    if (partialMessages) {
+      args.push('--include-partial-messages');
+    }
 
     // Resume an existing session if we have a session ID. `--resume <id>`
     // continues the conversation under the SAME session id (unlike
@@ -227,8 +255,12 @@ export class ClaudeAdapter extends ProviderAdapter {
 
     return new Promise<string | null>((resolve, reject) => {
       let sessionId: string | null = null;
-      let blockIndex = 0;
       let settled = false;
+
+      // Owns the turn's block indices. Both paths allocate from it: partial
+      // streaming handles the main agent, while sub-agent messages arrive only
+      // as whole `assistant` frames and are mapped below.
+      const mapper = new ClaudePartialStreamMapper();
 
       const env = buildSpawnEnv(context.requestId);
       // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
@@ -296,6 +328,15 @@ export class ClaudeAdapter extends ProviderAdapter {
           return;
         }
 
+        // Partial message chunks, when the CLI supports them. Each frame wraps
+        // one raw Anthropic SSE event; the mapper turns them into the same
+        // block_start / block_delta / block_stop trio the whole-message path
+        // produces, just finer grained.
+        if (type === 'stream_event') {
+          mapper.handle(parsed, onEvent);
+          return;
+        }
+
         if (type === 'assistant') {
           // A late readline-buffered assistant event can arrive after the
           // stream is already settled; log it for diagnosis.
@@ -309,6 +350,21 @@ export class ClaudeAdapter extends ProviderAdapter {
           const message = parsed['message'] as Record<string, unknown> | undefined;
           if (!message) return;
 
+          // In partial mode this frame is the twin of a stream we have ALREADY
+          // emitted — the CLI sends both, and this one arrives mid-stream,
+          // between the last delta and content_block_stop. Emitting it too
+          // would duplicate every block of the answer.
+          //
+          // Matched on the message id rather than on "partial mode is on",
+          // because sub-agent turns (the Task tool) are delivered only as whole
+          // assistant frames: the CLI emits no stream_event for a sidechain. A
+          // blanket rule would drop that output entirely, and the turn would
+          // read as the sub-agent having done nothing.
+          const messageId = typeof message['id'] === 'string' ? message['id'] : undefined;
+          if (mapper.wasStreamed(messageId)) {
+            return;
+          }
+
           const content = message['content'] as Array<Record<string, unknown>> | undefined;
           if (!content || !Array.isArray(content)) return;
 
@@ -319,11 +375,13 @@ export class ClaudeAdapter extends ProviderAdapter {
               const text = block['text'] as string;
               if (!text) continue;
 
+              const index = mapper.nextIndex();
+
               // Emit block_start + block_delta + block_stop for text
               onEvent({
                 event: 'block_start',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   block_type: 'text',
                 },
               });
@@ -331,7 +389,7 @@ export class ClaudeAdapter extends ProviderAdapter {
               onEvent({
                 event: 'block_delta',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   content: text,
                 },
               });
@@ -339,20 +397,20 @@ export class ClaudeAdapter extends ProviderAdapter {
               onEvent({
                 event: 'block_stop',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                 },
               });
-
-              blockIndex++;
             } else if (blockType === 'thinking') {
               const thinking = block['thinking'] as string;
               if (!thinking) continue;
+
+              const index = mapper.nextIndex();
 
               // Emit thinking block
               onEvent({
                 event: 'block_start',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   block_type: 'thinking',
                 },
               });
@@ -360,7 +418,7 @@ export class ClaudeAdapter extends ProviderAdapter {
               onEvent({
                 event: 'block_delta',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   content: thinking,
                 },
               });
@@ -368,11 +426,9 @@ export class ClaudeAdapter extends ProviderAdapter {
               onEvent({
                 event: 'block_stop',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                 },
               });
-
-              blockIndex++;
             } else if (blockType === 'tool_use') {
               // Claude emits tool_use blocks when the model wants to call a tool
               const toolName = block['name'] as string;
@@ -381,10 +437,12 @@ export class ClaudeAdapter extends ProviderAdapter {
 
               if (!toolName || !toolId) continue;
 
+              const index = mapper.nextIndex();
+
               onEvent({
                 event: 'block_start',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   block_type: 'tool_call',
                   tool_name: toolName,
                   tool_call_id: toolId,
@@ -394,7 +452,7 @@ export class ClaudeAdapter extends ProviderAdapter {
               onEvent({
                 event: 'block_delta',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                   content: JSON.stringify(toolInput ?? {}),
                 },
               });
@@ -402,11 +460,9 @@ export class ClaudeAdapter extends ProviderAdapter {
               onEvent({
                 event: 'block_stop',
                 data: {
-                  block_index: blockIndex,
+                  block_index: index,
                 },
               });
-
-              blockIndex++;
             }
           }
           return;

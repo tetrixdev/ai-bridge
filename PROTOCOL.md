@@ -813,6 +813,29 @@ For `tool_call` blocks (streaming the arguments JSON):
 }
 ```
 
+##### How fine the deltas are
+
+A block carries **one or many** deltas; a consumer must concatenate them and
+must not assume either shape. Granularity depends on the provider CLI, and it
+changes as those CLIs change:
+
+| Provider | Granularity | Why |
+|---|---|---|
+| `claude` | Chunks as the model writes them | The bridge passes `--include-partial-messages` when the installed CLI supports it. Measured on Claude Code 2.1.261: a 650-word answer arrived as 31 deltas averaging ~136 characters, against 1 delta before. |
+| `gemini` | Chunks as the model writes them | The CLI's `stream-json` output is delta-based already. |
+| `codex` | One delta per block | `codex exec --json` reports `item.completed`, which by definition fires once the item is finished. Nothing finer is available on the event schema the adapter consumes. |
+
+Claude's `tool_call` blocks are the deliberate exception: the CLI streams
+tool arguments as JSON fragments, and the bridge reassembles them into a
+single delta carrying the complete arguments object. Individual fragments are
+not valid JSON, so forwarding them would break any consumer that parses a
+delta on arrival — and there is nothing to gain, since arguments are rendered
+as a unit rather than read as they are typed.
+
+An older Claude CLI that does not offer `--include-partial-messages` falls
+back to one delta per block. That is a difference in smoothness only: the
+events, their order, and the reassembled text are identical.
+
 #### `block_stop`
 
 Closes a block. No further deltas for this `block_index` will be sent.
