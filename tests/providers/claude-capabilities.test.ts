@@ -193,6 +193,85 @@ describe('the operator kill switch', () => {
   });
 });
 
+describe('a probe that was simply wrong about the CLI', () => {
+  it('stops passing the flag instead of failing every turn forever', async () => {
+    // The case no other test here covers, because they all swap the fake binary
+    // first: `--help` LISTS the flag but the argv parser rejects it. Clearing
+    // the cache would re-ask the same unchanged CLI the same question, get the
+    // same answer, and fail the turn again — for the life of the process.
+    fakeClaude(HELP_WITH_FLAG);
+    await expect(supportsPartialMessages()).resolves.toBe(true);
+
+    const argvs: string[][] = [];
+    class Rejecting extends ClaudeAdapter {
+      protected override spawnCli(
+        _command: string,
+        args: string[],
+      ): ChildProcessByStdio<Writable | null, Readable, Readable> {
+        argvs.push(args);
+        return spawn(process.execPath, ['-e',
+          'process.stderr.write("error: unknown option \'--include-partial-messages\'\\n"); process.exit(1);',
+        ], { stdio: ['ignore', 'pipe', 'pipe'] }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
+      }
+    }
+
+    const turn = (id: string) => new Rejecting().execute({
+      request: {
+        type: 'ai_request', request_id: id, conversation_id: 'c', provider: 'claude',
+        message: 'go', system_prompt: null, options: {}, cli_session_id: null,
+      },
+      requestId: id,
+      tools: [],
+      mcp: null,
+      cliIsolation: 'native',
+      workingDir: process.cwd(),
+      signal: new AbortController().signal,
+      requestTimeoutSeconds: 30,
+      cliSessionId: null,
+      attachmentDir: null,
+    }, () => {});
+
+    await turn('t1');
+    await turn('t2');
+    await turn('t3');
+
+    expect(argvs[0]).toContain('--include-partial-messages');
+    expect(argvs[1], 'the second turn repeated a flag the CLI had already rejected')
+      .not.toContain('--include-partial-messages');
+    expect(argvs[2]).not.toContain('--include-partial-messages');
+  }, 20_000);
+});
+
+describe('output split across stdout and stderr', () => {
+  it('finds a flag split across two stdout writes despite stderr in between', async () => {
+    // A single carry-over buffer shared by both streams is clobbered by the
+    // other stream, and a flag that IS present reads as absent — the operator
+    // silently loses streaming.
+    fakeClaude([
+      'printf "  --include-partial-"',
+      'sleep 0.3',
+      'echo "a warning from some shim" >&2',
+      'sleep 0.3',
+      'printf "messages   Include partial message chunks\n"',
+    ].join('\n'));
+
+    await expect(supportsPartialMessages()).resolves.toBe(true);
+  }, 15_000);
+
+  it('does not assemble a flag out of two different streams', async () => {
+    // The other direction, and the dangerous one: the flag appears in NEITHER
+    // stream, but a shared tail ending mid-flag completes against the start of
+    // the other. The bridge would then pass a flag the CLI does not have.
+    fakeClaude([
+      'printf "note: try --include-partial-" >&2',
+      'sleep 0.3',
+      'printf "messages is not a thing here\n"',
+    ].join('\n'));
+
+    await expect(supportsPartialMessages()).resolves.toBe(false);
+  }, 15_000);
+});
+
 describe('recovering from a CLI downgraded under a running bridge', () => {
   it('re-probes after the CLI rejects the flag', async () => {
     fakeClaude(HELP_WITH_FLAG);

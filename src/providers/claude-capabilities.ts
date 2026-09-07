@@ -69,21 +69,26 @@ export function resetPartialMessageSupportCache(): void {
 }
 
 /**
- * Re-probe on the next turn if this looks like the CLI rejecting our flag.
+ * Record that the CLI rejected our flag, and stop passing it.
  *
- * The cache is what makes a mid-session DOWNGRADE unrecoverable: probed once as
- * supported, the bridge would keep passing a flag the newly installed CLI does
- * not have, and every turn would die before emitting anything until someone
- * restarted the bridge — reintroducing precisely the failure the probe exists
- * to prevent. Clearing the cache turns that into a single failed turn.
+ * Without this a probe that answered "supported" for a CLI that then rejects
+ * the flag would fail EVERY turn, for the life of the process — exactly the
+ * failure the probe exists to prevent, reached through the probe.
+ *
+ * It records `false` rather than clearing the cache. Clearing only helps when
+ * the probe's answer went STALE (the CLI was replaced under a running bridge);
+ * when the answer was simply WRONG, re-probing asks the same unchanged CLI the
+ * same question, gets the same answer, and the turn fails again — forever. The
+ * argv parser is the authority here and `--help` is only its description, so
+ * the parser's verdict wins and is not re-litigated.
  */
 export function noteCliRejectedPartialFlag(stderr: string): boolean {
   // Both halves are required. A CLI that DOES support the flag and prints its
   // own option list on an unrelated failure mentions the flag too, and taking
   // that as a rejection would re-probe after every such turn.
   if (!stderr.includes(PARTIAL_FLAG) || !OPTION_REJECTION.test(stderr)) return false;
-  log.warn(`Claude CLI rejected ${PARTIAL_FLAG} — re-probing before the next turn`);
-  resetPartialMessageSupportCache();
+  log.warn(`Claude CLI rejected ${PARTIAL_FLAG} — streaming whole messages from now on`);
+  cached = Promise.resolve(false);
   return true;
 }
 
@@ -112,9 +117,10 @@ async function probe(): Promise<boolean> {
 function runHelpProbe(): Promise<boolean> {
   return new Promise<boolean>((resolve, reject) => {
     // The probe runs a binary off PATH, so it gets the same credential
-    // stripping every other spawn does. CLAUDECODE additionally has to go: the
-    // CLI refuses to run when it is set, so a bridge running inside Claude Code
-    // would probe as "unsupported" and quietly disable streaming everywhere.
+    // stripping every other spawn does. CLAUDECODE goes too, matching what the
+    // adapter does for a real turn (claude.ts refuses to run with it set). On
+    // 2.1.261 `--help` happens to work either way, so this is consistency with
+    // the spawn that matters rather than a fix for an observed failure.
     const env = stripCredentials({ ...process.env });
     delete env['CLAUDECODE'];
 
@@ -151,7 +157,6 @@ function runHelpProbe(): Promise<boolean> {
     // enough tail to catch a match split across two chunks is both correct for
     // any output size and O(flag length) in memory.
     let found = false;
-    let tail = '';
     let settled = false;
 
     // Detaching means the child no longer shares the bridge's process group, so
@@ -162,6 +167,8 @@ function runHelpProbe(): Promise<boolean> {
     const killOnExit = (): void => killTree(child);
     process.once('exit', killOnExit);
 
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
     const settle = (act: () => void): void => {
       if (settled) return;
       settled = true;
@@ -170,23 +177,38 @@ function runHelpProbe(): Promise<boolean> {
       act();
     };
 
-    const onData = (chunk: Buffer): void => {
-      if (found) return;
-      const text = tail + chunk.toString();
-      if (text.includes(PARTIAL_FLAG)) {
-        found = true;
-        tail = '';
-        return;
-      }
-      tail = text.slice(-(PARTIAL_FLAG.length - 1));
+    // ONE scanner per stream. A shared carry-over buffer is wrong in both
+    // directions: stderr clobbers the tail stdout was mid-match on (a flag
+    // that IS present reads as absent), and a tail ending mid-flag on one
+    // stream can complete against the start of the other (a flag that is in
+    // neither stream reads as present, and the bridge then passes a fatal one).
+    const makeScanner = () => {
+      let tail = '';
+      return (chunk: Buffer): void => {
+        if (found) return;
+        const text = tail + chunk.toString();
+        if (text.includes(PARTIAL_FLAG)) {
+          found = true;
+          tail = '';
+          return;
+        }
+        tail = text.slice(-(PARTIAL_FLAG.length - 1));
+      };
     };
-    child.stdout?.on('data', onData);
-    child.stderr?.on('data', onData);
+    child.stdout?.on('data', makeScanner());
+    child.stderr?.on('data', makeScanner());
+
+    // A pipe read error must not become an uncaughtException: this function
+    // promises never to throw, and an unhandled stream error would take the
+    // whole bridge down rather than merely failing the probe. Same reason
+    // base.ts attaches one to the child's stdin.
+    child.stdout?.on('error', () => {});
+    child.stderr?.on('error', () => {});
 
     child.on('error', (err) => settle(() => reject(err)));
     child.on('close', () => settle(() => resolve(found)));
 
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       // `found` is used, not `false`. The help text is often complete long
       // before the process is: a wrapper that exits while a background child
       // holds the inherited stdout open keeps the pipe from closing, and
@@ -218,12 +240,18 @@ function runHelpProbe(): Promise<boolean> {
  * The exit hook cannot save this: `process.once('exit')` only fires once the
  * loop has drained, which is exactly what is not happening.
  *
- * Deliberately NOT guarded on the child having exited. That guard looked
- * prudent — a reaped pid can in principle be recycled, and `-pid` would then
- * signal a stranger's group — but it disabled the kill in the one shape that
- * needs it, and the premise is wrong anyway: while any member of the group is
- * alive the group id keeps the leader's pid reserved, so it cannot be recycled.
- * This is only ever called from the timeout path, before the probe settles.
+ * Deliberately NOT guarded on the child having exited, which is an accepted
+ * trade rather than a free one. Such a guard disabled the kill in the shape
+ * that needs it most — a wrapper reaped while the children it started live on —
+ * so it went. What remains is a genuine race inherent to pid-based group kills:
+ * if the whole group is already gone, the pid can have been recycled, and
+ * `-pid` is then aimed at whatever holds that group now. Measured in the
+ * pipe-hold shape, `kill(-pid, 0)` reports ESRCH at this point, so the window
+ * is real and not merely theoretical.
+ *
+ * It is accepted because the alternative leaks orphaned processes on every
+ * wedged probe, the window is one scheduling quantum wide, and the pipe
+ * teardown below — not the kill — is what actually lets the bridge exit.
  */
 function killTree(child: ChildProcess): void {
   let signalled = false;
