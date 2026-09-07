@@ -35,7 +35,7 @@ import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
 import { ClaudePartialStreamMapper } from './claude-partial.js';
-import { supportsPartialMessages } from './claude-capabilities.js';
+import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
@@ -81,6 +81,17 @@ export class ClaudeAdapter extends ProviderAdapter {
     const partialMessages = await supportsPartialMessages();
     if (partialMessages) {
       args.push('--include-partial-messages');
+    }
+
+    // The probe above is the first await in this method, so a cancellation that
+    // lands during it would otherwise be missed: the abort listener is only
+    // registered further down, and adding one to an ALREADY-aborted signal
+    // never fires. Without this check the CLI is spawned for a request nobody
+    // is reading, and runs until the request timeout.
+    if (context.signal.aborted) {
+      log.info('Request aborted before spawn', { requestId });
+      onEvent({ event: 'done', data: {} });
+      return null;
     }
 
     // Resume an existing session if we have a session ID. `--resume <id>`
@@ -262,6 +273,30 @@ export class ClaudeAdapter extends ProviderAdapter {
       // as whole `assistant` frames and are mapped below.
       const mapper = new ClaudePartialStreamMapper();
 
+      // Whole-message blocks that arrived while a partial block was still open.
+      //
+      // Nothing in the protocol forbids overlapping blocks, but every consumer
+      // tracks exactly one open block — the reference chat UI and the recorder
+      // both do — so a block_start arriving inside another one silently
+      // discards the outer block's text. It cannot happen with today's CLI (a
+      // sub-agent runs only while the main agent is blocked on the tool call,
+      // so no main block is open), but a backgrounded sub-agent would change
+      // that, and holding these back costs nothing.
+      const deferred: AdapterStreamEvent[] = [];
+      const emitWholeMessage = (event: AdapterStreamEvent) => {
+        if (mapper.hasOpenBlock()) deferred.push(event);
+        else onEvent(event);
+      };
+      const flushDeferred = () => {
+        while (deferred.length > 0) onEvent(deferred.shift()!);
+      };
+
+      /** Close anything the CLI left open, then release anything held back. */
+      const settleBlocks = () => {
+        mapper.closeOpenBlocks(onEvent);
+        flushDeferred();
+      };
+
       const env = buildSpawnEnv(context.requestId);
       // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
       delete env['CLAUDECODE'];
@@ -303,6 +338,10 @@ export class ClaudeAdapter extends ProviderAdapter {
         resolve,
         signal,
         onAbort,
+        // A cancelled turn, a timeout or a CLI crash abandons whatever block
+        // was mid-stream. Close them, or a consumer that commits a block on
+        // block_stop drops the last chunk of every cancelled answer.
+        onBeforeFinalize: settleBlocks,
       });
 
       // Parse NDJSON from stdout line by line
@@ -334,6 +373,7 @@ export class ClaudeAdapter extends ProviderAdapter {
         // produces, just finer grained.
         if (type === 'stream_event') {
           mapper.handle(parsed, onEvent);
+          if (!mapper.hasOpenBlock()) flushDeferred();
           return;
         }
 
@@ -378,7 +418,7 @@ export class ClaudeAdapter extends ProviderAdapter {
               const index = mapper.nextIndex();
 
               // Emit block_start + block_delta + block_stop for text
-              onEvent({
+              emitWholeMessage({
                 event: 'block_start',
                 data: {
                   block_index: index,
@@ -386,7 +426,7 @@ export class ClaudeAdapter extends ProviderAdapter {
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_delta',
                 data: {
                   block_index: index,
@@ -394,7 +434,7 @@ export class ClaudeAdapter extends ProviderAdapter {
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_stop',
                 data: {
                   block_index: index,
@@ -407,7 +447,7 @@ export class ClaudeAdapter extends ProviderAdapter {
               const index = mapper.nextIndex();
 
               // Emit thinking block
-              onEvent({
+              emitWholeMessage({
                 event: 'block_start',
                 data: {
                   block_index: index,
@@ -415,7 +455,7 @@ export class ClaudeAdapter extends ProviderAdapter {
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_delta',
                 data: {
                   block_index: index,
@@ -423,7 +463,7 @@ export class ClaudeAdapter extends ProviderAdapter {
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_stop',
                 data: {
                   block_index: index,
@@ -439,7 +479,7 @@ export class ClaudeAdapter extends ProviderAdapter {
 
               const index = mapper.nextIndex();
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_start',
                 data: {
                   block_index: index,
@@ -449,7 +489,7 @@ export class ClaudeAdapter extends ProviderAdapter {
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_delta',
                 data: {
                   block_index: index,
@@ -457,7 +497,7 @@ export class ClaudeAdapter extends ProviderAdapter {
                 },
               });
 
-              onEvent({
+              emitWholeMessage({
                 event: 'block_stop',
                 data: {
                   block_index: index,
@@ -483,6 +523,10 @@ export class ClaudeAdapter extends ProviderAdapter {
               ? errs.join('; ')
               : String(parsed['subtype'] ?? 'Claude reported an error');
 
+            // Blocks first: this path sets `settled` and returns, so the
+            // finalizer's onBeforeFinalize never runs and anything still open
+            // would never be closed.
+            settleBlocks();
             onEvent({
               event: 'error',
               data: {
@@ -499,6 +543,7 @@ export class ClaudeAdapter extends ProviderAdapter {
           const inputTokens = usage ? (usage['input_tokens'] as number) ?? null : null;
           const outputTokens = usage ? (usage['output_tokens'] as number) ?? null : null;
 
+          settleBlocks();
           onEvent({
             event: 'done',
             data: {
@@ -532,6 +577,10 @@ export class ClaudeAdapter extends ProviderAdapter {
       // Capture stderr for error logging (capped at 10KB)
       child.stderr.on('data', (chunk: Buffer) => {
         stderrBuffer = appendStderr(stderrBuffer, chunk.toString());
+        // A CLI downgraded under a running bridge rejects the flag we cached as
+        // supported. Clear the cache so the next turn re-probes instead of
+        // failing identically until someone restarts the bridge.
+        if (partialMessages) noteCliRejectedPartialFlag(stderrBuffer);
       });
 
       child.on('error', (err: NodeJS.ErrnoException) => {

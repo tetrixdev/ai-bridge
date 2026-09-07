@@ -143,6 +143,157 @@ describe('ClaudePartialStreamMapper', () => {
     expect(events[0]!.data).toMatchObject({ block_index: 0, block_type: 'text' });
   });
 
+  it('announces a non-empty thinking block as thinking, not as text', () => {
+    // Nothing else asserts the block_type that reaches the consumer for a
+    // streamed thinking block; get it wrong and reasoning renders as answer
+    // prose, with a green suite.
+    const events = run([
+      messageStart('msg_1'),
+      blockStart(0, { type: 'thinking', thinking: '' }),
+      blockDelta(0, { type: 'thinking_delta', thinking: 'weighing it up' }),
+      blockStop(0),
+    ]);
+    expect(events[0]!.data).toMatchObject({ block_index: 0, block_type: 'thinking' });
+  });
+
+  it('does not splice a new message into a block the previous one left open', () => {
+    // Both messages use CLI index 0. If the per-message mapping survived the
+    // message boundary, the second message's text would be appended to the
+    // first message's block — which a truncated stream makes reachable.
+    const events = run([
+      messageStart('msg_1'),
+      blockStart(0, { type: 'text', text: '' }),
+      blockDelta(0, { type: 'text_delta', text: 'first' }),
+      // no content_block_stop: the message ends abruptly
+      messageStart('msg_2'),
+      blockStart(0, { type: 'text', text: '' }),
+      blockDelta(0, { type: 'text_delta', text: 'second' }),
+      blockStop(0),
+    ]);
+
+    const starts = events.filter((e) => e.event === 'block_start')
+      .map((e) => (e.data as { block_index: number }).block_index);
+    expect(starts).toEqual([0, 1]);
+
+    const secondDelta = events.filter((e) => e.event === 'block_delta')
+      .find((e) => (e.data as { content: string }).content === 'second');
+    expect((secondDelta!.data as { block_index: number }).block_index).toBe(1);
+  });
+
+  it('drops a stray delta left over from an unterminated message', () => {
+    // Message 1 never closes its block; message 2 then sends a delta for the
+    // same CLI index with no content_block_start of its own. If the per-message
+    // maps survived the boundary, that delta would be appended to the PREVIOUS
+    // message's block. Only reachable on malformed output, which is exactly
+    // when it would be hardest to diagnose.
+    const events = run([
+      messageStart('msg_1'),
+      blockStart(0, { type: 'text', text: '' }),
+      blockDelta(0, { type: 'text_delta', text: 'first' }),
+      messageStart('msg_2'),
+      blockDelta(0, { type: 'text_delta', text: 'stray' }),
+      blockStop(0),
+    ]);
+
+    expect(events.filter((e) => e.event === 'block_delta')
+      .map((e) => (e.data as { content: string }).content)).toEqual(['first']);
+  });
+
+  it('drops a stray delta for a block announced but never opened in a past message', () => {
+    // Same shape, but the leftover is a PENDING block (announced, no content
+    // yet) rather than an open one.
+    const events = run([
+      messageStart('msg_1'),
+      blockStart(0, { type: 'thinking', thinking: '' }),
+      messageStart('msg_2'),
+      blockDelta(0, { type: 'thinking_delta', thinking: 'leaked' }),
+      blockStop(0),
+    ]);
+
+    expect(events).toEqual([]);
+  });
+
+  it('closes a block the stream abandoned', () => {
+    const mapper = new ClaudePartialStreamMapper();
+    const events: AdapterStreamEvent[] = [];
+    const emit = (e: AdapterStreamEvent) => events.push(e);
+
+    mapper.handle(messageStart('msg_1'), emit);
+    mapper.handle(blockStart(0, { type: 'text', text: '' }), emit);
+    mapper.handle(blockDelta(0, { type: 'text_delta', text: 'half an ans' }), emit);
+    expect(mapper.hasOpenBlock()).toBe(true);
+
+    mapper.closeOpenBlocks(emit);
+
+    expect(events.at(-1)).toEqual({ event: 'block_stop', data: { block_index: 0 } });
+    expect(mapper.hasOpenBlock()).toBe(false);
+  });
+
+  it('flushes the arguments of a tool call cut off mid-stream', () => {
+    // The buffering decision creates this case: without a flush the consumer
+    // gets an announced tool call with NO arguments delta at all, which is
+    // indistinguishable from a tool deliberately called with none.
+    const mapper = new ClaudePartialStreamMapper();
+    const events: AdapterStreamEvent[] = [];
+    const emit = (e: AdapterStreamEvent) => events.push(e);
+
+    mapper.handle(messageStart('msg_1'), emit);
+    mapper.handle(blockStart(0, { type: 'tool_use', id: 'toolu_1', name: 'Read' }), emit);
+    mapper.handle(blockDelta(0, { type: 'input_json_delta', partial_json: '{"file_pa' }), emit);
+
+    mapper.closeOpenBlocks(emit);
+
+    const delta = events.find((e) => e.event === 'block_delta');
+    expect(delta).toBeDefined();
+    // Forwarded verbatim rather than reported as `{}`: a consumer can say the
+    // arguments were truncated, where an empty object silently lies.
+    expect((delta!.data as { content: string }).content).toBe('{"file_pa');
+    expect(events.at(-1)!.event).toBe('block_stop');
+  });
+
+  it('closes several open blocks in the order they were opened', () => {
+    const mapper = new ClaudePartialStreamMapper();
+    const events: AdapterStreamEvent[] = [];
+    const emit = (e: AdapterStreamEvent) => events.push(e);
+
+    mapper.handle(messageStart('msg_1'), emit);
+    mapper.handle(blockStart(0, { type: 'text', text: '' }), emit);
+    mapper.handle(blockDelta(0, { type: 'text_delta', text: 'a' }), emit);
+    mapper.handle(blockStart(1, { type: 'tool_use', id: 't1', name: 'Read' }), emit);
+
+    events.length = 0;
+    mapper.closeOpenBlocks(emit);
+
+    expect(events.filter((e) => e.event === 'block_stop')
+      .map((e) => (e.data as { block_index: number }).block_index)).toEqual([0, 1]);
+  });
+
+  it('ignores a streamed sub-agent frame, leaving the main mapping intact', () => {
+    // Today the CLI never streams sidechains. If it started, a sub-agent
+    // message_start landing mid-message would wipe the main agent's live
+    // mapping and route its remaining deltas into the wrong block.
+    const mapper = new ClaudePartialStreamMapper();
+    const events: AdapterStreamEvent[] = [];
+    const emit = (e: AdapterStreamEvent) => events.push(e);
+
+    mapper.handle(messageStart('msg_main'), emit);
+    mapper.handle(blockStart(0, { type: 'text', text: '' }), emit);
+    mapper.handle(blockDelta(0, { type: 'text_delta', text: 'main ' }), emit);
+
+    mapper.handle({ ...messageStart('msg_sub'), parent_tool_use_id: 'toolu_x' }, emit);
+    mapper.handle({ ...blockStart(0, { type: 'text', text: '' }), parent_tool_use_id: 'toolu_x' }, emit);
+
+    mapper.handle(blockDelta(0, { type: 'text_delta', text: 'answer' }), emit);
+    mapper.handle(blockStop(0), emit);
+
+    // One block, both deltas, and the sub-agent's id never registered as
+    // streamed — so its `assistant` twin will still be delivered whole.
+    expect(events.filter((e) => e.event === 'block_start')).toHaveLength(1);
+    expect(events.filter((e) => e.event === 'block_delta')
+      .map((e) => (e.data as { content: string }).content).join('')).toBe('main answer');
+    expect(mapper.wasStreamed('msg_sub')).toBe(false);
+  });
+
   it('drops a tool block with no name or id, as the whole-message path does', () => {
     const events = run([
       messageStart('msg_1'),
@@ -266,6 +417,37 @@ describe('replaying real partial-mode turns through the adapter', () => {
     expect(new Set(startIndices).size).toBe(startIndices.length);
   });
 
+  it('numbers blocks 0,1,2… across BOTH paths in one turn', async () => {
+    // The sub-agent turn is the only fixture that exercises the whole-message
+    // path and the partial path sharing one counter, which is the entire
+    // reason the counter moved into the mapper. Without this, replacing
+    // `mapper.nextIndex()` with the literal 0 passes the whole suite, and
+    // every sub-agent tool call collides on block_index 0.
+    for (const fixture of ['claude-partial-tool-turn.ndjson', 'claude-partial-subagent-turn.ndjson']) {
+      const events = await replay(fixture);
+      const indices = events.filter((e) => e.event === 'block_start')
+        .map((e) => (e.data as { block_index: number }).block_index);
+
+      expect(indices.length).toBeGreaterThan(1);
+      expect(indices, `block_start indices for ${fixture}`)
+        .toEqual(indices.map((_, i) => i));
+    }
+  });
+
+  it('gives the sub-agent turn the indices the emission order implies', async () => {
+    const events = await replay('claude-partial-subagent-turn.ndjson');
+    const named = events.filter((e) => e.event === 'block_start'
+      && (e.data as { tool_name?: string }).tool_name !== undefined)
+      .map((e) => {
+        const d = e.data as { block_index: number; tool_name: string };
+        return [d.tool_name, d.block_index] as const;
+      });
+
+    // The main agent delegates (Agent, 0), the sub-agent does its own work
+    // (Bash 1, Read 2), and the main agent's closing text follows.
+    expect(named).toEqual([['Agent', 0], ['Bash', 1], ['Read', 2]]);
+  });
+
   it('streams that answer in chunks rather than one lump', async () => {
     const events = await replay('claude-partial-tool-turn.ndjson');
     const textIndex = events.find((e) => e.event === 'block_start'
@@ -295,6 +477,11 @@ describe('replaying real partial-mode turns through the adapter', () => {
     const args = textOfBlocks(events, 'tool_call');
     expect(args).toHaveLength(1);
     expect(JSON.parse(args[0]!)).toHaveProperty('file_path');
+
+    // The dropped empty thinking block gives away no index, so the tool call
+    // is 0 and the answer text is 1 — the same numbering the whole-message
+    // path would have produced.
+    expect((toolStart!.data as { block_index: number }).block_index).toBe(0);
   });
 
   it('still forwards sub-agent messages, which arrive only in whole-message form', async () => {
@@ -377,5 +564,243 @@ describe('the --include-partial-messages flag', () => {
     const argv = await argvFor();
     expect(argv).toContain('-p');
     expect(argv.join(' ')).toContain('--output-format stream-json');
+  });
+});
+
+// ── Turns that end badly ──────────────────────────────────────────────────
+
+describe('a turn that is cut off mid-stream', () => {
+  /** Replay only the first `lines` of a fixture, then exit with `code`. */
+  async function replayTruncated(fixture: string, lines: number, code: number): Promise<AdapterStreamEvent[]> {
+    const path = join(FIXTURES, fixture);
+
+    class Truncated extends ClaudeAdapter {
+      protected override spawnCli(): ChildProcessByStdio<Writable | null, Readable, Readable> {
+        return spawn(process.execPath, ['-e', `
+          const all = require('fs').readFileSync(process.argv[1], 'utf8').split('\\n');
+          process.stdout.write(all.slice(0, ${lines}).join('\\n') + '\\n');
+          process.exit(${code});
+        `, path], { stdio: ['ignore', 'pipe', 'pipe'] }) as
+          ChildProcessByStdio<Writable | null, Readable, Readable>;
+      }
+    }
+
+    const request: AiRequestMessage = {
+      type: 'ai_request',
+      request_id: 'req_trunc',
+      conversation_id: 'conv_1',
+      provider: 'claude',
+      message: 'go',
+      system_prompt: null,
+      options: {},
+      cli_session_id: null,
+    };
+
+    const events: AdapterStreamEvent[] = [];
+    await new Truncated().execute({
+      request,
+      requestId: request.request_id,
+      tools: [],
+      mcp: null,
+      cliIsolation: 'native',
+      workingDir: process.cwd(),
+      signal: new AbortController().signal,
+      requestTimeoutSeconds: 30,
+      cliSessionId: null,
+      attachmentDir: null,
+    }, (e) => events.push(e));
+    return events;
+  }
+
+  /** Block indices opened but never closed. */
+  function unclosed(events: AdapterStreamEvent[]): number[] {
+    const open = new Set<number>();
+    for (const e of events) {
+      const i = (e.data as { block_index?: number }).block_index;
+      if (i === undefined) continue;
+      if (e.event === 'block_start') open.add(i);
+      if (e.event === 'block_stop') open.delete(i);
+    }
+    return [...open];
+  }
+
+  it('closes the text block the CLI abandoned', async () => {
+    // Before partial streaming this adapter could not emit an unclosed block —
+    // start, delta and stop went out together. A consumer that commits a block
+    // on block_stop would otherwise drop the tail of every cancelled answer.
+    const events = await replayTruncated('claude-partial-tool-turn.ndjson', 48, 143);
+
+    expect(events.some((e) => e.event === 'block_delta')).toBe(true);
+    expect(unclosed(events)).toEqual([]);
+  });
+
+  it('still ends the turn', async () => {
+    const events = await replayTruncated('claude-partial-tool-turn.ndjson', 48, 143);
+    expect(events.at(-1)!.event).toBe('done');
+  });
+
+  it('emits the buffered tool arguments rather than none at all', async () => {
+    // Cut inside the tool block's argument fragments.
+    const events = await replayTruncated('claude-partial-tool-turn.ndjson', 12, 143);
+
+    const toolStart = events.find((e) => e.event === 'block_start'
+      && (e.data as { block_type: string }).block_type === 'tool_call');
+    expect(toolStart).toBeDefined();
+
+    const index = (toolStart!.data as { block_index: number }).block_index;
+    const delta = events.find((e) => e.event === 'block_delta'
+      && (e.data as { block_index: number }).block_index === index);
+
+    expect(delta, 'a truncated tool call must still report the arguments it had')
+      .toBeDefined();
+    expect((delta!.data as { content: string }).content.length).toBeGreaterThan(0);
+    expect(unclosed(events)).toEqual([]);
+  });
+
+  it('closes blocks before reporting a CLI-reported error', async () => {
+    // The is_error result path sets `settled` and returns, so the finalizer's
+    // pre-finalize hook never runs — blocks have to be closed there too.
+    const path = join(FIXTURES, 'claude-partial-tool-turn.ndjson');
+    const head = readFileSync(path, 'utf8').split('\n').slice(0, 12).join('\n');
+    const errorResult = JSON.stringify({
+      type: 'result', subtype: 'error_during_execution', is_error: true,
+      session_id: 's', errors: ['boom'],
+    });
+
+    class Erroring extends ClaudeAdapter {
+      protected override spawnCli(): ChildProcessByStdio<Writable | null, Readable, Readable> {
+        return spawn(process.execPath, ['-e',
+          `process.stdout.write(${JSON.stringify(head + '\n' + errorResult + '\n')})`,
+        ], { stdio: ['ignore', 'pipe', 'pipe'] }) as
+          ChildProcessByStdio<Writable | null, Readable, Readable>;
+      }
+    }
+
+    const events: AdapterStreamEvent[] = [];
+    await new Erroring().execute({
+      request: {
+        type: 'ai_request', request_id: 'req_err', conversation_id: 'c', provider: 'claude',
+        message: 'go', system_prompt: null, options: {}, cli_session_id: null,
+      },
+      requestId: 'req_err',
+      tools: [],
+      mcp: null,
+      cliIsolation: 'native',
+      workingDir: process.cwd(),
+      signal: new AbortController().signal,
+      requestTimeoutSeconds: 30,
+      cliSessionId: null,
+      attachmentDir: null,
+    }, (e) => events.push(e));
+
+    expect(events.some((e) => e.event === 'error')).toBe(true);
+    expect(unclosed(events)).toEqual([]);
+
+    // And the close has to precede the error, not trail it.
+    const lastStop = events.map((e) => e.event).lastIndexOf('block_stop');
+    expect(lastStop).toBeLessThan(events.map((e) => e.event).indexOf('error'));
+  });
+});
+
+describe('a request cancelled before the CLI is spawned', () => {
+  it('ends the turn instead of spawning for a reader that has gone', async () => {
+    // The capability probe is the first await in execute(), and adding an abort
+    // listener to an already-aborted signal never fires it. Without the check,
+    // a disconnect landing in that window spawns a CLI nobody will read, which
+    // then burns tokens until the request timeout.
+    let spawned = false;
+    class Probe extends ClaudeAdapter {
+      protected override spawnCli(): ChildProcessByStdio<Writable | null, Readable, Readable> {
+        spawned = true;
+        return spawn(process.execPath, ['-e', ''], { stdio: ['pipe', 'pipe', 'pipe'] }) as
+          ChildProcessByStdio<Writable | null, Readable, Readable>;
+      }
+    }
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const events: AdapterStreamEvent[] = [];
+    await new Probe().execute({
+      request: {
+        type: 'ai_request', request_id: 'req_abort', conversation_id: 'c', provider: 'claude',
+        message: 'go', system_prompt: null, options: {}, cli_session_id: null,
+      },
+      requestId: 'req_abort',
+      tools: [],
+      mcp: null,
+      cliIsolation: 'isolated',
+      workingDir: process.cwd(),
+      signal: controller.signal,
+      requestTimeoutSeconds: 30,
+      cliSessionId: null,
+      attachmentDir: null,
+    }, (e) => events.push(e));
+
+    expect(spawned).toBe(false);
+    expect(events.map((e) => e.event)).toEqual(['done']);
+  });
+});
+
+describe('a whole-message frame arriving while a partial block is open', () => {
+  it('is held back so blocks never overlap', async () => {
+    // Every consumer tracks exactly one open block — the reference chat UI and
+    // the conversation recorder both do — so a block_start arriving inside
+    // another one silently discards the outer block's text. Today's CLI cannot
+    // produce this (a sub-agent runs only while the main agent is blocked on
+    // the tool call), but a backgrounded sub-agent would.
+    const lines = [
+      { type: 'system', subtype: 'init', session_id: 's' },
+      { type: 'stream_event', event: { type: 'message_start', message: { id: 'msg_main' } } },
+      { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } },
+      { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'main ' } } },
+      // A sub-agent message lands mid-block. It is never streamed, so it takes
+      // the whole-message path.
+      {
+        type: 'assistant', parent_tool_use_id: 'toolu_bg',
+        message: { id: 'msg_sub', content: [{ type: 'text', text: 'from the sub-agent' }] },
+      },
+      { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'answer' } } },
+      { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } },
+      { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+    ].map((l) => JSON.stringify(l)).join('\n') + '\n';
+
+    class Interleaved extends ClaudeAdapter {
+      protected override spawnCli(): ChildProcessByStdio<Writable | null, Readable, Readable> {
+        return spawn(process.execPath, ['-e', `process.stdout.write(${JSON.stringify(lines)})`],
+          { stdio: ['ignore', 'pipe', 'pipe'] }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
+      }
+    }
+
+    const events: AdapterStreamEvent[] = [];
+    await new Interleaved().execute({
+      request: {
+        type: 'ai_request', request_id: 'req_i', conversation_id: 'c', provider: 'claude',
+        message: 'go', system_prompt: null, options: {}, cli_session_id: null,
+      },
+      requestId: 'req_i',
+      tools: [],
+      mcp: null,
+      cliIsolation: 'native',
+      workingDir: process.cwd(),
+      signal: new AbortController().signal,
+      requestTimeoutSeconds: 30,
+      cliSessionId: null,
+      attachmentDir: null,
+    }, (e) => events.push(e));
+
+    // No block_start may appear between another block's start and its stop.
+    let open: number | null = null;
+    for (const e of events) {
+      const i = (e.data as { block_index?: number }).block_index;
+      if (e.event === 'block_start') {
+        expect(open, `block ${i} opened while ${open} was still open`).toBeNull();
+        open = i!;
+      }
+      if (e.event === 'block_stop') open = null;
+    }
+
+    // Held back, not dropped: the sub-agent's text still arrives.
+    expect(textOfBlocks(events, 'text')).toEqual(['main answer', 'from the sub-agent']);
   });
 });

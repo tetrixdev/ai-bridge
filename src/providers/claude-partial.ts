@@ -11,10 +11,13 @@
  * Shapes below were captured from Claude Code 2.1.261 rather than assumed, and
  * three of them are traps:
  *
- *  1. The whole-message `assistant` frame STILL ARRIVES for a message that was
- *     streamed — in the middle of it, between the last delta and
- *     `content_block_stop`. Handling both paths naively emits every block
- *     twice. See `wasStreamed()`.
+ *  1. The `assistant` frame STILL ARRIVES for a message that was streamed — in
+ *     the middle of it, between the last delta and `content_block_stop`.
+ *     Handling both paths naively emits every block twice. See `wasStreamed()`.
+ *
+ *     Note that ONE message can produce SEVERAL such frames — the CLI sends one
+ *     per content block, all carrying the same message id — so suppression is a
+ *     set membership test, not a one-shot.
  *
  *  2. `content_block_start.index` RESTARTS AT 0 for each message in the turn.
  *     A turn that calls a tool has at least two messages, so the raw index is
@@ -103,10 +106,66 @@ export class ClaudePartialStreamMapper {
     return messageId !== undefined && this.streamedMessageIds.has(messageId);
   }
 
+  /** Is a block currently open — announced with block_start, not yet stopped? */
+  hasOpenBlock(): boolean {
+    return this.bridgeIndex.size > 0;
+  }
+
+  /**
+   * Close every block still open, for a turn that ended without closing them.
+   *
+   * A cancelled turn, a request timeout, or a CLI crash abandons whatever was
+   * mid-stream. Before partial streaming the Claude adapter could not produce
+   * an unclosed block — start, delta and stop were emitted together per
+   * assistant frame — so this is a failure mode the change introduces, and one
+   * the Gemini adapter already guards against the same way.
+   *
+   * A truncated TOOL block matters most: its arguments are buffered until
+   * block_stop, so without this flush a consumer sees an announced tool call
+   * with no arguments at all — indistinguishable from a tool deliberately
+   * called with none.
+   */
+  closeOpenBlocks(emit: (event: AdapterStreamEvent) => void): void {
+    // In bridge-index order, so a consumer sees them close in the order it saw
+    // them open.
+    const open = [...this.bridgeIndex.entries()].sort((a, b) => a[1] - b[1]);
+
+    for (const [cliIndex, index] of open) {
+      if (this.blockType.get(cliIndex) === 'tool_call') {
+        emit({
+          event: 'block_delta',
+          data: { block_index: index, content: normaliseToolArguments(this.toolJson.get(cliIndex)) },
+        });
+      }
+      emit({ event: 'block_stop', data: { block_index: index } });
+    }
+
+    this.bridgeIndex.clear();
+    this.blockType.clear();
+    this.toolJson.clear();
+    // Blocks still pending never emitted a block_start, so there is nothing to
+    // close for them — but they must not survive into anything that follows.
+    this.pending.clear();
+  }
+
   /** Handle one `stream_event` frame, emitting whatever bridge events it maps to. */
   handle(frame: Record<string, unknown>, emit: (event: AdapterStreamEvent) => void): void {
     const event = obj(frame, 'event');
     if (!event) return;
+
+    // Sub-agent frames are not streamed by the CLI today (verified against
+    // 2.1.261: sidechain messages arrive only as whole `assistant` frames), and
+    // if a future version starts streaming them this mapper must not try to
+    // interleave two streams. Both restart `index` at 0, so a sub-agent's
+    // `message_start` landing mid-message would wipe the main agent's live
+    // mapping and route its remaining deltas into the wrong block.
+    //
+    // Skipping them loses nothing: the `assistant` twin still arrives, its id
+    // was never recorded as streamed, and the whole-message path emits it.
+    if (frame['parent_tool_use_id'] != null) {
+      log.debug('Ignoring a streamed sub-agent frame — delivered whole instead');
+      return;
+    }
 
     switch (str(event, 'type')) {
       case 'message_start':

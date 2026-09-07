@@ -13,10 +13,9 @@
  */
 
 import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { createLogger } from '../utils/logger.js';
+import { getBridgeWorkingDir, stripCredentials } from './env.js';
 
-const execFileAsync = promisify(execFile);
 const log = createLogger('ClaudeCapabilities');
 
 /** Operator kill switch, for a CLI whose partial output turns out to be wrong. */
@@ -24,22 +23,51 @@ const DISABLE_ENV_VAR = 'AI_BRIDGE_DISABLE_PARTIAL_STREAMING';
 
 const PARTIAL_FLAG = '--include-partial-messages';
 
+/**
+ * Hard ceiling on the probe, enforced by us rather than by execFile.
+ *
+ * `execFile`'s own `timeout` only SENDS a signal; the promise settles when the
+ * child's `close` fires. A child that ignores SIGTERM therefore leaves it
+ * pending forever — measured, not assumed. That matters far more here than it
+ * looks: the result is cached, and the adapter awaits it before the per-request
+ * timeout is armed, so a single hung probe would silently stall every Claude
+ * turn for the life of the process with no error, no `done`, and nothing in the
+ * logs pointing at `claude --help`.
+ */
+const PROBE_TIMEOUT_MS = 10_000;
+
 let cached: Promise<boolean> | null = null;
 
 /**
  * Does this machine's `claude` accept `--include-partial-messages`?
  *
- * Never throws: a missing binary, a timeout, or help text in an unexpected
- * shape all report `false`, which costs granularity and nothing else.
+ * Never throws and never hangs: a missing binary, a timeout, a wedged child, or
+ * help text in an unexpected shape all report `false`, which costs granularity
+ * and nothing else.
  */
 export function supportsPartialMessages(): Promise<boolean> {
   if (cached === null) cached = probe();
   return cached;
 }
 
-/** Reset the cached probe. Tests only. */
+/** Reset the cached probe. Tests, and the downgrade recovery below. */
 export function resetPartialMessageSupportCache(): void {
   cached = null;
+}
+
+/**
+ * Re-probe on the next turn if this looks like the CLI rejecting our flag.
+ *
+ * The cache is what makes a mid-session DOWNGRADE unrecoverable: probed once as
+ * supported, the bridge would keep passing a flag the newly installed CLI does
+ * not have, and every turn would die before emitting anything until someone
+ * restarted the bridge — reintroducing precisely the failure the probe exists
+ * to prevent. Clearing the cache turns that into a single failed turn.
+ */
+export function noteCliRejectedPartialFlag(stderr: string): void {
+  if (!stderr.includes(PARTIAL_FLAG)) return;
+  log.warn(`Claude CLI rejected ${PARTIAL_FLAG} — re-probing before the next turn`);
+  resetPartialMessageSupportCache();
 }
 
 async function probe(): Promise<boolean> {
@@ -50,15 +78,7 @@ async function probe(): Promise<boolean> {
   }
 
   try {
-    // The probe runs a binary off PATH, so it gets the same credential
-    // stripping as the version probe in detector.ts.
-    const env = { ...process.env };
-    delete env['AI_BRIDGE_TOKEN'];
-    delete env['AI_BRIDGE_SERVER'];
-    delete env['CLAUDECODE'];
-
-    const { stdout, stderr } = await execFileAsync('claude', ['--help'], { timeout: 10_000, env });
-    const supported = ((stdout || '') + (stderr || '')).includes(PARTIAL_FLAG);
+    const supported = await runHelpProbe();
     log.info(supported
       ? 'Claude CLI supports partial message streaming'
       : `Claude CLI does not list ${PARTIAL_FLAG} — falling back to whole-message streaming`);
@@ -69,4 +89,49 @@ async function probe(): Promise<boolean> {
     });
     return false;
   }
+}
+
+/** Run `claude --help` under a timeout we control, and say whether it lists the flag. */
+function runHelpProbe(): Promise<boolean> {
+  return new Promise<boolean>((resolve, reject) => {
+    // The probe runs a binary off PATH, so it gets the same credential
+    // stripping every other spawn does. CLAUDECODE additionally has to go:
+    // the CLI refuses to run when it is set, so a bridge running inside Claude
+    // Code would probe as "unsupported" and quietly disable streaming
+    // everywhere.
+    const env = stripCredentials({ ...process.env });
+    delete env['CLAUDECODE'];
+
+    let settled = false;
+
+    const child = execFile('claude', ['--help'], {
+      // SIGKILL rather than the default SIGTERM, so a child that traps TERM
+      // cannot outlive its own timeout.
+      timeout: PROBE_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+      env,
+      // Pinned like every other Claude spawn, so `--help` cannot walk a project
+      // tree the operator did not point us at.
+      cwd: getBridgeWorkingDir(),
+    }, (err, stdout, stderr) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) return void reject(err);
+      resolve(((stdout || '') + (stderr || '')).includes(PARTIAL_FLAG));
+    });
+
+    // The backstop for the case execFile's own timeout cannot handle. Resolves
+    // rather than rejects, so the answer is the safe one either way.
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      log.warn(`claude --help did not finish within ${PROBE_TIMEOUT_MS}ms — assuming no partial message support`);
+      child.kill('SIGKILL');
+      resolve(false);
+    }, PROBE_TIMEOUT_MS + 500);
+
+    // Nothing should keep the process alive for a probe.
+    timer.unref?.();
+  });
 }

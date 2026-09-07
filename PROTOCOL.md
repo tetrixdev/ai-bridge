@@ -813,6 +813,18 @@ For `tool_call` blocks (streaming the arguments JSON):
 }
 ```
 
+##### Blocks do not overlap
+
+A block's `block_start` … `block_stop` never encloses another block's. A
+consumer may therefore keep a single "current block" and treat any
+`block_start` as proof the previous block ended — which is what the reference
+consumers do.
+
+The bridge guarantees this even where a provider CLI does not. The Claude
+adapter, for example, receives sub-agent messages whole while the main agent's
+text is still streaming; it holds them back until the open block closes rather
+than interleaving them.
+
 ##### How fine the deltas are
 
 A block carries **one or many** deltas; a consumer must concatenate them and
