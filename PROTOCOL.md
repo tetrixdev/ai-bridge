@@ -900,6 +900,10 @@ What a tool returned. Emitted for **both** kinds of tool call:
 
 `is_error` is the authoritative failure signal, and is **absent when the provider did not report one** — absent never means "succeeded". Do not infer failure from the text: a tool legitimately printing `Error: no matches` is indistinguishable from one that failed. (For historical reasons the Codex and Gemini adapters additionally prefix `Error: ` onto a failed result; that prefix is not a substitute for the field.)
 
+**Size.** A result, and a `tool_call` block's arguments, are bounded by the bridge at 256 KB of JSON-encoded bytes — a quarter of the server's 1 MB frame cap. Anything longer arrives truncated with an explicit marker naming the original length. This is not squeamishness about size: an oversized frame is not delivered-and-ignored, it is answered with a `CLOSE_TOO_BIG` that tears down the WebSocket connection and every in-flight request on it. A marked truncation is what a consumer can act on.
+
+Binary parts — an image or audio block, an MCP embedded resource carrying a base64 blob — are replaced by a short description of their kind and size rather than inlined. A screenshot is around 600,000 characters of base64: unreadable as output, and two of them exceed the frame cap on their own. A file the assistant means to hand back has its own route in the [`attachment`](#attachment) event.
+
 #### `rate_limit`
 
 The provider's own rate-limit status, forwarded as the CLI reports it. **Informational and non-terminal** — the turn continues, and a consumer that treats this as an error will abort a perfectly healthy turn.
@@ -915,6 +919,7 @@ The provider's own rate-limit status, forwarded as the CLI reports it. **Informa
   }
 }
 ```
+
 
 `info` is the provider's own shape, passed through unchanged rather than normalised — its contents differ per provider and are expected to change. Carried so a server can show what the operator's CLI already knows, instead of discovering a limit by hitting it.
 
