@@ -473,7 +473,7 @@ export class CodexAdapter extends ProviderAdapter {
                 // says absent means "not reported" and never "succeeded", so
                 // deriving `false` from a missing status would be an
                 // authoritative claim made out of nothing.
-                ...(status !== undefined || errorMsg !== undefined
+                ...(typeof status === 'string' || errorMsg !== undefined
                   ? { is_error: status === 'error' || errorMsg !== undefined }
                   : {}),
               },

@@ -45,7 +45,10 @@ async function replay(source: { fixture: string } | { lines: unknown[] }): Promi
   } else {
     scratch = mkdtempSync(join(tmpdir(), 'replay-'));
     path = join(scratch, 'stream.ndjson');
-    writeFileSync(path, source.lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+    // A string entry is already-serialised NDJSON. Needed for payloads the test
+    // itself cannot stringify — a structure deep enough to overflow the stack
+    // is exactly what one of these tests is about.
+    writeFileSync(path, source.lines.map((l) => typeof l === 'string' ? l : JSON.stringify(l)).join('\n') + '\n');
   }
 
   class Replay extends ClaudeAdapter {
@@ -307,6 +310,119 @@ describe('results that are not text', () => {
     expect(result).toMatch(/^\[image: image\/png, \d+ KB\]$/);
     expect(result).not.toContain('AAAA');
     expect(result.length).toBeLessThan(100);
+  });
+
+  it('survives a structure too deep to serialise', async () => {
+    // JSON.parse is iterative and accepts essentially unbounded nesting;
+    // JSON.stringify is recursive and throws around 5,000 levels. So a line the
+    // adapter has already accepted can blow up while being described — inside
+    // the readline listener, where an uncaught throw takes down the daemon and
+    // every concurrent turn.
+    const deep = '['.repeat(6000) + '1' + ']'.repeat(6000);
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        // Built as raw text: JSON.stringify would throw here in the test
+        // itself, which is the very asymmetry that makes this reachable.
+        `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[${deep}]}]}}`,
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    expect(of(events, 'tool_result')).toHaveLength(1);
+    expect((of(events, 'tool_result')[0]!.data as { result: string }).result).toContain('could not be serialised');
+    expect(events.at(-1)!.event).toBe('done');
+  });
+
+  it('forwards a large READABLE part whole, rather than describing it away', async () => {
+    // An MCP embedded resource carries plain text. An earlier cap keyed on
+    // "non-text part over 4KB" turned that into `[resource: 5 KB]` — throwing
+    // away exactly the structured output a server most wants, and regressing
+    // against forwarding it verbatim.
+    const body = 'r'.repeat(50_000);
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: {
+            content: [{
+              type: 'tool_result', tool_use_id: 't1',
+              content: [{ type: 'resource', resource: { mimeType: 'text/plain', body } }],
+            }],
+          },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    const result = (of(events, 'tool_result')[0]!.data as { result: string }).result;
+    expect(result).toContain(body);
+    expect(result).not.toContain('[resource:');
+  });
+
+  it('bounds an enormous result, and says it did', async () => {
+    // A `cat` of a large file is likelier than a screenshot, and an oversized
+    // frame fails as a DROPPED WebSocket message — the server gets nothing and
+    // has no error to act on. A marked truncation is strictly better.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'z'.repeat(900_000) }] },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    const result = (of(events, 'tool_result')[0]!.data as { result: string }).result;
+    expect(result.length).toBeLessThan(600_000);
+    expect(result).toContain('truncated by the bridge');
+    expect(result).toContain('900000 characters');
+  });
+
+  it('says so when an image part is malformed, rather than claiming 0 KB', async () => {
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: {
+            content: [{
+              type: 'tool_result', tool_use_id: 't1',
+              content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png' } }],
+            }],
+          },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    // "0 KB" is indistinguishable from a genuinely tiny image.
+    expect((of(events, 'tool_result')[0]!.data as { result: string }).result)
+      .toBe('[image: image/png, size unknown]');
+  });
+
+  it('describes audio the same way as an image', async () => {
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: {
+            content: [{
+              type: 'tool_result', tool_use_id: 't1',
+              content: [{ type: 'audio', source: { type: 'base64', media_type: 'audio/wav', data: 'A'.repeat(8000) } }],
+            }],
+          },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    expect((of(events, 'tool_result')[0]!.data as { result: string }).result)
+      .toMatch(/^\[audio: audio\/wav, \d+ KB\]$/);
   });
 
   it('keeps a small structured part inline', async () => {

@@ -385,7 +385,15 @@ export class ClaudeAdapter extends ProviderAdapter {
         // both forwarded theirs. The tool_use_id matches the tool_call_id
         // already carried on the tool_call block, so a consumer can pair them.
         if (type === 'user') {
-          if (settled) return;
+          if (settled) {
+            // The one path where a result vanishes. Correct — nothing may
+            // follow `done` — but it is exactly the backgrounded-sub-agent case
+            // this handling exists for, so a real occurrence must be
+            // diagnosable. The assistant handler logs its equivalent.
+            log.debug('Tool result received after stream settled — dropping', { sessionId });
+
+            return;
+          }
           const message = parsed['message'] as Record<string, unknown> | undefined;
           const content = message?.['content'];
           if (!Array.isArray(content)) return;
@@ -719,10 +727,10 @@ function num(value: unknown): number | null {
  * than dropping it: the server would show something that looks like output.
  */
 function flattenToolResult(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return content == null ? '' : describePart(content);
+  if (typeof content === 'string') return boundResult(content);
+  if (!Array.isArray(content)) return boundResult(content == null ? '' : describePart(content));
 
-  return content
+  return boundResult(content
     .map((part) => {
       if (typeof part === 'string') return part;
       if (typeof part === 'object' && part !== null) {
@@ -733,42 +741,70 @@ function flattenToolResult(content: unknown): string {
       if (part === null || part === undefined) return '';
       return describePart(part);
     })
-    .join('');
+    .join(''));
 }
 
-/** Largest non-text payload worth forwarding inline as result text. */
-const MAX_INLINE_PART_CHARS = 4096;
+/**
+ * Ceiling on a single tool result, well under the server's 1MB frame cap.
+ *
+ * A `cat` of a large file is far more likely than a screenshot, and an
+ * oversized frame fails as a DROPPED WebSocket message — the server receives
+ * nothing at all and has no error to act on. A marked truncation is strictly
+ * better than that: the server still gets the result, and is told plainly that
+ * it is not all of it.
+ */
+const MAX_RESULT_CHARS = 512 * 1024;
+
+/** Bound a result, saying so rather than silently losing the tail. */
+function boundResult(text: string): string {
+  if (text.length <= MAX_RESULT_CHARS) return text;
+
+  return `${text.slice(0, MAX_RESULT_CHARS)}\n…[truncated by the bridge: showing ${MAX_RESULT_CHARS} of ${text.length} characters]`;
+}
 
 /**
- * Describe a result part that carries no text.
+ * Describe a result part that carries no text of its own.
  *
- * An image block is the case that matters: a single screenshot arrives as
- * roughly 600,000 characters of base64, measured against 2.1.261. Forwarding
- * that as "what the tool returned" is useless to read, and two of them exceed
- * the server's 1MB WebSocket cap — which PROTOCOL.md notes fails as a dropped
- * message rather than as an error anyone can act on.
+ * Only genuinely UNREADABLE parts are replaced: an image or audio block is
+ * megabytes of base64 — one screenshot measured at 617,411 characters against
+ * 2.1.261 — which is not output anyone can read and which a server cannot do
+ * anything with on this path. A file the assistant wants to hand back has its
+ * own route in the `attachment` event.
  *
- * So the shape and size are reported instead of the bytes. That is not hiding
- * the result: it is strictly more informative than 600KB of base64, and the
- * bytes were never usable on this path. A file the assistant wants to hand back
- * has its own route — the `attachment` event.
+ * Everything else is forwarded whole. An earlier version capped any non-text
+ * part at 4KB, which threw away exactly the readable structured output a
+ * server most wants — an MCP embedded resource carrying plain text became
+ * `[resource: 5 KB]` — and was a regression against forwarding it verbatim.
+ * Size is bounded once, on the assembled result, where the actual constraint
+ * lives.
  */
 function describePart(part: unknown): string {
   const record = typeof part === 'object' && part !== null ? part as Record<string, unknown> : {};
   const type = typeof record['type'] === 'string' ? record['type'] as string : 'unknown';
 
-  if (type === 'image') {
+  if (type === 'image' || type === 'audio') {
     const source = typeof record['source'] === 'object' && record['source'] !== null
       ? record['source'] as Record<string, unknown>
       : {};
-    const media = typeof source['media_type'] === 'string' ? source['media_type'] : 'image';
-    const data = typeof source['data'] === 'string' ? source['data'] : '';
-    // base64 is 4 characters per 3 bytes.
-    return `[image: ${media}, ${Math.round((data.length * 3) / 4 / 1024)} KB]`;
+    const media = typeof source['media_type'] === 'string' ? source['media_type'] : type;
+    const data = source['data'];
+    // base64 is 4 characters per 3 bytes. A malformed part says so rather than
+    // reporting a confident "0 KB", which is indistinguishable from a tiny one.
+    const size = typeof data === 'string'
+      ? `${Math.round((data.length * 3) / 4 / 1024)} KB`
+      : 'size unknown';
+
+    return `[${type}: ${media}, ${size}]`;
   }
 
-  const encoded = JSON.stringify(part);
-  if (encoded !== undefined && encoded.length <= MAX_INLINE_PART_CHARS) return encoded;
-
-  return `[${type}: ${Math.round((encoded?.length ?? 0) / 1024)} KB]`;
+  try {
+    return JSON.stringify(part) ?? '';
+  } catch {
+    // JSON.parse is iterative and accepts essentially unbounded nesting;
+    // JSON.stringify is recursive and throws around 5,000 levels. So a line
+    // this adapter already accepted can blow up here — inside the readline
+    // listener, where an uncaught throw takes down the daemon and every
+    // concurrent turn rather than failing one request.
+    return `[${type}: could not be serialised]`;
+  }
 }
