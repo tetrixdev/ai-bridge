@@ -401,6 +401,9 @@ export class GeminiAdapter extends ProviderAdapter {
               result: status === 'error'
                 ? `Error: ${(parsed['error'] as Record<string, unknown>)?.['message'] ?? output}`
                 : output,
+              // Structural, alongside the `Error: ` prefix rather than instead
+              // of it — the prefix stays for consumers that already read it.
+              is_error: status === 'error',
             },
           });
           return;

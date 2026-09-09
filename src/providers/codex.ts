@@ -461,7 +461,15 @@ export class CodexAdapter extends ProviderAdapter {
 
             onEvent({
               event: 'tool_result',
-              data: { tool_call_id: toolCallId, result: resultText },
+              data: {
+                tool_call_id: toolCallId,
+                result: resultText,
+                // Structural, alongside the `Error: ` prefix above rather than
+                // instead of it: the prefix stays for consumers that already
+                // read it, but a tool legitimately printing "Error: no matches"
+                // is indistinguishable from a failure by text alone.
+                is_error: status === 'error' || errorMsg !== undefined,
+              },
             });
 
             log.info('Codex MCP tool call surfaced', {

@@ -765,7 +765,7 @@ Opens a new block. The `block_index` is sequential within the response (0, 1, 2,
 }
 ```
 
-For `tool_call` blocks, includes the tool name:
+For `tool_call` blocks, includes the tool name and id:
 
 ```json
 {
@@ -775,11 +775,24 @@ For `tool_call` blocks, includes the tool name:
   "data": {
     "block_index": 1,
     "block_type": "tool_call",
-    "tool_name": "roll_dice",
-    "tool_call_id": "tc_001"
+    "tool_name": "Bash",
+    "tool_call_id": "toolu_01SXtmUHX3mr4tSyyHMNNxsv"
   }
 }
 ```
+
+`tool_name` is the provider's own name for the tool, **verbatim** — `Bash`, `Read`, `Edit`, or an MCP tool's full namespaced name such as `mcp__bridge__roll_dice`. It is not prettified, split or title-cased; display formatting is the consumer's decision, and a name the consumer cannot map back to the provider's own is worse than useless.
+
+Two kinds of call arrive as `tool_call` blocks, and a consumer usually wants to treat them differently:
+
+| | Where it ran | Also arrives as |
+|---|---|---|
+| `mcp__bridge__<tool>` | The **server** resolves it | a separate [`tool_call`](#tool_call) frame carrying parsed arguments |
+| anything else | The operator's **own machine** — the CLI's shell, file reader, editor | nothing else |
+
+For a server-resolved tool the block is a shadow of the `tool_call` frame; render one or the other, not both. For a locally-run tool the block is the **only** record that will ever exist, and its `tool_result` the only account of what it did — dropping it is why a chat can end up able to say "4 tool calls" and nothing more.
+
+`tool_call_id` pairs the call to its [`tool_result`](#tool_result).
 
 #### `block_delta`
 
@@ -865,7 +878,10 @@ Closes a block. No further deltas for this `block_index` will be sent.
 
 #### `tool_result`
 
-After the server executes a tool and returns the result (see [Tool Calls](#tool-calls)), the bridge acknowledges with this event before continuing generation:
+What a tool returned. Emitted for **both** kinds of tool call:
+
+- a tool the **server** resolved (see [Tool Calls](#tool-calls)), acknowledged before generation continues;
+- a tool that ran on the **operator's own machine** — the CLI's shell, file reader, editor. The server never sees these run, so this event is the only account of what they did.
 
 ```json
 {
@@ -873,11 +889,34 @@ After the server executes a tool and returns the result (see [Tool Calls](#tool-
   "request_id": "req_abc123",
   "event": "tool_result",
   "data": {
-    "tool_call_id": "tc_001",
-    "result": "You rolled a 17!"
+    "tool_call_id": "toolu_01SXtmUHX3mr4tSyyHMNNxsv",
+    "result": "hello",
+    "is_error": false
   }
 }
 ```
+
+`tool_call_id` is the same id carried on the matching `tool_call` block's `block_start`, so a consumer can pair a result to the call that produced it.
+
+`is_error` is the authoritative failure signal, and is **absent when the provider did not report one** — absent never means "succeeded". Do not infer failure from the text: a tool legitimately printing `Error: no matches` is indistinguishable from one that failed. (For historical reasons the Codex and Gemini adapters additionally prefix `Error: ` onto a failed result; that prefix is not a substitute for the field.)
+
+#### `rate_limit`
+
+The provider's own rate-limit status, forwarded as the CLI reports it. **Informational and non-terminal** — the turn continues, and a consumer that treats this as an error will abort a perfectly healthy turn.
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "rate_limit",
+  "data": {
+    "provider": "claude",
+    "info": { "status": "allowed", "rateLimitType": "five_hour", "resetsAt": 1788991200 }
+  }
+}
+```
+
+`info` is the provider's own shape, passed through unchanged rather than normalised — its contents differ per provider and are expected to change. Carried so a server can show what the operator's CLI already knows, instead of discovering a limit by hitting it.
 
 #### `attachment`
 
@@ -915,15 +954,39 @@ Signals the end of the AI response. No more events for this `request_id`.
   "event": "done",
   "data": {
     "usage": {
-      "input_tokens": 1250,
-      "output_tokens": 380
+      "input_tokens": 6,
+      "output_tokens": 183,
+      "cache_creation_input_tokens": 5429,
+      "cache_read_input_tokens": 66013
     },
+    "model": "claude-sonnet-5",
+    "provider_version": "2.1.261",
+    "stop_reason": "end_turn",
+    "cost_usd": 0.0377526,
+    "duration_ms": 7034,
+    "duration_api_ms": 7597,
+    "num_turns": 3,
+    "permission_denials": [],
     "cli_session_id": "session_def456"
   }
 }
 ```
 
 `usage` is optional — not all CLIs report token counts.
+
+**The cache counts are not a detail.** On a resumed conversation they dominate: the example above is a real turn that read 66,013 cached tokens against six new input tokens. A consumer showing only `input_tokens` and `output_tokens` understates the turn by orders of magnitude and cannot reconcile its own numbers with the provider's bill.
+
+Everything beside `usage` is likewise provider-reported and optional. **Absent means the CLI did not say — never that the value was zero.** The bridge forwards what it is given rather than deciding what a server ought to care about:
+
+| Field | What it is |
+|---|---|
+| `model` | The model that actually ran, resolved from whatever alias was requested. A server asking for `sonnet` learns here what that became. |
+| `provider_version` | Version of the provider CLI that ran the turn. |
+| `stop_reason` | Why the model stopped — `end_turn`, `max_tokens`, and so on. |
+| `cost_usd` | What the provider says the turn cost. |
+| `duration_ms` / `duration_api_ms` | Wall-clock duration of the turn, and of the API portion. |
+| `num_turns` | How many assistant turns the CLI took internally to answer. |
+| `permission_denials` | Tool calls the CLI's own permission system refused. In `isolated` this is the record of what the posture actually stopped — an empty answer with three denials reads very differently from an empty answer with none. |
 
 `cli_session_id` is the CLI session this turn ran under — the id created on a fresh start, or the id resumed. The server persists it on the conversation so the next turn can resume. Absent/`null` when no session id was produced.
 

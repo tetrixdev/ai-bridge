@@ -266,6 +266,8 @@ export class ClaudeAdapter extends ProviderAdapter {
 
     return new Promise<string | null>((resolve, reject) => {
       let sessionId: string | null = null;
+      let model: string | null = null;
+      let providerVersion: string | null = null;
       let settled = false;
 
       // Owns the turn's block indices. Both paths allocate from it: partial
@@ -367,7 +369,42 @@ export class ClaudeAdapter extends ProviderAdapter {
         if (type === 'system' && (parsed as Record<string, unknown>)['subtype'] === 'init') {
           // Extract session ID from init event
           sessionId = (parsed['session_id'] as string) ?? null;
-          log.debug('Session init', { sessionId, model: parsed['model'] });
+          // The model the CLI actually resolved, and the CLI's own version.
+          // The server asks for an alias ("sonnet"); only this says what ran.
+          model = typeof parsed['model'] === 'string' ? parsed['model'] : null;
+          providerVersion = typeof parsed['claude_code_version'] === 'string'
+            ? parsed['claude_code_version']
+            : null;
+          log.debug('Session init', { sessionId, model, providerVersion });
+          return;
+        }
+
+        // Tool results. The CLI reports them on `user` frames, and the bridge
+        // used to drop them on the floor — so a server could see that a tool
+        // ran and never what it returned, while the Codex and Gemini adapters
+        // both forwarded theirs. The tool_use_id matches the tool_call_id
+        // already carried on the tool_call block, so a consumer can pair them.
+        if (type === 'user') {
+          if (settled) return;
+          const message = parsed['message'] as Record<string, unknown> | undefined;
+          const content = message?.['content'];
+          if (!Array.isArray(content)) return;
+
+          for (const entry of content as Array<Record<string, unknown>>) {
+            if (entry['type'] !== 'tool_result') continue;
+            const toolUseId = entry['tool_use_id'];
+            if (typeof toolUseId !== 'string') continue;
+
+            const isError = entry['is_error'];
+            onEvent({
+              event: 'tool_result',
+              data: {
+                tool_call_id: toolUseId,
+                result: flattenToolResult(entry['content']),
+                ...(typeof isError === 'boolean' ? { is_error: isError } : {}),
+              },
+            });
+          }
           return;
         }
 
@@ -550,17 +587,27 @@ export class ClaudeAdapter extends ProviderAdapter {
           }
 
           const usage = parsed['usage'] as Record<string, unknown> | undefined;
-          const inputTokens = usage ? (usage['input_tokens'] as number) ?? null : null;
-          const outputTokens = usage ? (usage['output_tokens'] as number) ?? null : null;
 
           settleBlocks();
           onEvent({
             event: 'done',
             data: {
               usage: {
-                input_tokens: inputTokens,
-                output_tokens: outputTokens,
+                input_tokens: num(usage?.['input_tokens']),
+                output_tokens: num(usage?.['output_tokens']),
+                cache_creation_input_tokens: num(usage?.['cache_creation_input_tokens']),
+                cache_read_input_tokens: num(usage?.['cache_read_input_tokens']),
               },
+              model,
+              provider_version: providerVersion,
+              stop_reason: typeof parsed['stop_reason'] === 'string' ? parsed['stop_reason'] : null,
+              cost_usd: num(parsed['total_cost_usd']),
+              duration_ms: num(parsed['duration_ms']),
+              duration_api_ms: num(parsed['duration_api_ms']),
+              num_turns: num(parsed['num_turns']),
+              ...(Array.isArray(parsed['permission_denials'])
+                ? { permission_denials: parsed['permission_denials'] }
+                : {}),
             },
           });
           settled = true;
@@ -573,9 +620,19 @@ export class ClaudeAdapter extends ProviderAdapter {
         // request mid-stream. A genuine hard rate-limit surfaces through the
         // result event / non-zero exit, which the normal error path handles.
         if (type === 'rate_limit_event') {
+          const info = parsed['rate_limit_info'];
           log.debug('Claude rate limit event (informational)', {
-            status: (parsed['rate_limit_info'] as Record<string, unknown> | undefined)?.['status'],
+            status: (info as Record<string, unknown> | undefined)?.['status'],
           });
+          // Forwarded, not just logged: how much of the operator's window is
+          // spent and when it resets is something the server can act on, and
+          // a log on someone else's machine is not.
+          if (!settled && typeof info === 'object' && info !== null) {
+            onEvent({
+              event: 'rate_limit',
+              data: { provider: 'claude', info: info as Record<string, unknown> },
+            });
+          }
           return;
         }
 
@@ -634,4 +691,33 @@ export class ClaudeAdapter extends ProviderAdapter {
     // Claude CLI has no dynamic model listing — return known aliases
     return CLAUDE_MODELS;
   }
+}
+
+/** Read a numeric field, or null when it is absent or not a number. */
+function num(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Reduce a tool result's content to the text a server can display.
+ *
+ * Claude sends this either as a plain string or as an array of content blocks,
+ * and the array form is what a tool returning structured output produces. A
+ * naive `String(content)` turns that into "[object Object]", which is worse
+ * than dropping it: the server would show something that looks like output.
+ */
+function flattenToolResult(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return content == null ? '' : JSON.stringify(content);
+
+  return content
+    .map((part) => {
+      if (typeof part === 'string') return part;
+      if (typeof part === 'object' && part !== null) {
+        const text = (part as Record<string, unknown>)['text'];
+        if (typeof text === 'string') return text;
+      }
+      return JSON.stringify(part);
+    })
+    .join('');
 }

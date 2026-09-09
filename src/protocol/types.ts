@@ -612,6 +612,7 @@ export type StreamEventType =
   | 'block_stop'
   | 'tool_result'
   | 'attachment'
+  | 'rate_limit'
   | 'done'
   | 'error';
 
@@ -640,9 +641,32 @@ export interface BlockStopData {
 }
 
 /** Data payload for tool_result events. */
+/**
+ * Provider rate-limit status, forwarded as the CLI reports it.
+ *
+ * Informational and non-terminal — the turn continues. Carried so a server can
+ * show what the operator's own CLI already knows (how much of a window is
+ * spent, when it resets) rather than discovering a limit by hitting it. The
+ * shape is the provider's own, passed through unchanged.
+ */
+export interface RateLimitData {
+  provider: string;
+  info: Record<string, unknown>;
+}
+
 export interface ToolResultData {
   tool_call_id: string;
   result: string;
+  /**
+   * Whether the tool reported failure, when the provider says so.
+   *
+   * The authoritative signal. Reading it out of `result` cannot work: a tool
+   * that legitimately prints "Error: no matches" is indistinguishable from one
+   * that failed, and the Codex and Gemini adapters additionally prefix their
+   * own `Error: ` onto a failed result for historical reasons. Absent when the
+   * provider does not report a status.
+   */
+  is_error?: boolean;
 }
 
 /**
@@ -668,6 +692,35 @@ export interface AttachmentEventData {
 export interface DoneData {
   usage?: TokenUsage;
   /**
+   * What the provider reported about the turn, beyond the token counts.
+   *
+   * All optional and all provider-reported: absent means the CLI did not say,
+   * never that the value was zero. The bridge forwards what it is given rather
+   * than deciding what a server is interested in.
+   */
+  /** The model that actually ran, resolved from whatever alias was requested. */
+  model?: string | null;
+  /** Version of the provider CLI that ran the turn. */
+  provider_version?: string | null;
+  /** Why the model stopped — e.g. `end_turn`, `max_tokens`. */
+  stop_reason?: string | null;
+  /** What the provider says the turn cost, in USD. */
+  cost_usd?: number | null;
+  /** Wall-clock duration of the turn, and of the API portion of it. */
+  duration_ms?: number | null;
+  duration_api_ms?: number | null;
+  /** How many assistant turns the CLI took internally to answer. */
+  num_turns?: number | null;
+  /**
+   * Tool calls the CLI's own permission system refused.
+   *
+   * Worth surfacing rather than leaving in a log on someone else's machine: in
+   * `isolated` this is the record of what the posture actually stopped, and an
+   * empty answer with three denials here reads very differently from an empty
+   * answer with none.
+   */
+  permission_denials?: unknown[];
+  /**
    * The CLI session id this turn ran under — the id created on a fresh
    * session, or the id resumed. The server persists it on the conversation
    * so the next turn can resume. Null/absent when no session id was produced.
@@ -685,6 +738,16 @@ export interface StreamErrorData {
 export interface TokenUsage {
   input_tokens: number | null;
   output_tokens: number | null;
+  /**
+   * Cache tokens, when the provider reports them.
+   *
+   * Dominant on a resumed conversation — a turn can read tens of thousands of
+   * cached tokens against six new input tokens — so a server showing only
+   * input/output understates the turn by an order of magnitude and cannot
+   * reconcile its own numbers with the provider's bill.
+   */
+  cache_creation_input_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
 }
 
 /** Union of all stream event data payloads. */
@@ -693,6 +756,7 @@ export type StreamEventData =
   | BlockDeltaData
   | BlockStopData
   | ToolResultData
+  | RateLimitData
   | AttachmentEventData
   | DoneData
   | StreamErrorData;
