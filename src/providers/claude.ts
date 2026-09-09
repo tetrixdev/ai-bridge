@@ -34,6 +34,7 @@ import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt }
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
+import { boundResult, safeStringify } from './result-text.js';
 import { ClaudePartialStreamMapper } from './claude-partial.js';
 import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
@@ -385,16 +386,25 @@ export class ClaudeAdapter extends ProviderAdapter {
         // both forwarded theirs. The tool_use_id matches the tool_call_id
         // already carried on the tool_call block, so a consumer can pair them.
         if (type === 'user') {
+          const message = parsed['message'] as Record<string, unknown> | undefined;
+
           if (settled) {
             // The one path where a result vanishes. Correct — nothing may
             // follow `done` — but it is exactly the backgrounded-sub-agent case
             // this handling exists for, so a real occurrence must be
             // diagnosable. The assistant handler logs its equivalent.
-            log.debug('Tool result received after stream settled — dropping', { sessionId });
+            const ids = Array.isArray(message?.['content'])
+              ? (message['content'] as Array<Record<string, unknown>>)
+                .filter((e) => typeof e === 'object' && e !== null && e['type'] === 'tool_result')
+                .map((e) => e['tool_use_id'])
+              : [];
+            log.warn('Tool result received after stream settled — dropping', {
+              requestId, sessionId, toolCallIds: ids,
+            });
 
             return;
           }
-          const message = parsed['message'] as Record<string, unknown> | undefined;
+
           const content = message?.['content'];
           if (!Array.isArray(content)) return;
 
@@ -556,7 +566,11 @@ export class ClaudeAdapter extends ProviderAdapter {
                 event: 'block_delta',
                 data: {
                   block_index: index,
-                  content: JSON.stringify(toolInput ?? {}),
+                  // Guarded for the same reason describePart is: this runs in
+                  // the readline listener, and a sub-agent's tool_use input
+                  // reaches here unstreamed, so a structure too deep to encode
+                  // would take down the daemon rather than fail one request.
+                  content: safeStringify(toolInput ?? {}, '{}'),
                 },
               });
 
@@ -745,24 +759,6 @@ function flattenToolResult(content: unknown): string {
 }
 
 /**
- * Ceiling on a single tool result, well under the server's 1MB frame cap.
- *
- * A `cat` of a large file is far more likely than a screenshot, and an
- * oversized frame fails as a DROPPED WebSocket message — the server receives
- * nothing at all and has no error to act on. A marked truncation is strictly
- * better than that: the server still gets the result, and is told plainly that
- * it is not all of it.
- */
-const MAX_RESULT_CHARS = 512 * 1024;
-
-/** Bound a result, saying so rather than silently losing the tail. */
-function boundResult(text: string): string {
-  if (text.length <= MAX_RESULT_CHARS) return text;
-
-  return `${text.slice(0, MAX_RESULT_CHARS)}\n…[truncated by the bridge: showing ${MAX_RESULT_CHARS} of ${text.length} characters]`;
-}
-
-/**
  * Describe a result part that carries no text of its own.
  *
  * Only genuinely UNREADABLE parts are replaced: an image or audio block is
@@ -782,29 +778,36 @@ function describePart(part: unknown): string {
   const record = typeof part === 'object' && part !== null ? part as Record<string, unknown> : {};
   const type = typeof record['type'] === 'string' ? record['type'] as string : 'unknown';
 
-  if (type === 'image' || type === 'audio') {
-    const source = typeof record['source'] === 'object' && record['source'] !== null
-      ? record['source'] as Record<string, unknown>
-      : {};
-    const media = typeof source['media_type'] === 'string' ? source['media_type'] : type;
-    const data = source['data'];
+  // Three shapes carry binary, and only knowing one of them means a perfectly
+  // good MCP image reads as a broken one — or worse, an embedded resource's
+  // base64 blob is forwarded verbatim, which is the case this exists to stop.
+  //
+  //   Anthropic : { type: 'image', source: { media_type, data } }
+  //   MCP image : { type: 'image', mimeType, data }
+  //   MCP blob  : { type: 'resource', resource: { mimeType, blob } }
+  const resource = typeof record['resource'] === 'object' && record['resource'] !== null
+    ? record['resource'] as Record<string, unknown>
+    : undefined;
+  const source = typeof record['source'] === 'object' && record['source'] !== null
+    ? record['source'] as Record<string, unknown>
+    : undefined;
+  const holder = source ?? resource ?? record;
+  const binary = holder['data'] ?? holder['blob'];
+  const isBinary = type === 'image' || type === 'audio'
+    || (resource !== undefined && typeof holder['blob'] === 'string');
+
+  if (isBinary) {
+    const media = ['media_type', 'mimeType', 'mime_type']
+      .map((key) => holder[key])
+      .find((value): value is string => typeof value === 'string') ?? type;
     // base64 is 4 characters per 3 bytes. A malformed part says so rather than
     // reporting a confident "0 KB", which is indistinguishable from a tiny one.
-    const size = typeof data === 'string'
-      ? `${Math.round((data.length * 3) / 4 / 1024)} KB`
+    const size = typeof binary === 'string'
+      ? `${Math.round((binary.length * 3) / 4 / 1024)} KB`
       : 'size unknown';
 
     return `[${type}: ${media}, ${size}]`;
   }
 
-  try {
-    return JSON.stringify(part) ?? '';
-  } catch {
-    // JSON.parse is iterative and accepts essentially unbounded nesting;
-    // JSON.stringify is recursive and throws around 5,000 levels. So a line
-    // this adapter already accepted can blow up here — inside the readline
-    // listener, where an uncaught throw takes down the daemon and every
-    // concurrent turn rather than failing one request.
-    return `[${type}: could not be serialised]`;
-  }
+  return safeStringify(part, `[${type}: could not be serialised]`);
 }

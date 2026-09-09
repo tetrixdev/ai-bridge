@@ -56,6 +56,7 @@ import {
 } from '../mcp/cli-config.js';
 import { RequestRefusal } from '../errors.js';
 import { resumeAwareErrorCode } from './session-error.js';
+import { boundResult, safeStringify } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
@@ -376,7 +377,9 @@ export class GeminiAdapter extends ProviderAdapter {
             event: 'block_delta',
             data: {
               block_index: blockIndex,
-              content: JSON.stringify(parsed['parameters'] ?? {}),
+              // Guarded: an encode that throws inside the readline
+              // listener would take down the daemon, not just this turn.
+              content: safeStringify(parsed['parameters'] ?? {}, '{}'),
             },
           });
 
@@ -398,9 +401,9 @@ export class GeminiAdapter extends ProviderAdapter {
             event: 'tool_result',
             data: {
               tool_call_id: toolId,
-              result: status === 'error'
+              result: boundResult(status === 'error'
                 ? `Error: ${(parsed['error'] as Record<string, unknown>)?.['message'] ?? output}`
-                : output,
+                : output),
               // Structural, alongside the `Error: ` prefix rather than instead
               // of it — the prefix stays for consumers that already read it.
               //

@@ -28,6 +28,7 @@ import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, 
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
+import { boundResult, safeStringify } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
@@ -421,7 +422,9 @@ export class CodexAdapter extends ProviderAdapter {
             // UI doesn't have to special-case the shape.
             const argsContent = typeof args === 'string'
               ? args
-              : JSON.stringify(args ?? {});
+              // Guarded: this runs in the readline listener, where a
+              // structure too deep to encode would take down the daemon.
+              : safeStringify(args ?? {}, '{}');
 
             onEvent({
               event: 'block_start',
@@ -449,7 +452,7 @@ export class CodexAdapter extends ProviderAdapter {
             const errorMsg = typeof errorField === 'string'
               ? errorField
               : errorField != null
-                ? JSON.stringify(errorField)
+                ? safeStringify(errorField, '"unserialisable error"')
                 : undefined;
 
             // Result. Codex emits a single combined item for begin+end of an
@@ -457,13 +460,13 @@ export class CodexAdapter extends ProviderAdapter {
             // tool_result follows immediately after the tool_call block.
             const resultText = status === 'error' || errorMsg
               ? `Error: ${errorMsg ?? 'tool call failed'}`
-              : (typeof result === 'string' ? result : JSON.stringify(result ?? null));
+              : (typeof result === 'string' ? result : safeStringify(result ?? null, 'null'));
 
             onEvent({
               event: 'tool_result',
               data: {
                 tool_call_id: toolCallId,
-                result: resultText,
+                result: boundResult(resultText),
                 // Structural, alongside the `Error: ` prefix above rather than
                 // instead of it: the prefix stays for consumers that already
                 // read it, but a tool legitimately printing "Error: no matches"
