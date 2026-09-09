@@ -403,7 +403,11 @@ export class GeminiAdapter extends ProviderAdapter {
                 : output,
               // Structural, alongside the `Error: ` prefix rather than instead
               // of it — the prefix stays for consumers that already read it.
-              is_error: status === 'error',
+              //
+              // Only when Gemini reported a status. Absent means "not
+              // reported", never "succeeded", so a missing status must not
+              // become an authoritative `false`.
+              ...(typeof status === 'string' ? { is_error: status === 'error' } : {}),
             },
           });
           return;

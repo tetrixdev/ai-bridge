@@ -468,7 +468,14 @@ export class CodexAdapter extends ProviderAdapter {
                 // instead of it: the prefix stays for consumers that already
                 // read it, but a tool legitimately printing "Error: no matches"
                 // is indistinguishable from a failure by text alone.
-                is_error: status === 'error' || errorMsg !== undefined,
+                //
+                // Set ONLY when Codex actually reported something. The protocol
+                // says absent means "not reported" and never "succeeded", so
+                // deriving `false` from a missing status would be an
+                // authoritative claim made out of nothing.
+                ...(status !== undefined || errorMsg !== undefined
+                  ? { is_error: status === 'error' || errorMsg !== undefined }
+                  : {}),
               },
             });
 

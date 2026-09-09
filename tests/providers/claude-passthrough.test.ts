@@ -15,6 +15,8 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Readable, Writable } from 'node:stream';
@@ -32,15 +34,27 @@ const FIXTURES = fileURLToPath(new URL('./fixtures/', import.meta.url));
 
 /** Replay NDJSON — a fixture file, or lines given inline — through the adapter. */
 async function replay(source: { fixture: string } | { lines: unknown[] }): Promise<AdapterStreamEvent[]> {
-  const script = 'fixture' in source
-    ? 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8"))'
-    : `process.stdout.write(${JSON.stringify(source.lines.map((l) => JSON.stringify(l)).join('\n') + '\n')})`;
-  const args = 'fixture' in source ? [script, join(FIXTURES, source.fixture)] : [script];
+  // Inline lines go through a temp FILE, not a `node -e` argument. A test that
+  // feeds a realistically large payload (an image result is ~600KB of base64)
+  // otherwise dies with spawn E2BIG, which looks like a bug in the code under
+  // test rather than in the harness.
+  let path: string;
+  let scratch: string | null = null;
+  if ('fixture' in source) {
+    path = join(FIXTURES, source.fixture);
+  } else {
+    scratch = mkdtempSync(join(tmpdir(), 'replay-'));
+    path = join(scratch, 'stream.ndjson');
+    writeFileSync(path, source.lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  }
 
   class Replay extends ClaudeAdapter {
     protected override spawnCli(): ChildProcessByStdio<Writable | null, Readable, Readable> {
-      return spawn(process.execPath, ['-e', ...args], { stdio: ['ignore', 'pipe', 'pipe'] }) as
-        ChildProcessByStdio<Writable | null, Readable, Readable>;
+      return spawn(
+        process.execPath,
+        ['-e', 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8"))', path],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      ) as ChildProcessByStdio<Writable | null, Readable, Readable>;
     }
   }
 
@@ -56,19 +70,36 @@ async function replay(source: { fixture: string } | { lines: unknown[] }): Promi
   };
 
   const events: AdapterStreamEvent[] = [];
-  await new Replay().execute({
-    request,
-    requestId: request.request_id,
-    tools: [],
-    mcp: null,
-    cliIsolation: 'native',
-    workingDir: process.cwd(),
-    signal: new AbortController().signal,
-    requestTimeoutSeconds: 30,
-    cliSessionId: null,
-    attachmentDir: null,
-  }, (e) => events.push(e));
+  try {
+    await new Replay().execute({
+      request,
+      requestId: request.request_id,
+      tools: [],
+      mcp: null,
+      cliIsolation: 'native',
+      workingDir: process.cwd(),
+      signal: new AbortController().signal,
+      requestTimeoutSeconds: 30,
+      cliSessionId: null,
+      attachmentDir: null,
+    }, (e) => events.push(e));
+  } finally {
+    if (scratch !== null) rmSync(scratch, { recursive: true, force: true });
+  }
   return events;
+}
+
+/** Concatenate the deltas of every block of one type, block by block. */
+function textOfBlocks(events: AdapterStreamEvent[], blockType: string): string[] {
+  const types = new Map<number, string>();
+  const text = new Map<number, string>();
+  for (const e of events) {
+    const data = e.data as { block_index?: number; block_type?: string; content?: string };
+    if (data.block_index === undefined) continue;
+    if (e.event === 'block_start') types.set(data.block_index, data.block_type ?? '');
+    if (e.event === 'block_delta') text.set(data.block_index, (text.get(data.block_index) ?? '') + (data.content ?? ''));
+  }
+  return [...types.entries()].filter(([, t]) => t === blockType).map(([i]) => text.get(i) ?? '');
 }
 
 const of = (events: AdapterStreamEvent[], name: string) => events.filter((e) => e.event === name);
@@ -125,6 +156,17 @@ describe('tool results', () => {
     expect(calls.map((c) => c.tool_name)).toEqual(['Agent', 'Bash', 'Read']);
     expect(resultIds).toHaveLength(3);
     expect(resultIds.every((id) => calls.some((c) => c.tool_call_id === id))).toBe(true);
+
+    // Set membership alone is order-agnostic and passes even when every result
+    // precedes its own call. Each result must arrive AFTER the block that
+    // announced it, or a consumer pairing as events arrive sees orphans.
+    const order = events.map((e) => e.event === 'block_start'
+      ? `call:${(e.data as { tool_call_id?: string }).tool_call_id}`
+      : e.event === 'tool_result' ? `result:${(e.data as { tool_call_id: string }).tool_call_id}` : null);
+    for (const id of resultIds) {
+      expect(order.indexOf(`call:${id}`), `result for ${id} arrived before its call`)
+        .toBeLessThan(order.indexOf(`result:${id}`));
+    }
   });
 
   it('reports failure structurally rather than only in the text', async () => {
@@ -195,6 +237,120 @@ describe('tool results', () => {
       ],
     });
     expect(of(events, 'tool_result')).toHaveLength(0);
+    expect(events.at(-1)!.event).toBe('done');
+  });
+});
+
+describe('ordering against the block lifecycle', () => {
+  it('never lands a result inside an open block', async () => {
+    // A backgrounded sub-agent reports results while the main agent is still
+    // writing. Emitting directly spliced tool output into the middle of the
+    // answer and delivered results before the block_start of the call they
+    // belong to — measured on a real turn, 5 of 6 out of order.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        { type: 'stream_event', event: { type: 'message_start', message: { id: 'm1' } } },
+        { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'part one ' } } },
+        {
+          type: 'user', parent_tool_use_id: 'toolu_bg',
+          message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_bg_1', content: 'sub-agent output' }] },
+        },
+        { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'part two' } } },
+        { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    let open: number | null = null;
+    for (const e of events) {
+      const index = (e.data as { block_index?: number }).block_index;
+      if (e.event === 'block_start') open = index ?? null;
+      if (e.event === 'block_stop') open = null;
+      if (e.event === 'tool_result') {
+        expect(open, 'a tool_result landed inside an open block').toBeNull();
+      }
+    }
+
+    // Held back, not dropped — and the answer is not broken up by it.
+    expect(of(events, 'tool_result')).toHaveLength(1);
+    expect(textOfBlocks(events, 'text')).toEqual(['part one part two']);
+  });
+});
+
+describe('results that are not text', () => {
+  it('reports an image by kind and size instead of shipping its base64', async () => {
+    // A single screenshot is ~600,000 characters of base64. Forwarding that as
+    // "what the tool returned" is unreadable, and two of them exceed the
+    // server's 1MB WebSocket cap — which fails as a dropped message rather
+    // than as an error anyone can act on.
+    const data = 'A'.repeat(400_000);
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: {
+            content: [{
+              type: 'tool_result',
+              tool_use_id: 't1',
+              content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data } }],
+            }],
+          },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    const result = (of(events, 'tool_result')[0]!.data as { result: string }).result;
+    expect(result).toMatch(/^\[image: image\/png, \d+ KB\]$/);
+    expect(result).not.toContain('AAAA');
+    expect(result.length).toBeLessThan(100);
+  });
+
+  it('keeps a small structured part inline', async () => {
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: [{ type: 'data', rows: 3 }] }] },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    expect((of(events, 'tool_result')[0]!.data as { result: string }).result).toBe('{"type":"data","rows":3}');
+  });
+
+  it('does not render a null part as the word "null"', async () => {
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: [null, { type: 'text', text: 'real' }] }] },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    expect((of(events, 'tool_result')[0]!.data as { result: string }).result).toBe('real');
+  });
+
+  it('survives a null entry in the content array without killing the process', async () => {
+    // This loop runs inside the readline listener, where a throw becomes an
+    // uncaughtException and takes down the daemon and every concurrent turn.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        { type: 'user', message: { content: [null, { type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    expect(of(events, 'tool_result')).toHaveLength(1);
     expect(events.at(-1)!.event).toBe('done');
   });
 });

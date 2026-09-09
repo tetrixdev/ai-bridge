@@ -391,12 +391,24 @@ export class ClaudeAdapter extends ProviderAdapter {
           if (!Array.isArray(content)) return;
 
           for (const entry of content as Array<Record<string, unknown>>) {
+            // Guarded because this runs inside the readline 'line' listener: a
+            // throw here is an uncaughtException, and the CLI installs no
+            // handler for those, so it would take down the daemon and every
+            // other turn on it — not merely fail this request.
+            if (typeof entry !== 'object' || entry === null) continue;
             if (entry['type'] !== 'tool_result') continue;
             const toolUseId = entry['tool_use_id'];
             if (typeof toolUseId !== 'string') continue;
 
             const isError = entry['is_error'];
-            onEvent({
+            // Through the deferral queue like every other whole-message event.
+            // A backgrounded sub-agent reports its results while the main agent
+            // is still writing, so emitting directly put tool output inside an
+            // open text block and delivered results before the block_start of
+            // the call they belong to — measured, 5 of 6 out of order on a real
+            // turn. The comment that used to say this could not happen was
+            // right only for foreground sub-agents.
+            emitWholeMessage({
               event: 'tool_result',
               data: {
                 tool_call_id: toolUseId,
@@ -708,7 +720,7 @@ function num(value: unknown): number | null {
  */
 function flattenToolResult(content: unknown): string {
   if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return content == null ? '' : JSON.stringify(content);
+  if (!Array.isArray(content)) return content == null ? '' : describePart(content);
 
   return content
     .map((part) => {
@@ -717,7 +729,46 @@ function flattenToolResult(content: unknown): string {
         const text = (part as Record<string, unknown>)['text'];
         if (typeof text === 'string') return text;
       }
-      return JSON.stringify(part);
+      // A null element would otherwise render as the literal word "null".
+      if (part === null || part === undefined) return '';
+      return describePart(part);
     })
     .join('');
+}
+
+/** Largest non-text payload worth forwarding inline as result text. */
+const MAX_INLINE_PART_CHARS = 4096;
+
+/**
+ * Describe a result part that carries no text.
+ *
+ * An image block is the case that matters: a single screenshot arrives as
+ * roughly 600,000 characters of base64, measured against 2.1.261. Forwarding
+ * that as "what the tool returned" is useless to read, and two of them exceed
+ * the server's 1MB WebSocket cap — which PROTOCOL.md notes fails as a dropped
+ * message rather than as an error anyone can act on.
+ *
+ * So the shape and size are reported instead of the bytes. That is not hiding
+ * the result: it is strictly more informative than 600KB of base64, and the
+ * bytes were never usable on this path. A file the assistant wants to hand back
+ * has its own route — the `attachment` event.
+ */
+function describePart(part: unknown): string {
+  const record = typeof part === 'object' && part !== null ? part as Record<string, unknown> : {};
+  const type = typeof record['type'] === 'string' ? record['type'] as string : 'unknown';
+
+  if (type === 'image') {
+    const source = typeof record['source'] === 'object' && record['source'] !== null
+      ? record['source'] as Record<string, unknown>
+      : {};
+    const media = typeof source['media_type'] === 'string' ? source['media_type'] : 'image';
+    const data = typeof source['data'] === 'string' ? source['data'] : '';
+    // base64 is 4 characters per 3 bytes.
+    return `[image: ${media}, ${Math.round((data.length * 3) / 4 / 1024)} KB]`;
+  }
+
+  const encoded = JSON.stringify(part);
+  if (encoded !== undefined && encoded.length <= MAX_INLINE_PART_CHARS) return encoded;
+
+  return `[${type}: ${Math.round((encoded?.length ?? 0) / 1024)} KB]`;
 }
