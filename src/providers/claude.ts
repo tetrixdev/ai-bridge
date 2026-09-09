@@ -570,7 +570,11 @@ export class ClaudeAdapter extends ProviderAdapter {
                   // the readline listener, and a sub-agent's tool_use input
                   // reaches here unstreamed, so a structure too deep to encode
                   // would take down the daemon rather than fail one request.
-                  content: safeStringify(toolInput ?? {}, '{}'),
+                  // Bounded like a result is. A sub-agent's Write call carries
+                  // a whole file as its arguments, and an oversized frame is
+                  // answered with a CLOSE_TOO_BIG that tears down the
+                  // connection — every in-flight request on the bridge with it.
+                  content: boundResult(safeStringify(toolInput ?? {}, '{}')),
                 },
               });
 

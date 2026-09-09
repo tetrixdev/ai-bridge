@@ -59,6 +59,47 @@ function sliceWholeCharacters(text: string, end: number): string {
  * The marker is inside the budget, not added after it.
  */
 export function boundResult(text: string): string {
+  return boundWellFormed(replaceLoneSurrogates(text));
+}
+
+/**
+ * Replace any unpaired surrogate with U+FFFD.
+ *
+ * A lone surrogate anywhere — not only at a cut — makes PHP's `json_decode`
+ * reject the ENTIRE message, so the turn is lost behind a protocol error
+ * pointing nowhere near the cause. One can arrive in the input itself: a CLI
+ * line containing `"\ud83d"` parses to exactly that. Replacing it costs one
+ * unrenderable character; not replacing it costs the message.
+ *
+ * Written out rather than using `String.prototype.toWellFormed`, which is
+ * ES2024 and beyond this project's lib target. The common case — no lone
+ * surrogate — allocates nothing.
+ */
+export function replaceLoneSurrogates(text: string): string {
+  let rebuilt: string[] | null = null;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    const isHigh = code >= 0xd800 && code <= 0xdbff;
+    const isLow = code >= 0xdc00 && code <= 0xdfff;
+    if (!isHigh && !isLow) continue;
+
+    if (isHigh && i + 1 < text.length) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        i += 1; // a well-formed pair
+        continue;
+      }
+    }
+
+    if (rebuilt === null) rebuilt = Array.from({ length: text.length }, (_, n) => text[n] as string);
+    rebuilt[i] = '\ufffd';
+  }
+
+  return rebuilt === null ? text : rebuilt.join('');
+}
+
+function boundWellFormed(text: string): string {
   if (encodedBytes(text) <= MAX_RESULT_BYTES) return text;
 
   const marker = (shown: number): string =>

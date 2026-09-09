@@ -471,6 +471,56 @@ describe('results that are not text', () => {
   });
 });
 
+describe('tool call arguments', () => {
+  /** What the whole stream frame costs once encoded, as bridge.ts sends it. */
+  function frameBytes(event: AdapterStreamEvent): number {
+    return Buffer.byteLength(JSON.stringify({
+      type: 'stream', request_id: 'req_abc123', event: event.event, data: event.data,
+    }), 'utf8');
+  }
+
+  it('are bounded, not only results', async () => {
+    // A sub-agent's Write call carries a whole file as its ARGUMENTS. Bounding
+    // only results left this frame oversized — and an oversized frame is
+    // answered with a CLOSE_TOO_BIG that tears down the connection, taking
+    // every other in-flight request on the bridge with it.
+    const body = 'x'.repeat(1_500_000);
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'assistant', parent_tool_use_id: 'toolu_bg',
+          message: {
+            id: 'm1',
+            content: [{ type: 'tool_use', id: 'toolu_1', name: 'Write', input: { file_path: '/tmp/a', content: body } }],
+          },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    const delta = of(events, 'block_delta')[0]!;
+    expect(frameBytes(delta)).toBeLessThan(1024 * 1024);
+    expect((delta.data as { content: string }).content).toContain('truncated by the bridge');
+  });
+
+  it('leaves ordinary arguments untouched', async () => {
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'assistant',
+          message: { id: 'm1', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/a' } }] },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    expect((of(events, 'block_delta')[0]!.data as { content: string }).content)
+      .toBe(JSON.stringify({ file_path: '/a' }));
+  });
+});
+
 describe('what the turn cost and how it ran', () => {
   it('reports the cache tokens, which dominate a resumed conversation', async () => {
     const events = await replay({ fixture: 'claude-tool-results-turn.ndjson' });

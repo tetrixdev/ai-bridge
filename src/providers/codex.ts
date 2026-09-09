@@ -424,7 +424,7 @@ export class CodexAdapter extends ProviderAdapter {
               ? args
               // Guarded: this runs in the readline listener, where a
               // structure too deep to encode would take down the daemon.
-              : safeStringify(args ?? {}, '{}');
+              : boundResult(safeStringify(args ?? {}, '{}'));
 
             onEvent({
               event: 'block_start',

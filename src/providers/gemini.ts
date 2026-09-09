@@ -379,7 +379,7 @@ export class GeminiAdapter extends ProviderAdapter {
               block_index: blockIndex,
               // Guarded: an encode that throws inside the readline
               // listener would take down the daemon, not just this turn.
-              content: safeStringify(parsed['parameters'] ?? {}, '{}'),
+              content: boundResult(safeStringify(parsed['parameters'] ?? {}, '{}')),
             },
           });
 

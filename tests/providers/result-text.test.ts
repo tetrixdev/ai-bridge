@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { boundResult, safeStringify, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
+import { boundResult, safeStringify, replaceLoneSurrogates, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
 
 /** What the whole stream frame costs once encoded, as bridge.ts sends it. */
 function frameBytes(result: string): number {
@@ -22,6 +22,11 @@ function frameBytes(result: string): number {
 }
 
 const SERVER_FRAME_CAP = 1024 * 1024;
+
+/** Local check — String.prototype.isWellFormed is ES2024, past this lib target. */
+function isWellFormed(text: string): boolean {
+  return replaceLoneSurrogates(text) === text;
+}
 
 describe('boundResult', () => {
   it('leaves an ordinary result untouched', () => {
@@ -70,7 +75,7 @@ describe('boundResult', () => {
       const text = 'a'.repeat(pad) + String.fromCodePoint(0x1f600).repeat(400_000);
       const bounded = boundResult(text);
 
-      expect(bounded.isWellFormed(), `lone surrogate with ${pad} bytes of padding`).toBe(true);
+      expect(isWellFormed(bounded), `lone surrogate with ${pad} bytes of padding`).toBe(true);
       expect(JSON.parse(JSON.stringify(bounded))).toBe(bounded);
     }
   });
@@ -79,6 +84,36 @@ describe('boundResult', () => {
     const bounded = boundResult('z'.repeat(2 * 1024 * 1024));
     // Comfortably more than half the byte budget put to use.
     expect(bounded.length).toBeGreaterThan(MAX_RESULT_BYTES / 2);
+  });
+});
+
+describe('replaceLoneSurrogates', () => {
+  it('leaves ordinary text alone', () => {
+    const text = `plain ${String.fromCodePoint(0x1f600)} text`;
+    expect(replaceLoneSurrogates(text)).toBe(text);
+  });
+
+  it('replaces a lone surrogate that arrived in the INPUT', () => {
+    // Not only at the cut. A CLI line containing a bare \ud83d escape parses
+    // to exactly this, and PHP then rejects the whole message.
+    const text = `a${String.fromCharCode(0xd83d)}b`;
+    const cleaned = replaceLoneSurrogates(text);
+
+    expect(isWellFormed(cleaned)).toBe(true);
+    expect(cleaned).toBe(`a\ufffdb`);
+  });
+
+  it('replaces a lone LOW surrogate too', () => {
+    expect(isWellFormed(replaceLoneSurrogates(`a${String.fromCharCode(0xdc00)}b`))).toBe(true);
+  });
+
+  it('replaces a high surrogate at the very end', () => {
+    expect(isWellFormed(replaceLoneSurrogates(`ab${String.fromCharCode(0xd83d)}`))).toBe(true);
+  });
+
+  it('carries a lone surrogate out of a bounded result', () => {
+    const text = String.fromCharCode(0xd83d) + 'a'.repeat(400_000);
+    expect(isWellFormed(boundResult(text))).toBe(true);
   });
 });
 

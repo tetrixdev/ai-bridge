@@ -33,6 +33,7 @@
 
 import type { AdapterStreamEvent } from './base.js';
 import { createLogger } from '../utils/logger.js';
+import { boundResult } from './result-text.js';
 
 const log = createLogger('ClaudePartial');
 
@@ -354,13 +355,16 @@ export function normaliseToolArguments(buffered: string | undefined): string {
   if (raw === '') return '{}';
 
   try {
-    return JSON.stringify(JSON.parse(raw));
+    // Bounded: a Write call's arguments are a whole file, and an oversized
+    // frame tears down the connection rather than being dropped.
+    return boundResult(JSON.stringify(JSON.parse(raw)));
   } catch {
     // Truncated or malformed JSON — the CLI died mid-block, or the shape
     // changed. Forward it verbatim rather than inventing `{}`: a consumer that
     // fails to parse this can say so, where a silently empty argument object
     // would look like a tool deliberately called with no arguments.
     log.warn('Tool arguments did not parse as JSON — forwarding verbatim', { length: raw.length });
-    return raw;
+
+    return boundResult(raw);
   }
 }
