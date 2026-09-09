@@ -109,6 +109,24 @@ describe('tool results', () => {
     expect(names).toEqual(['Bash', 'Read']);
   });
 
+  it('forwards a sub-agent\'s tool results too, paired to its calls', async () => {
+    // A delegated turn runs its own tools. Those calls arrive as whole-message
+    // assistant frames and their results on user frames, so both take a
+    // different path from the main agent's — and every result must still find
+    // the call it belongs to.
+    const events = await replay({ fixture: 'claude-partial-subagent-turn.ndjson' });
+
+    const calls = of(events, 'block_start')
+      .filter((e) => (e.data as { block_type: string }).block_type === 'tool_call')
+      .map((e) => (e.data as { tool_name: string; tool_call_id: string }));
+    const resultIds = of(events, 'tool_result').map((e) => (e.data as { tool_call_id: string }).tool_call_id);
+
+    // The main agent delegating, plus the sub-agent's own work.
+    expect(calls.map((c) => c.tool_name)).toEqual(['Agent', 'Bash', 'Read']);
+    expect(resultIds).toHaveLength(3);
+    expect(resultIds.every((id) => calls.some((c) => c.tool_call_id === id))).toBe(true);
+  });
+
   it('reports failure structurally rather than only in the text', async () => {
     const events = await replay({
       lines: [
