@@ -28,7 +28,7 @@ import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, 
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundArgumentText, boundArguments, boundResult, safeStringify } from './result-text.js';
+import { boundArgumentText, boundArguments, safeStringify, toolResultEventData } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
@@ -93,6 +93,18 @@ export function probeCodexSupportsCd(): Promise<boolean> {
 /** Test seam — forget the cached probe result. */
 export function resetCodexCdProbe(): void {
   codexSupportsCdPromise = null;
+}
+
+/**
+ * A reported count, or null.
+ *
+ * `x as number` is a promise to the compiler, not a check: a provider sending
+ * `"100"` would have had the string forwarded as if it were a count, and a
+ * consumer adding it up gets string concatenation. Claude's adapter has always
+ * validated; the siblings asserted.
+ */
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 export class CodexAdapter extends ProviderAdapter {
@@ -470,29 +482,33 @@ export class CodexAdapter extends ProviderAdapter {
             // Result. Codex emits a single combined item for begin+end of an
             // MCP call (unlike local_shell_call which is split), so the
             // tool_result follows immediately after the tool_call block.
-            const resultText = status === 'error' || errorMsg
+            // Codex's own vocabulary for an MCP call is `in_progress` /
+            // `completed` / `failed` (openai/codex, sdk/typescript/src/items.ts);
+            // older builds said `error`. Reading ONLY `error` meant a `failed`
+            // call with no `error` field was reported as a success — the exact
+            // inversion a consumer cannot recover from, since nothing else in
+            // the frame contradicts it.
+            const failed = status === 'failed' || status === 'error' || errorMsg !== undefined;
+            const succeeded = status === 'completed' && errorMsg === undefined;
+
+            const resultText = failed
               ? `Error: ${errorMsg ?? 'tool call failed'}`
               : (typeof result === 'string' ? result : safeStringify(result ?? null, 'null'));
 
-            onEvent({
-              event: 'tool_result',
-              data: {
-                tool_call_id: toolCallId,
-                result: boundResult(resultText),
-                // Structural, alongside the `Error: ` prefix above rather than
-                // instead of it: the prefix stays for consumers that already
-                // read it, but a tool legitimately printing "Error: no matches"
-                // is indistinguishable from a failure by text alone.
-                //
-                // Set ONLY when Codex actually reported something. The protocol
-                // says absent means "not reported" and never "succeeded", so
-                // deriving `false` from a missing status would be an
-                // authoritative claim made out of nothing.
-                ...(typeof status === 'string' || errorMsg !== undefined
-                  ? { is_error: status === 'error' || errorMsg !== undefined }
-                  : {}),
-              },
-            });
+            // `is_error` is structural, alongside the `Error: ` prefix above
+            // rather than instead of it: the prefix stays for consumers that
+            // already read it, but a tool legitimately printing "Error: no
+            // matches" is indistinguishable from a failure by text alone.
+            //
+            // Passed ONLY when Codex reported a VERDICT — absent means "not
+            // reported" and never "succeeded".
+            for (const data of toolResultEventData(
+              toolCallId,
+              resultText,
+              failed || succeeded ? failed : undefined,
+            )) {
+              onEvent({ event: 'tool_result', data });
+            }
 
             log.info('Codex MCP tool call surfaced', {
               server,
@@ -515,15 +531,19 @@ export class CodexAdapter extends ProviderAdapter {
           if (settled) return;
 
           const usage = parsed['usage'] as Record<string, unknown> | undefined;
-          const inputTokens = usage ? (usage['input_tokens'] as number) ?? null : null;
-          const outputTokens = usage ? (usage['output_tokens'] as number) ?? null : null;
 
           onEvent({
             event: 'done',
             data: {
               usage: {
-                input_tokens: inputTokens,
-                output_tokens: outputTokens,
+                input_tokens: numberOrNull(usage?.['input_tokens']),
+                output_tokens: numberOrNull(usage?.['output_tokens']),
+                // Codex says `cached_input_tokens`, and it was being dropped.
+                // PROTOCOL.md is emphatic that the cache counts are not a
+                // detail: a consumer shown only input and output understates a
+                // resumed turn by orders of magnitude and cannot reconcile its
+                // own numbers against the provider's bill.
+                cache_read_input_tokens: numberOrNull(usage?.['cached_input_tokens']),
               },
             },
           });

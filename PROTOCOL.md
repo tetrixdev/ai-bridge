@@ -785,12 +785,14 @@ For `tool_call` blocks, includes the tool name and id:
 
 Two kinds of call arrive as `tool_call` blocks, and a consumer usually wants to treat them differently:
 
-| | Where it ran | Also arrives as |
-|---|---|---|
-| `mcp__bridge__<tool>` | The **server** resolves it | a separate [`tool_call`](#tool_call) frame carrying parsed arguments |
-| anything else | The operator's **own machine** — the CLI's shell, file reader, editor | nothing else |
+| Where it ran | Also arrives as |
+|---|---|
+| The **server** resolves it | a separate [`tool_call`](#tool-resolution-flow-cli-bridge) frame carrying parsed arguments |
+| The operator's **own machine** — the CLI's shell, file reader, editor, or a tool the bridge itself runs | nothing else |
 
-For a server-resolved tool the block is a shadow of the `tool_call` frame; render one or the other, not both. For a locally-run tool the block is the **only** record that will ever exist, and its `tool_result` the only account of what it did — dropping it is why a chat can end up able to say "4 tool calls" and nothing more.
+For a server-resolved tool the block is a shadow of the `tool_call` frame; render one or the other, not both. For every other call the block is the **only** record that will ever exist, and its `tool_result` the only account of what it did — dropping it is why a chat can end up able to say "4 tool calls" and nothing more.
+
+**The `mcp__bridge__` prefix does not tell the two apart.** It says the tool was declared by the server, not that a frame is coming: a server-declared tool with `execute: "local"` runs on the bridge and reaches the model under the same prefix, with no frame of its own. A consumer that discards a prefixed block on sight therefore deletes exactly those calls and orphans their results. Keep every block, and treat one as a shadow only once the matching `tool_call` frame has actually arrived — reconciling at the end of the turn, since the order of the two is not pinned down.
 
 `tool_call_id` pairs the call to its [`tool_result`](#tool_result).
 
@@ -900,10 +902,55 @@ What a tool returned. Emitted for **both** kinds of tool call:
 
 `is_error` is the authoritative failure signal, and is **absent when the provider did not report one** — absent never means "succeeded". Do not infer failure from the text: a tool legitimately printing `Error: no matches` is indistinguishable from one that failed. (For historical reasons the Codex and Gemini adapters additionally prefix `Error: ` onto a failed result; that prefix is not a substitute for the field.)
 
-**Size.** Two different ceilings, because the two are stored differently:
+##### Chunked results
 
-- A **result** is bounded at 256 KB of JSON-encoded bytes, and anything longer arrives truncated with a marker naming the original length.
-- A **`tool_call` block's arguments** are bounded at **64 KB** — the same number the reference server caps them at, so that two truncations cannot compose and destroy each other's evidence.
+A result larger than one frame arrives **in pieces**, keyed by `tool_call_id`:
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "tool_result",
+  "data": {
+    "tool_call_id": "toolu_01SXtmUHX3mr4tSyyHMNNxsv",
+    "result": "…the first 256 KB…",
+    "chunk_index": 0,
+    "final": false,
+    "is_error": false
+  }
+}
+```
+
+- **`chunk_index`** — 0-based, ascending, one sequence per `tool_call_id`. Two calls can chunk at the same time, so a consumer must key its buffer by the call id and not by arrival order.
+- **`final`** — `true` on the last chunk and only then. Concatenate `result` in index order; the join is exact, with no separator.
+- **`truncated_bytes`** — on the final chunk only, and only when the whole result exceeded the 16 MB ceiling below. It names how many bytes were dropped.
+
+**A result that fits in one frame carries neither `chunk_index` nor `final`** — the shape this event has always had. Chunk fields appear only where a result would previously have been truncated, so a consumer written before chunking existed sees no change to anything it could already receive.
+
+If the stream ends before a `final` chunk arrives, keep what you have and mark it partial. Discarding it loses the only account of what the tool did, which is the thing this event exists to carry.
+
+**Size.** Three ceilings:
+
+- A **single frame's result** holds at most 256 KB of JSON-encoded bytes. Longer results are chunked, not cut.
+- A **whole result**, across all its chunks, is bounded at **16 MB of JSON-encoded bytes** — the wire cost, which is what the receiver has to hold. Past that the final chunk carries `truncated_bytes` (counting the raw content bytes dropped) and a marker. There has to be some limit: the reassembling side holds every chunk until the result completes, so an unbounded result is an unbounded allocation on a machine that did not choose to make it.
+- A **`tool_call` block's arguments** are bounded at **64 KB** — the same number the reference server caps them at, so that two truncations cannot compose and destroy each other's evidence. Arguments are not chunked; they are bounded by structure, below.
+
+A consumer that **stores** results has its own decision to make, separate from the transport, and needs more than one bound. The reference server keeps a reassembled result whole in the live stream and, before writing to the transcript, applies:
+
+| Bound | Value | Why |
+|---|---|---|
+| one stored result | 1 MB | a `cat` of a large file should not dominate a row |
+| one turn's blocks — **results and arguments together** | 8 MB | bounding results alone bounds nothing: the number of tool calls is the model's choice, and 200 calls at 64 KB of arguments is 12 MB on its own |
+| one turn's **prose** (text and thinking) | 4 MB, budgeted separately | it grows delta by delta with no ceiling of its own and shares the row; kept apart from tool output because an answer is what a reader came for, and cutting it to make room for a `cat` is the wrong trade |
+| one assembling result | 16 MB | held in memory until its final chunk arrives |
+| all assembling results at once | 32 MB | the sender picks the `tool_call_id` each buffer is keyed by, so the count is not the receiver's to choose |
+| results assembling at once | 64 | as above, for the number of buffers rather than their size |
+
+None of that is the protocol's business, but the reasoning is worth stating: a database write that is too large tends to fail as a whole row, and a turn's prose is in the same row as its tool results. Losing the entire assistant message to one large `cat` is a worse outcome than a marked truncation.
+
+Three consequences a consumer should copy. **Spend a turn budget, do not zero it** — cutting one result must not make every later result in the turn store empty. **Say which bound was reached**: "this result was too large" is false about a small result that merely arrived after the budget was gone, and sends a reader at the wrong thing. And **never replace content with a longer notice** — past the budget a truncation marker is bigger than a short result, so swapping one for the other grows the row it exists to shrink.
+
+That last rule makes a turn budget a target rather than a hard ceiling: once it is spent, short blocks are kept whole and the total can drift past it by up to a marker's length per block. The alternative is storing an empty result, which renders as "the tool returned nothing" — a false statement about a call that produced output. The reference server takes the drift and measures it: under 30 KB across a 500-call turn, against a `max_allowed_packet` counted in megabytes.
 
 Arguments are bounded by **structure**, not by cutting the text. Every key survives that can, and only values too large to carry are replaced, by an object saying what was there:
 

@@ -45,7 +45,7 @@ function check(name, ok, detail = '') {
  * `isolation` of 'omit' leaves `cli_isolation` off the welcome entirely, which
  * is how a server predating this feature behaves.
  */
-async function turn({ isolation = 'workspace', request, args = [], assets = {}, tools = [], timeoutMs = 120_000 }) {
+async function turn({ isolation = 'workspace', request, args = [], assets = {}, tools = [], toolResult = null, timeoutMs = 120_000 }) {
   const frames = [];
   let advertised = null;
   let toolCalled = false;
@@ -97,7 +97,8 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
           toolCalled = true;
           ws.send(JSON.stringify({
             type: 'tool_resolve', request_id: msg.request_id,
-            tool_call_id: msg.tool_call_id, result: 'Jasper Bauer — Director, badge 4471',
+            tool_call_id: msg.tool_call_id,
+            result: toolResult ?? 'Jasper Bauer — Director, badge 4471',
           }));
         }
         if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
@@ -129,6 +130,11 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
       .map((f) => ({ name: f.data.tool_name, id: f.data.tool_call_id })),
     toolResults: stream.filter((f) => f.event === 'tool_result').map((f) => f.data),
     doneData: stream.find((f) => f.event === 'done')?.data ?? null,
+    // Every stream frame, verbatim, so a run can be replayed through the OTHER
+    // implementation. Every other check here reads the bridge's output with the
+    // bridge's own eyes; this is the only way to see whether the server can
+    // actually make sense of a real turn.
+    rawStream: stream.map((f) => ({ event: f.event, data: f.data })),
     // Arrival times of the text deltas, relative to the first stream frame.
     // Counting deltas alone cannot tell streaming apart from a CLI that
     // buffered the whole answer and flushed it in pieces at the end.
@@ -317,6 +323,11 @@ try {
       timeoutMs: 300_000,
     });
 
+    if (process.env['AI_BRIDGE_E2E_DUMP']) {
+      writeFileSync(process.env['AI_BRIDGE_E2E_DUMP'], JSON.stringify(r.rawStream, null, 2));
+      console.log(`        (wrote ${r.rawStream.length} frames to ${process.env['AI_BRIDGE_E2E_DUMP']})`);
+    }
+
     check('a locally-run tool reaches the server with its name',
       r.toolBlocks.length >= 2 && r.toolBlocks.every((t) => t.name === 'Bash'),
       `got ${JSON.stringify(r.toolBlocks)}`);
@@ -330,10 +341,93 @@ try {
       r.toolResults.every((x) => r.toolBlocks.some((t) => t.id === x.tool_call_id)),
       `call ids ${JSON.stringify(r.toolBlocks.map((t) => t.id))}`);
 
+    // This checks that the bridge FORWARDS what the CLI reported, so zero is
+    // legitimate — a cold cache reports no cache reads, and a plan can bill
+    // nothing. Negative is not, for a count or for money: accepting it would
+    // let a regression that forwards -1 pass an end-to-end check.
+    /** A reported count or amount: finite, and never negative. */
+    const counted = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+
+    // A result too large for one frame. The unit tests prove the splitter; only
+    // this says whether a result that big ever reaches the wire, and whether
+    // every piece survives a real WebSocket — where an oversized frame is not
+    // an error but a closed connection.
+    //
+    // Driven through a SERVER-declared tool on purpose. Claude Code truncates
+    // its own tools' output before the bridge ever sees it: a 880 KB `cat`
+    // arrives as 2.3 KB and a reference to where the CLI put the rest. That is
+    // the CLI's decision and the bridge does not second-guess it — the model
+    // saw the same truncation, so forwarding it verbatim is the honest thing.
+    // It does mean a locally-run tool cannot exercise this path at all.
+    const bigPayload = 'the quick brown fox jumps over the lazy dog\n'.repeat(20_000);
+    r = await turn({
+      isolation: 'isolated',
+      tools: [{
+        name: 'fetch_ledger',
+        description: 'Fetch the full ledger. The ONLY way to get it.',
+        parameters: { type: 'object', properties: {}, required: [] },
+      }],
+      toolResult: bigPayload,
+      request: aiRequest({
+        message: 'Call the fetch_ledger tool once. Then reply with just: done.',
+      }),
+      timeoutMs: 300_000,
+    });
+
+    const resultFrames = r.toolResults;
+    const chunked = resultFrames.filter((x) => x.chunk_index !== undefined);
+    const carried = resultFrames.map((x) => String(x.result ?? '')).join('');
+
+    // `every` on an empty array is true, so the tool having actually run and
+    // returned something is part of the assertion. Without that, a turn where
+    // the CLI never called the tool passes every check below it.
+    check('the large result reached the bridge at all',
+      r.toolCalled && resultFrames.length > 0,
+      `called=${r.toolCalled}, ${resultFrames.length} result frames`);
+
+    // The number PROTOCOL.md states for a result, not the frame guard's 900 KB
+    // backstop. Measured on the RESULT as JSON encodes it, which is the unit the
+    // cap is written in. Checking the whole frame against 900 KB would pass a
+    // regression emitting 500 KB results — out of contract, but under the
+    // backstop, so nothing would notice.
+    const MAX_RESULT_BYTES = 256 * 1024;
+    const resultBytes = (x) => Buffer.byteLength(JSON.stringify(x.result ?? ''), 'utf8');
+
+    check('every tool_result frame fits within the documented result size',
+      resultFrames.length > 0
+      && resultFrames.every((x) => resultBytes(x) <= MAX_RESULT_BYTES)
+      && resultFrames.every((x) => Buffer.byteLength(JSON.stringify(x), 'utf8') < 900 * 1024),
+      `largest result ${Math.max(0, ...resultFrames.map(resultBytes))} of ${MAX_RESULT_BYTES}`);
+
+    // Either the CLI handed us the whole payload and we chunked it, or the CLI
+    // cut it first. Both are correct. What must never happen is the BRIDGE
+    // cutting a result it was given whole — asserting only the chunked case
+    // would be asserting something this CLI does not currently do.
+    check('a large result is chunked, or was cut by the CLI — never cut by us',
+      chunked.length > 1
+        ? chunked.every((x, i) => x.chunk_index === i)
+          // The final flag on the LAST chunk specifically. "Exactly one is
+          // final" also holds when the first one is, which would mean a
+          // consumer reassembles a fragment and calls it the whole result.
+          && chunked.every((x, i) => (x.final === true) === (i === chunked.length - 1))
+          && carried.includes('the quick brown fox jumps over the lazy dog\n'.repeat(50))
+        : carried.length > 0
+          && carried.length < bigPayload.length
+          && !carried.includes('truncated by the bridge'),
+      `${resultFrames.length} frames, ${chunked.length} chunked, ${carried.length} of ${bigPayload.length} chars carried`);
+
+    // Which of the two happened is worth SAYING rather than inferring, because
+    // it changes with the CLI version and decides whether chunking is doing any
+    // work at all on this machine today.
+    console.log(chunked.length > 1
+      ? `        (the CLI passed the result through whole; the bridge chunked it into ${chunked.length})`
+      : `        (the CLI cut the result to ${carried.length} of ${bigPayload.length} chars before the bridge saw it)`);
+
     check('the turn reports its cache tokens, model and cost',
-      r.doneData?.usage?.cache_read_input_tokens > 0
+      counted(r.doneData?.usage?.cache_read_input_tokens)
+      && counted(r.doneData?.usage?.cache_creation_input_tokens)
       && typeof r.doneData?.model === 'string'
-      && r.doneData?.cost_usd > 0,
+      && counted(r.doneData?.cost_usd),
       `got ${JSON.stringify(r.doneData).slice(0, 200)}`);
 
     // Partial streaming. The unit tests replay captured output, so they prove

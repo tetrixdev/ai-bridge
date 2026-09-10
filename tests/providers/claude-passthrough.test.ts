@@ -19,6 +19,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
 import type { Readable, Writable } from 'node:stream';
 import { ClaudeAdapter } from '../../src/providers/claude.js';
 import type { AdapterStreamEvent } from '../../src/providers/base.js';
@@ -361,25 +362,61 @@ describe('results that are not text', () => {
     expect(result).not.toContain('[resource:');
   });
 
-  it('bounds an enormous result, and says it did', async () => {
-    // A `cat` of a large file is likelier than a screenshot, and an oversized
-    // frame fails as a DROPPED WebSocket message — the server gets nothing and
-    // has no error to act on. A marked truncation is strictly better.
+  it('carries an enormous result WHOLE, in chunks', async () => {
+    // A `cat` of a large file is likelier than a screenshot. This used to be
+    // truncated at 256 KB with a marker; it now crosses in pieces and arrives
+    // complete, which is the point of chunking.
+    const body = 'z'.repeat(900_000);
     const events = await replay({
       lines: [
         { type: 'system', subtype: 'init', session_id: 's' },
         {
           type: 'user',
-          message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'z'.repeat(900_000) }] },
+          message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: body }] },
         },
         { type: 'result', subtype: 'success', session_id: 's', usage: {} },
       ],
     });
 
-    const result = (of(events, 'tool_result')[0]!.data as { result: string }).result;
-    expect(result.length).toBeLessThan(600_000);
-    expect(result).toContain('truncated by the bridge');
-    expect(result).toContain('900000 characters');
+    const chunks = of(events, 'tool_result').map((e) => e.data as Record<string, unknown>);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((c) => c['tool_call_id'] === 't1')).toBe(true);
+    expect(chunks.map((c) => c['chunk_index'])).toEqual(chunks.map((_, i) => i));
+    expect(chunks.slice(0, -1).every((c) => c['final'] === false)).toBe(true);
+    expect(chunks[chunks.length - 1]!['final']).toBe(true);
+
+    // Nothing lost and nothing added: reassembling gives back the original.
+    expect(chunks.map((c) => String(c['result'])).join('')).toBe(body);
+
+    // The number PROTOCOL.md states, not the frame guard's 900 KB backstop.
+    // Asserting the looser one would pass a regression emitting 500 KB chunks,
+    // which is out of contract even though the guard would let it through.
+    for (const chunk of chunks) {
+      expect(Buffer.byteLength(JSON.stringify(chunk['result']), 'utf8'))
+        .toBeLessThanOrEqual(MAX_RESULT_BYTES);
+    }
+  });
+
+  it('leaves a result that fits in one frame exactly as it was', async () => {
+    // The wire shape for an ordinary result must not change: a server that has
+    // never heard of chunking sees no difference for anything it can already
+    // receive.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'small' }] },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    const chunks = of(events, 'tool_result');
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]!.data).toEqual({ tool_call_id: 't1', result: 'small' });
   });
 
   it('says so when an image part is malformed, rather than claiming 0 KB', async () => {
@@ -536,14 +573,20 @@ describe('tool call arguments', () => {
 describe('what the turn cost and how it ran', () => {
   it('reports the cache tokens, which dominate a resumed conversation', async () => {
     const events = await replay({ fixture: 'claude-tool-results-turn.ndjson' });
-    const usage = (of(events, 'done')[0]!.data as unknown as { usage: Record<string, number | null> }).usage;
+    // `undefined` is in the value type because TokenUsage's cache members are
+    // optional, and leaving it out made `not.toBeNull()` pass on a field that
+    // was never forwarded at all — an assertion that reads as proof of the
+    // feature while being blind to its absence.
+    const usage = (of(events, 'done')[0]!.data as unknown as {
+      usage: Record<string, number | null | undefined>;
+    }).usage;
 
     // In this real turn the cache read is four orders of magnitude larger than
     // the input count. A server shown only input/output understates it wildly.
     expect(usage['cache_read_input_tokens']).toBeGreaterThan(1000);
     expect(usage['cache_creation_input_tokens']).toBeGreaterThan(0);
-    expect(usage['input_tokens']).not.toBeNull();
-    expect(usage['output_tokens']).not.toBeNull();
+    expect(typeof usage['input_tokens']).toBe('number');
+    expect(typeof usage['output_tokens']).toBe('number');
   });
 
   it('says which model actually ran and which CLI ran it', async () => {
@@ -651,5 +694,188 @@ describe('rate limit status', () => {
       ],
     });
     expect(events.map((e) => e.event)).toEqual(['done']);
+  });
+});
+
+describe('the terminal frame, and the parts that are not text', () => {
+  it('scrubs a lone surrogate out of a permission denial', async () => {
+    // A denial carries the refused call's whole input — model-authored text,
+    // which is exactly where a lone surrogate comes from — and it was the one
+    // field on the TERMINAL frame passed through raw. The frame is small, so
+    // the size guard never engages; JSON.stringify succeeds, so the encode
+    // fallback never engages. PHP's json_decode then rejects the whole document
+    // and the turn's only terminal is lost, leaving the request to time out.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'result', subtype: 'success', session_id: 's', usage: {},
+          permission_denials: [{
+            tool_name: 'Write', tool_use_id: 'tu_1',
+            tool_input: { file_path: '/tmp/a', content: 'hi \ud83d' },
+          }],
+        },
+      ],
+    });
+
+    const done = of(events, 'done')[0]!.data as Record<string, unknown>;
+    const encoded = JSON.stringify(done);
+
+    expect(/\\ud83d(?!\\ude)/i.test(encoded)).toBe(false);
+    expect(() => JSON.parse(encoded)).not.toThrow();
+    // Scrubbed, not dropped: the denial is still reported.
+    expect(JSON.stringify(done['permission_denials'])).toContain('Write');
+  });
+
+  it('describes a document part instead of inlining its base64', async () => {
+    // Keyed on the TYPE NAME, a `document` carrying a PDF in `source.data` fell
+    // through to safeStringify and was inlined whole — measured at 1.2 million
+    // characters. `boundResult` used to cap that at 256 KB; removing it in
+    // favour of chunking raised the ceiling to 16 MB.
+    const base64 = 'A'.repeat(1_200_000);
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: {
+            content: [{
+              type: 'tool_result', tool_use_id: 't1',
+              content: [{
+                type: 'document',
+                source: { type: 'base64', media_type: 'application/pdf', data: base64 },
+              }],
+            }],
+          },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    const results = of(events, 'tool_result').map((e) => (e.data as { result: string }).result);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!).not.toContain(base64.slice(0, 200));
+    expect(results[0]!).toContain('application/pdf');
+    expect(results[0]!).toMatch(/\d+ KB/);
+  });
+
+  it('still describes an image part', async () => {
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: {
+            content: [{
+              type: 'tool_result', tool_use_id: 't1',
+              content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'B'.repeat(40_000) } }],
+            }],
+          },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    const result = (of(events, 'tool_result')[0]!.data as { result: string }).result;
+
+    expect(result).toContain('image/png');
+    expect(result).not.toContain('BBBBBBBBBB');
+  });
+});
+
+describe('the counters a mis-key would hide', () => {
+  /** A `result` frame with exactly these usage numbers. */
+  const withUsage = (usage: Record<string, number>, extra: Record<string, unknown> = {}) => ({
+    lines: [
+      { type: 'system', subtype: 'init', session_id: 's', model: 'claude-x' },
+      { type: 'result', subtype: 'success', session_id: 's', usage, ...extra },
+    ],
+  });
+
+  it('reads each cache counter from its OWN key', async () => {
+    // The test protecting these asserted `cache_read > 1000` and
+    // `cache_creation > 0`, which both hold when the two read the SAME source
+    // key — so a swapped or mis-keyed cache counter passed. PROTOCOL.md calls
+    // these "not a detail": distinct values are the only thing that can tell.
+    const events = await replay(withUsage({
+      input_tokens: 11,
+      output_tokens: 22,
+      cache_creation_input_tokens: 33,
+      cache_read_input_tokens: 44,
+    }));
+
+    const usage = (of(events, 'done')[0]!.data as unknown as {
+      usage: Record<string, number | null | undefined>;
+    }).usage;
+
+    expect(usage).toEqual({
+      input_tokens: 11,
+      output_tokens: 22,
+      cache_creation_input_tokens: 33,
+      cache_read_input_tokens: 44,
+    });
+  });
+
+  it('reads each duration from its OWN key', async () => {
+    // `duration_api_ms` was asserted nowhere, so it could be filled from
+    // `duration_ms` and nothing would notice.
+    const events = await replay(withUsage({}, {
+      duration_ms: 8000, duration_api_ms: 3000, num_turns: 2, total_cost_usd: 0.5,
+    }));
+
+    const done = of(events, 'done')[0]!.data as unknown as Record<string, unknown>;
+
+    expect(done['duration_ms']).toBe(8000);
+    expect(done['duration_api_ms']).toBe(3000);
+    expect(done['num_turns']).toBe(2);
+    expect(done['cost_usd']).toBe(0.5);
+  });
+
+  it('keeps what a FAILED turn cost', async () => {
+    // A turn that fails still spent tokens and money, often more than one that
+    // succeeds — and this reported `{}`, so the cost of exactly the turns worth
+    // investigating was the cost thrown away.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's', model: 'claude-x' },
+        {
+          type: 'result', subtype: 'error_during_execution', session_id: 's', is_error: true,
+          errors: ['it went wrong'],
+          usage: { input_tokens: 100, output_tokens: 5 },
+          total_cost_usd: 0.41, num_turns: 2, duration_ms: 900,
+        },
+      ],
+    });
+
+    expect(of(events, 'error')).toHaveLength(1);
+
+    const done = of(events, 'done')[0]!.data as unknown as Record<string, unknown>;
+
+    expect(done['cost_usd']).toBe(0.41);
+    expect(done['num_turns']).toBe(2);
+    expect((done['usage'] as Record<string, unknown>)['input_tokens']).toBe(100);
+  });
+
+  it('measures the denial budget in BYTES, not code units', async () => {
+    // The unit in the code was right and the test used ASCII, where the two are
+    // equal — so measuring in UTF-16 length passed. Multi-byte denials are what
+    // tell the difference: 3 bytes per character against 1 code unit.
+    const denial = (i: number) => ({
+      tool_name: 'Write', tool_use_id: `tu_${i}`,
+      tool_input: { content: '漢'.repeat(4000) },
+    });
+    const events = await replay(withUsage({}, {
+      permission_denials: [denial(1), denial(2), denial(3), denial(4)],
+    }));
+
+    const done = of(events, 'done')[0]!.data as unknown as Record<string, unknown>;
+    const encoded = Buffer.byteLength(JSON.stringify(done['permission_denials']), 'utf8');
+
+    // 4 denials x ~12 KB of encoded bytes is over the 32 KB budget, so some are
+    // omitted. Measured in code units the same input looks like ~16 KB and all
+    // four would be kept.
+    expect(encoded).toBeLessThanOrEqual(33 * 1024);
+    expect(JSON.stringify(done['permission_denials'])).toContain('omitted');
   });
 });

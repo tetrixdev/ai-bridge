@@ -56,7 +56,7 @@ import {
 } from '../mcp/cli-config.js';
 import { RequestRefusal } from '../errors.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundArguments, boundResult, safeStringify } from './result-text.js';
+import { boundArguments, safeStringify, toolResultEventData } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
@@ -74,6 +74,11 @@ const GEMINI_MODELS: ModelInfo[] = [
 ];
 
 const log = createLogger('GeminiAdapter');
+
+/** A reported count, or null — `as number` asserts rather than checks. */
+function geminiNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
 
 export class GeminiAdapter extends ProviderAdapter {
   readonly providerName = 'gemini';
@@ -210,6 +215,7 @@ export class GeminiAdapter extends ProviderAdapter {
       let sessionId: string | null = null;
       let blockIndex = 0;
       let settled = false;
+      let reportedModel: string | null = null;
       let inTextBlock = false;
 
       const env = buildSpawnEnv(context.requestId);
@@ -282,7 +288,8 @@ export class GeminiAdapter extends ProviderAdapter {
         // ── init ─────────────────────────────────────────────
         if (type === 'init') {
           sessionId = (parsed['session_id'] as string) ?? null;
-          log.debug('Session init', { sessionId, model: parsed['model'] });
+          reportedModel = typeof parsed['model'] === 'string' ? parsed['model'] : null;
+          log.debug('Session init', { sessionId, model: reportedModel });
           return;
         }
 
@@ -394,25 +401,29 @@ export class GeminiAdapter extends ProviderAdapter {
         // ── tool_result ──────────────────────────────────────
         if (type === 'tool_result') {
           const toolId = parsed['tool_id'] as string;
-          const output = (parsed['output'] as string) ?? '';
+          // Validated, not asserted. `as string` is a promise to the compiler,
+          // not a check: an array or object here reached `replaceLoneSurrogates`
+          // and threw `text.charCodeAt is not a function` INSIDE the readline
+          // listener, where nothing catches it — no `uncaughtException` handler
+          // exists — taking the daemon down with every in-flight request on it.
+          // Both sibling adapters already guard this.
+          const raw = parsed['output'];
+          const output = typeof raw === 'string' ? raw : safeStringify(raw ?? '', '');
           const status = parsed['status'] as string;
 
-          onEvent({
-            event: 'tool_result',
-            data: {
-              tool_call_id: toolId,
-              result: boundResult(status === 'error'
-                ? `Error: ${(parsed['error'] as Record<string, unknown>)?.['message'] ?? output}`
-                : output),
-              // Structural, alongside the `Error: ` prefix rather than instead
-              // of it — the prefix stays for consumers that already read it.
-              //
-              // Only when Gemini reported a status. Absent means "not
-              // reported", never "succeeded", so a missing status must not
-              // become an authoritative `false`.
-              ...(typeof status === 'string' ? { is_error: status === 'error' } : {}),
-            },
-          });
+          // `is_error` is structural, alongside the `Error: ` prefix rather
+          // than instead of it — the prefix stays for consumers that already
+          // read it. Passed only when Gemini reported a status: absent means
+          // "not reported", never "succeeded".
+          for (const data of toolResultEventData(
+            toolId,
+            status === 'error'
+              ? `Error: ${(parsed['error'] as Record<string, unknown>)?.['message'] ?? output}`
+              : output,
+            typeof status === 'string' ? status === 'error' : undefined,
+          )) {
+            onEvent({ event: 'tool_result', data });
+          }
           return;
         }
 
@@ -478,16 +489,17 @@ export class GeminiAdapter extends ProviderAdapter {
 
           // Extract usage stats
           const stats = parsed['stats'] as Record<string, unknown> | undefined;
-          const inputTokens = stats ? (stats['input_tokens'] as number) ?? null : null;
-          const outputTokens = stats ? (stats['output_tokens'] as number) ?? null : null;
 
           onEvent({
             event: 'done',
             data: {
               usage: {
-                input_tokens: inputTokens,
-                output_tokens: outputTokens,
+                input_tokens: geminiNumber(stats?.['input_tokens']),
+                output_tokens: geminiNumber(stats?.['output_tokens']),
               },
+              // Read off the init frame, logged, and then thrown away. Absent
+              // tells the server "not reported", and the CLI DID report it.
+              ...(reportedModel !== null ? { model: reportedModel } : {}),
             },
           });
           settled = true;

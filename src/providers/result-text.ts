@@ -38,12 +38,14 @@ function encodedBytes(text: string): number {
  * surrogate" — the result is lost behind a protocol error pointing nowhere
  * near the size.
  *
- * Belt and braces, and worth being honest about: the search below cannot
- * currently choose such a cut. The escape costs six bytes where the intact pair
- * costs four, so a split is always more expensive than keeping the pair and
- * never fits where the pair did not. Measured — removing this guard changes no
- * output. It stays because that reasoning is a property of the search, and the
- * next person to change the search should not have to rediscover it.
+ * This guard is LOAD-BEARING, and the comment here used to say the opposite —
+ * that the search could never choose such a cut, and that removing the guard
+ * changed no output. Both claims were false. `fittingLength` picks its cut by
+ * arithmetic (`length * budget / bytes`), not by what fits, so it lands on an
+ * odd index straight through a pair as a matter of course; deleting the guard
+ * fails the chunking tests. Believing that false premise is exactly why the
+ * fallback path in `fittingLength` was written without going through here, and
+ * that shipped a result the server rejected outright.
  */
 function sliceWholeCharacters(text: string, end: number): string {
   const code = text.charCodeAt(end - 1);
@@ -60,6 +62,178 @@ function sliceWholeCharacters(text: string, end: number): string {
  */
 export function boundResult(text: string): string {
   return boundText(text, MAX_RESULT_BYTES, encodedBytes);
+}
+
+/** One piece of a tool result, as it goes on the wire. */
+export interface ResultFrame {
+  result: string;
+  /** 0-based. Absent when the result fits in one frame. */
+  chunk_index?: number;
+  /** Absent when the result fits in one frame; true on the last chunk. */
+  final?: boolean;
+  /** On the final chunk only, when the total ceiling cut the result short. */
+  truncated_bytes?: number;
+}
+
+/**
+ * Split a tool result into frames that each fit on the wire.
+ *
+ * A result under the per-frame budget yields exactly ONE frame carrying no
+ * chunk fields — byte-identical to what the bridge sent before chunking
+ * existed, so a server that has never heard of chunks is unaffected by this
+ * change for every result it can already receive. Chunk fields appear only for
+ * results that would otherwise have been truncated, which is the one case
+ * where an older server was already being given something lossy.
+ *
+ * Pieces are cut on whole characters and measured as JSON encodes them, since
+ * a code unit costs between one and six bytes once escaped and a fixed ratio
+ * would be wrong in one direction or the other for most real content.
+ */
+export function toolResultFrames(text: string): ResultFrame[] {
+  const clean = replaceLoneSurrogates(text);
+
+  if (encodedBytes(clean) <= MAX_RESULT_BYTES) return [{ result: clean }];
+
+  const frames: ResultFrame[] = [];
+  let pos = 0;
+  let carried = 0;
+
+  while (pos < clean.length) {
+    // Cut here, not merely at the length `fittingLength` returned. The
+    // invariant belongs at the slice, so a later change to how the length is
+    // chosen cannot reintroduce a split pair — which is precisely how the last
+    // one got in.
+    const take = fittingLength(clean, pos, MAX_RESULT_BYTES);
+    const piece = sliceWholeCharacters(clean.slice(pos, pos + take), take);
+
+    // Cannot happen with a 256 KB budget, where one code unit always fits, but
+    // an empty piece would spin this loop for ever — inside the readline
+    // listener, where a stalled event loop never recovers.
+    if (piece.length === 0) break;
+
+    const pieceBytes = encodedBytes(piece);
+
+    // The ceiling is on the assembled result, so it is checked before a piece
+    // is added rather than after: going over and then trimming would mean the
+    // reassembling side had already been asked to hold more than the limit.
+    if (carried + pieceBytes > MAX_TOTAL_RESULT_BYTES) break;
+
+    frames.push({ result: piece, chunk_index: frames.length, final: false });
+    carried += pieceBytes;
+    pos += piece.length;
+  }
+
+  // Everything was too large for even one piece — vanishingly unlikely, since a
+  // piece is bounded below by one character, but a caller must never get an
+  // empty list and silently emit nothing at all.
+  if (frames.length === 0) {
+    return [{ result: boundResult(clean), chunk_index: 0, final: true }];
+  }
+
+  const last = frames[frames.length - 1]!;
+  last.final = true;
+
+  const dropped = Buffer.byteLength(clean.slice(pos), 'utf8');
+  if (dropped > 0) {
+    // The notice does not name the number, and `truncated_bytes` does. Putting
+    // the count in the text would be circular: the text has to be paid for out
+    // of the final chunk's budget, so adding it can force a trim, which changes
+    // the count, which changes the text. One of the two has to be fixed-length.
+    const notice = `\n…[truncated by the bridge: further output over the ${MAX_TOTAL_RESULT_BYTES}-byte ceiling]`;
+
+    // The final piece was measured to fill the per-frame budget, so the notice
+    // has to come OUT of it. Appended on top it made the last chunk oversized —
+    // and an oversized chunk does not merely lose the notice, it goes down the
+    // frame guard's fallback path and the result never reassembles at all.
+    // Against BOTH budgets. The frame this replaces is already counted in
+    // `carried`, so paying for the notice out of the per-frame budget alone
+    // could push the whole result past the total ceiling.
+    //
+    // Belt and braces, and said plainly: I could not construct an input that
+    // reaches it. Every frame accepted before a ceiling break is full-size, so
+    // the aggregate budget is never tighter than the per-frame one, and
+    // removing this changes no output I could find. It stays because that is an
+    // argument about the shape of the search rather than a property of this
+    // function — and the last comment in this file that reasoned "the search
+    // cannot choose such a cut" was wrong, and cost a result the server
+    // rejected outright.
+    const aggregateBudget = MAX_TOTAL_RESULT_BYTES - (carried - encodedBytes(last.result));
+    const finalBudget = Math.min(MAX_RESULT_BYTES, aggregateBudget);
+
+    let kept = last.result;
+    while (kept.length > 0 && encodedBytes(kept + notice) > finalBudget) {
+      const ratio = finalBudget / encodedBytes(kept + notice);
+      // Strictly decreasing, so this terminates whatever the ratio says.
+      const next = Math.min(kept.length - 1, Math.max(0, Math.floor(kept.length * ratio * 0.98)));
+      kept = sliceWholeCharacters(kept, next);
+    }
+
+    last.truncated_bytes = dropped + Buffer.byteLength(last.result.slice(kept.length), 'utf8');
+    last.result = kept + notice;
+  }
+
+  return frames;
+}
+
+/**
+ * The `data` payloads for one tool result, one per frame.
+ *
+ * `is_error` rides on EVERY chunk rather than only the last. It costs sixteen
+ * bytes and removes an ordering dependency: a consumer that sees a partial
+ * result — because the turn was cut short before the final chunk — still knows
+ * whether it is looking at a failure, which is exactly when that matters most.
+ */
+export function toolResultEventData(
+  toolCallId: string,
+  text: string,
+  isError?: boolean,
+): Array<Record<string, unknown>> {
+  const verdict = typeof isError === 'boolean' ? { is_error: isError } : {};
+
+  return toolResultFrames(text).map((frame) => ({
+    tool_call_id: toolCallId,
+    ...frame,
+    ...verdict,
+  }));
+}
+
+/**
+ * How many characters from `pos` still encode within `budget`.
+ *
+ * Guesses from the previous ratio and corrects downward, which settles in two
+ * or three measurements for real content — a binary search would re-encode a
+ * quarter-megabyte slice two dozen times per chunk, synchronously, in the
+ * readline listener this file's header says must not block.
+ */
+function fittingLength(text: string, pos: number, budget: number): number {
+  const remaining = text.length - pos;
+  let take = Math.min(remaining, budget);
+
+  // Correct by the EXACT ratio. A safety factor here would look harmless and
+  // was not: shaving 2% off every chunk left several kilobytes of slack in each
+  // one, which silently absorbed the truncation notice below and made the test
+  // written to catch an oversized final chunk pass against the bug.
+  //
+  // Bounded regardless: each pass strictly reduces `take`, and the floor below
+  // is a length that cannot fail — six encoded bytes is the worst any code unit
+  // costs.
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = sliceWholeCharacters(text.slice(pos, pos + take), take);
+    const bytes = encodedBytes(candidate);
+    if (bytes <= budget) return candidate.length;
+
+    const scaled = Math.floor(candidate.length * (budget / bytes));
+    take = Math.max(1, Math.min(candidate.length - 1, scaled));
+  }
+
+  // Six encoded bytes is the worst any code unit costs, so this always fits —
+  // but it has to be cut like every other cut. Returned raw, it split surrogate
+  // pairs: `JSON.stringify` then escapes each half to a literal `\ud83d`, and
+  // PHP's `json_decode` rejects the WHOLE frame, so both chunks either side of
+  // the split are lost rather than one character.
+  const floor = Math.max(1, Math.min(remaining, Math.floor(budget / 6)));
+
+  return sliceWholeCharacters(text.slice(pos, pos + floor), floor).length;
 }
 
 /**
@@ -251,12 +425,45 @@ export function replaceLoneSurrogateEscapes(json: string): string {
  */
 export const MAX_ARGUMENT_BYTES = 64 * 1024;
 
+/**
+ * The largest whole tool result the bridge will carry, across all its chunks.
+ *
+ * A result over `MAX_RESULT_BYTES` is split rather than truncated, so this is
+ * the only remaining ceiling — and there has to be one. The reassembling side
+ * holds every chunk in memory until the result completes, so an unbounded
+ * result is an unbounded allocation on a machine that did not choose to make
+ * it. 16 MB covers a very large build log with room to spare; past that a
+ * consumer is better served by a marked truncation than by a server falling
+ * over.
+ *
+ * Counted in JSON-ENCODED bytes, like the per-frame budget. Counting raw bytes
+ * let content escape at up to six bytes per code unit: a 16 MB result of
+ * control characters became 384 frames and 96 MB on the wire, built in 4.4
+ * seconds of synchronous work inside the readline listener. The number that
+ * needs bounding is what the wire and the receiver actually pay.
+ */
+export const MAX_TOTAL_RESULT_BYTES = 16 * 1024 * 1024;
+
 /** How much of an oversized value to keep as a sample. */
 const HEAD_CHARS = 200;
 
 /** What a value costs once encoded. */
 function valueBytes(value: unknown): number {
   return Buffer.byteLength(safeStringify(value, '""'), 'utf8');
+}
+
+/**
+ * What a key costs once JSON has encoded it, quotes included.
+ *
+ * The raw byte length is not that number: a key holding a quote, a backslash or
+ * a control character grows on encoding — a control character by six. Values
+ * have always been measured encoded (above); keys were not, so an object could
+ * pass the estimate and fail the real check, at which point the keep-what-fits
+ * path discards every sibling argument to make room for a size that was never
+ * really there.
+ */
+function keyBytes(key: string): number {
+  return Buffer.byteLength(JSON.stringify(key), 'utf8');
 }
 
 /**
@@ -329,7 +536,7 @@ function shrinkEntries(
   const sized = entries.map(([key, value]) => ({
     key: String(key),
     value,
-    bytes: valueBytes(value) + Buffer.byteLength(String(key), 'utf8') + 4,
+    bytes: valueBytes(value) + keyBytes(String(key)) + 2,
   }));
 
   let total = sized.reduce((sum, e) => sum + e.bytes, 2);
@@ -339,7 +546,7 @@ function shrinkEntries(
     if (total <= budget) break;
 
     const shrunkValue = shrinkValue(entry.value, Math.max(budget - (total - entry.bytes), 0), depth);
-    const shrunkBytes = valueBytes(shrunkValue) + Buffer.byteLength(entry.key, 'utf8') + 4;
+    const shrunkBytes = valueBytes(shrunkValue) + keyBytes(entry.key) + 2;
     // Replacing many small values with markers makes the object BIGGER, which
     // is how the first version looped over every key and still did not fit.
     if (shrunkBytes >= entry.bytes) continue;
@@ -359,7 +566,7 @@ function shrinkEntries(
   let used = 2;
   for (const entry of sized) {
     const value = replaced.has(entry.key) ? replaced.get(entry.key) : entry.value;
-    const bytes = valueBytes(value) + Buffer.byteLength(entry.key, 'utf8') + 4;
+    const bytes = valueBytes(value) + keyBytes(entry.key) + 2;
     if (used + bytes > budget - 80) break;
     kept.push([entry.key, value]);
     used += bytes;

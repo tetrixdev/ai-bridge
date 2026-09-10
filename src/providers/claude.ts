@@ -34,7 +34,7 @@ import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt }
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundArguments, boundResult, safeStringify } from './result-text.js';
+import { boundArguments, replaceLoneSurrogateEscapes, safeStringify, toolResultEventData } from './result-text.js';
 import { ClaudePartialStreamMapper } from './claude-partial.js';
 import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
@@ -426,14 +426,13 @@ export class ClaudeAdapter extends ProviderAdapter {
             // the call they belong to — measured, 5 of 6 out of order on a real
             // turn. The comment that used to say this could not happen was
             // right only for foreground sub-agents.
-            emitWholeMessage({
-              event: 'tool_result',
-              data: {
-                tool_call_id: toolUseId,
-                result: flattenToolResult(entry['content']),
-                ...(typeof isError === 'boolean' ? { is_error: isError } : {}),
-              },
-            });
+            for (const data of toolResultEventData(
+              toolUseId,
+              flattenToolResult(entry['content']),
+              typeof isError === 'boolean' ? isError : undefined,
+            )) {
+              emitWholeMessage({ event: 'tool_result', data });
+            }
           }
           return;
         }
@@ -622,39 +621,19 @@ export class ClaudeAdapter extends ProviderAdapter {
                 message: errText,
               },
             });
-            onEvent({ event: 'done', data: {} });
+            // The SAME metadata as a successful turn. A turn that fails still
+            // spent tokens and money — often more than one that succeeds — and
+            // this reported `{}`, so the cost of exactly the turns worth
+            // investigating was the cost that got thrown away. Stopping `done`'s
+            // fields being written into the ERROR frame was right; leaving the
+            // accompanying `done` empty was not.
+            onEvent({ event: 'done', data: doneDataFrom(parsed, model, providerVersion) });
             settled = true;
             return;
           }
 
-          const usage = parsed['usage'] as Record<string, unknown> | undefined;
-
           settleBlocks();
-          onEvent({
-            event: 'done',
-            data: {
-              usage: {
-                input_tokens: num(usage?.['input_tokens']),
-                output_tokens: num(usage?.['output_tokens']),
-                cache_creation_input_tokens: num(usage?.['cache_creation_input_tokens']),
-                cache_read_input_tokens: num(usage?.['cache_read_input_tokens']),
-              },
-              model,
-              provider_version: providerVersion,
-              stop_reason: typeof parsed['stop_reason'] === 'string' ? parsed['stop_reason'] : null,
-              cost_usd: num(parsed['total_cost_usd']),
-              duration_ms: num(parsed['duration_ms']),
-              duration_api_ms: num(parsed['duration_api_ms']),
-              num_turns: num(parsed['num_turns']),
-              // Bounded: each denial carries the refused call's whole input,
-              // so one denied large write would otherwise make the TERMINAL
-              // frame oversized — and a `done` that does not arrive hangs the
-              // request rather than costing one event.
-              ...(Array.isArray(parsed['permission_denials'])
-                ? { permission_denials: boundDenials(parsed['permission_denials']) }
-                : {}),
-            },
-          });
+          onEvent({ event: 'done', data: doneDataFrom(parsed, model, providerVersion) });
           settled = true;
           return;
         }
@@ -751,11 +730,17 @@ function num(value: unknown): number | null {
  * naive `String(content)` turns that into "[object Object]", which is worse
  * than dropping it: the server would show something that looks like output.
  */
+/**
+ * A tool result's content as one string.
+ *
+ * Deliberately NOT bounded here: the emit site splits it into frames, so
+ * bounding at this point would truncate a result that chunking can carry whole.
+ */
 function flattenToolResult(content: unknown): string {
-  if (typeof content === 'string') return boundResult(content);
-  if (!Array.isArray(content)) return boundResult(content == null ? '' : describePart(content));
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return content == null ? '' : describePart(content);
 
-  return boundResult(content
+  return (content
     .map((part) => {
       if (typeof part === 'string') return part;
       if (typeof part === 'object' && part !== null) {
@@ -804,8 +789,14 @@ function describePart(part: unknown): string {
     : undefined;
   const holder = source ?? resource ?? record;
   const binary = holder['data'] ?? holder['blob'];
+  // A base64 payload is binary whatever the part calls itself. Keying on the
+  // TYPE NAME let a `document` part carrying a PDF in `source.data` fall through
+  // to `safeStringify`, which inlines the whole thing: measured at 1.2 million
+  // characters across five frames. That used to be capped at 256 KB by
+  // `boundResult`; removing that bound in favour of chunking turned a bounded
+  // leak into one with a 16 MB ceiling.
   const isBinary = type === 'image' || type === 'audio'
-    || (resource !== undefined && typeof holder['blob'] === 'string');
+    || ((source !== undefined || resource !== undefined) && typeof binary === 'string');
 
   if (isBinary) {
     const media = ['media_type', 'mimeType', 'mime_type']
@@ -824,6 +815,42 @@ function describePart(part: unknown): string {
 }
 
 /**
+ * What the CLI reported about a turn, whether it succeeded or failed.
+ *
+ * @param result the CLI's `result` frame
+ */
+function doneDataFrom(
+  result: Record<string, unknown>,
+  model: string | null,
+  providerVersion: string | null,
+): Record<string, unknown> {
+  const usage = result['usage'] as Record<string, unknown> | undefined;
+
+  return {
+    usage: {
+      input_tokens: num(usage?.['input_tokens']),
+      output_tokens: num(usage?.['output_tokens']),
+      cache_creation_input_tokens: num(usage?.['cache_creation_input_tokens']),
+      cache_read_input_tokens: num(usage?.['cache_read_input_tokens']),
+    },
+    model,
+    provider_version: providerVersion,
+    stop_reason: typeof result['stop_reason'] === 'string' ? result['stop_reason'] : null,
+    cost_usd: num(result['total_cost_usd']),
+    duration_ms: num(result['duration_ms']),
+    duration_api_ms: num(result['duration_api_ms']),
+    num_turns: num(result['num_turns']),
+    // Bounded: each denial carries the refused call's whole input, so one
+    // denied large write would otherwise make the TERMINAL frame oversized —
+    // and a `done` that does not arrive hangs the request rather than costing
+    // one event.
+    ...(Array.isArray(result['permission_denials'])
+      ? { permission_denials: boundDenials(result['permission_denials']) }
+      : {}),
+  };
+}
+
+/**
  * Keep the permission denials that fit, and say how many did not.
  *
  * Which tools were refused is the useful part — an empty answer with three
@@ -836,12 +863,28 @@ function boundDenials(denials: unknown[]): unknown[] {
   let used = 0;
 
   for (const denial of denials) {
-    const size = Buffer.byteLength(safeStringify(denial, '{}'), 'utf8');
+    // Scrubbed, not merely measured. A denial carries the refused call's whole
+    // input — model-authored text, which is exactly where a lone surrogate
+    // comes from — and this was the one field on the TERMINAL frame passed
+    // through raw. `JSON.stringify` succeeds and the frame is small, so neither
+    // the size guard nor the encode fallback engages; PHP's `json_decode` then
+    // rejects the whole document and the turn's only terminal is lost, leaving
+    // the request to hang to a timeout.
+    const encoded = replaceLoneSurrogateEscapes(safeStringify(denial, '{}'));
+    const size = Buffer.byteLength(encoded, 'utf8');
     if (used + size > BUDGET) {
       kept.push({ omitted: denials.length - kept.length, reason: 'too large to forward' });
       break;
     }
-    kept.push(denial);
+
+    let clean: unknown = denial;
+    try {
+      clean = JSON.parse(encoded);
+    } catch {
+      clean = { omitted: 1, reason: 'could not be encoded' };
+    }
+
+    kept.push(clean);
     used += size;
   }
 
