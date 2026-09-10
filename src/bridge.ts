@@ -1792,11 +1792,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // `usage` and `cli_session_id` are what the server acts on, so they are
       // worth one attempt — but they come from the provider, and a terminal
       // frame that cannot be sent at all costs more than either.
-      const data = (stripped['data'] ?? {}) as Record<string, unknown>;
-      yield {
-        ...stripped,
-        data: { ...data, usage: null, cli_session_id: null },
-      };
+      //
+      // `done` only: an `error` frame has neither field, and writing them in
+      // would put two meaningless nulls into a frame whose shape the server
+      // reads.
+      if (stripped['event'] === 'done') {
+        const data = (stripped['data'] ?? {}) as Record<string, unknown>;
+        yield {
+          ...stripped,
+          data: { ...data, usage: null, cli_session_id: null },
+        };
+      }
     }
 
     const requestId = (message as { request_id?: string }).request_id;
