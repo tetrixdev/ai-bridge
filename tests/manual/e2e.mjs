@@ -368,8 +368,16 @@ try {
     const chunked = resultFrames.filter((x) => x.chunk_index !== undefined);
     const carried = resultFrames.map((x) => String(x.result ?? '')).join('');
 
+    // `every` on an empty array is true, so the tool having actually run and
+    // returned something is part of the assertion. Without that, a turn where
+    // the CLI never called the tool passes every check below it.
+    check('the large result reached the bridge at all',
+      r.toolCalled && resultFrames.length > 0,
+      `called=${r.toolCalled}, ${resultFrames.length} result frames`);
+
     check('every tool_result frame fits on the wire',
-      resultFrames.every((x) => Buffer.byteLength(JSON.stringify(x), 'utf8') < 900 * 1024),
+      resultFrames.length > 0
+      && resultFrames.every((x) => Buffer.byteLength(JSON.stringify(x), 'utf8') < 900 * 1024),
       `largest ${Math.max(0, ...resultFrames.map((x) => Buffer.byteLength(JSON.stringify(x), 'utf8')))}`);
 
     // Either the CLI handed us the whole payload and we chunked it, or the CLI
@@ -379,9 +387,14 @@ try {
     check('a large result is chunked, or was cut by the CLI — never cut by us',
       chunked.length > 1
         ? chunked.every((x, i) => x.chunk_index === i)
-          && chunked.filter((x) => x.final === true).length === 1
+          // The final flag on the LAST chunk specifically. "Exactly one is
+          // final" also holds when the first one is, which would mean a
+          // consumer reassembles a fragment and calls it the whole result.
+          && chunked.every((x, i) => (x.final === true) === (i === chunked.length - 1))
           && carried.includes('the quick brown fox jumps over the lazy dog\n'.repeat(50))
-        : carried.length < bigPayload.length && !carried.includes('truncated by the bridge'),
+        : carried.length > 0
+          && carried.length < bigPayload.length
+          && !carried.includes('truncated by the bridge'),
       `${resultFrames.length} frames, ${chunked.length} chunked, ${carried.length} of ${bigPayload.length} chars carried`);
 
     // Which of the two happened is worth SAYING rather than inferring, because

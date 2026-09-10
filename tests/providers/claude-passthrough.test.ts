@@ -19,6 +19,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
 import type { Readable, Writable } from 'node:stream';
 import { ClaudeAdapter } from '../../src/providers/claude.js';
 import type { AdapterStreamEvent } from '../../src/providers/base.js';
@@ -388,9 +389,12 @@ describe('results that are not text', () => {
     // Nothing lost and nothing added: reassembling gives back the original.
     expect(chunks.map((c) => String(c['result'])).join('')).toBe(body);
 
-    // And every chunk fits on the wire on its own.
+    // The number PROTOCOL.md states, not the frame guard's 900 KB backstop.
+    // Asserting the looser one would pass a regression emitting 500 KB chunks,
+    // which is out of contract even though the guard would let it through.
     for (const chunk of chunks) {
-      expect(Buffer.byteLength(JSON.stringify(chunk), 'utf8')).toBeLessThan(900 * 1024);
+      expect(Buffer.byteLength(JSON.stringify(chunk['result']), 'utf8'))
+        .toBeLessThanOrEqual(MAX_RESULT_BYTES);
     }
   });
 

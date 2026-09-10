@@ -123,8 +123,26 @@ export function toolResultFrames(text: string): ResultFrame[] {
 
   const dropped = Buffer.byteLength(clean.slice(pos), 'utf8');
   if (dropped > 0) {
-    last.truncated_bytes = dropped;
-    last.result += `\n…[truncated by the bridge: ${dropped} further bytes over the ${MAX_TOTAL_RESULT_BYTES}-byte ceiling]`;
+    // The notice does not name the number, and `truncated_bytes` does. Putting
+    // the count in the text would be circular: the text has to be paid for out
+    // of the final chunk's budget, so adding it can force a trim, which changes
+    // the count, which changes the text. One of the two has to be fixed-length.
+    const notice = `\n…[truncated by the bridge: further output over the ${MAX_TOTAL_RESULT_BYTES}-byte ceiling]`;
+
+    // The final piece was measured to fill the per-frame budget, so the notice
+    // has to come OUT of it. Appended on top it made the last chunk oversized —
+    // and an oversized chunk does not merely lose the notice, it goes down the
+    // frame guard's fallback path and the result never reassembles at all.
+    let kept = last.result;
+    while (kept.length > 0 && encodedBytes(kept + notice) > MAX_RESULT_BYTES) {
+      const ratio = MAX_RESULT_BYTES / encodedBytes(kept + notice);
+      // Strictly decreasing, so this terminates whatever the ratio says.
+      const next = Math.min(kept.length - 1, Math.max(0, Math.floor(kept.length * ratio * 0.98)));
+      kept = sliceWholeCharacters(kept, next);
+    }
+
+    last.truncated_bytes = dropped + Buffer.byteLength(last.result.slice(kept.length), 'utf8');
+    last.result = kept + notice;
   }
 
   return frames;
@@ -164,14 +182,20 @@ function fittingLength(text: string, pos: number, budget: number): number {
   const remaining = text.length - pos;
   let take = Math.min(remaining, budget);
 
-  // Bounded: each pass strictly reduces `take`, and the floor below is a length
-  // that cannot fail — six encoded bytes is the worst any code unit costs.
+  // Correct by the EXACT ratio. A safety factor here would look harmless and
+  // was not: shaving 2% off every chunk left several kilobytes of slack in each
+  // one, which silently absorbed the truncation notice below and made the test
+  // written to catch an oversized final chunk pass against the bug.
+  //
+  // Bounded regardless: each pass strictly reduces `take`, and the floor below
+  // is a length that cannot fail — six encoded bytes is the worst any code unit
+  // costs.
   for (let attempt = 0; attempt < 8; attempt++) {
     const candidate = sliceWholeCharacters(text.slice(pos, pos + take), take);
     const bytes = encodedBytes(candidate);
     if (bytes <= budget) return candidate.length;
 
-    const scaled = Math.floor(candidate.length * (budget / bytes) * 0.98);
+    const scaled = Math.floor(candidate.length * (budget / bytes));
     take = Math.max(1, Math.min(candidate.length - 1, scaled));
   }
 

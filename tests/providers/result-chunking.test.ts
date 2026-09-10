@@ -94,9 +94,16 @@ describe('splitting a tool result', () => {
     expect(last.truncated_bytes).toBeGreaterThan(0);
     expect(last.result).toContain('truncated by the bridge');
 
+    // The notice is paid for OUT of the final chunk's budget, not added on top.
+    // Appended on top it made the last chunk oversized, and an oversized chunk
+    // does not merely lose the notice — it goes down the frame guard's fallback
+    // path and the result never reassembles at all.
+    for (const frame of frames) {
+      expect(encoded(frame.result)).toBeLessThanOrEqual(MAX_RESULT_BYTES);
+    }
+
     const carried = frames.reduce((n, f) => n + Buffer.byteLength(f.result, 'utf8'), 0);
-    // The notice sits on top of the carried content, so allow for it.
-    expect(carried).toBeLessThanOrEqual(MAX_TOTAL_RESULT_BYTES + 200);
+    expect(carried).toBeLessThanOrEqual(MAX_TOTAL_RESULT_BYTES);
   });
 
   it('does not claim a truncation that did not happen', () => {
