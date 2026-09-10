@@ -948,7 +948,9 @@ A consumer that **stores** results has its own decision to make, separate from t
 
 None of that is the protocol's business, but the reasoning is worth stating: a database write that is too large tends to fail as a whole row, and a turn's prose is in the same row as its tool results. Losing the entire assistant message to one large `cat` is a worse outcome than a marked truncation.
 
-Two consequences a consumer should copy. **Spend a turn budget, do not zero it** — cutting one result must not make every later result in the turn store empty. And **say which bound was reached**: "this result was too large" is false about a small result that merely arrived after the budget was gone, and sends a reader at the wrong thing.
+Three consequences a consumer should copy. **Spend a turn budget, do not zero it** — cutting one result must not make every later result in the turn store empty. **Say which bound was reached**: "this result was too large" is false about a small result that merely arrived after the budget was gone, and sends a reader at the wrong thing. And **never replace content with a longer notice** — past the budget a truncation marker is bigger than a short result, so swapping one for the other grows the row it exists to shrink.
+
+That last rule makes a turn budget a target rather than a hard ceiling: once it is spent, short blocks are kept whole and the total can drift past it by up to a marker's length per block. The alternative is storing an empty result, which renders as "the tool returned nothing" — a false statement about a call that produced output. The reference server takes the drift and measures it: under 30 KB across a 500-call turn, against a `max_allowed_packet` counted in megabytes.
 
 Arguments are bounded by **structure**, not by cutting the text. Every key survives that can, and only values too large to carry are replaced, by an object saying what was there:
 
