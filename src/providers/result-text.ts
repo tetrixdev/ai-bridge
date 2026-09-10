@@ -76,7 +76,11 @@ export function boundResult(text: string): string {
  * this stopped being boundResult.
  */
 export function boundArgumentText(text: string): string {
-  return boundText(text, MAX_ARGUMENT_BYTES, (t) => Buffer.byteLength(t, 'utf8'));
+  // Escapes scrubbed here too. This text IS argument JSON, and a lone
+  // surrogate escape in it makes the consumer's json_decode reject the whole
+  // object — every argument lost, including the one that says what the call
+  // did. `boundArguments` did this and its text-shaped sibling did not.
+  return boundText(replaceLoneSurrogateEscapes(text), MAX_ARGUMENT_BYTES, (t) => Buffer.byteLength(t, 'utf8'));
 }
 
 function boundText(text: string, budget: number, measure: (text: string) => number): string {

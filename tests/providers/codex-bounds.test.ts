@@ -75,6 +75,35 @@ const toolCall = (args: unknown) => ({
 });
 
 describe('codex tool call arguments', () => {
+  it('bounds pre-stringified arguments at the ARGUMENT ceiling', async () => {
+    // 64KB in raw bytes, the number the consumer measures — not the 256KB
+    // result ceiling. The sibling path was fixed for exactly this; this one
+    // was missed.
+    const events = await replay([
+      { type: 'thread.started', thread_id: 't1' },
+      toolCall(JSON.stringify({ file_path: '/tmp/a', content: 'x'.repeat(150_000) })),
+      { type: 'turn.completed', usage: {} },
+    ]);
+
+    const delta = events.find((e) => e.event === 'block_delta');
+    const content = (delta!.data as { content: string }).content;
+    expect(Buffer.byteLength(content, 'utf8')).toBeLessThanOrEqual(65536);
+  });
+
+  it('scrubs a lone surrogate escape out of pre-stringified arguments', async () => {
+    // One makes the consumer's json_decode reject the WHOLE object, losing
+    // every argument including the one that says what the call did.
+    const events = await replay([
+      { type: 'thread.started', thread_id: 't1' },
+      toolCall('{"a":"\ud83d","path":"/etc/x"}'),
+      { type: 'turn.completed', usage: {} },
+    ]);
+
+    const content = (events.find((e) => e.event === 'block_delta')!.data as { content: string }).content;
+    expect(content).not.toContain('\ud83d');
+    expect(() => JSON.parse(content)).not.toThrow();
+  });
+
   it('bounds them when they arrive PRE-STRINGIFIED', async () => {
     const events = await replay([
       { type: 'thread.started', thread_id: 't1' },

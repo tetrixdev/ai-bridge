@@ -28,7 +28,7 @@ import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, 
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundArguments, boundResult, safeStringify } from './result-text.js';
+import { boundArgumentText, boundArguments, boundResult, safeStringify } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
@@ -430,7 +430,12 @@ export class CodexAdapter extends ProviderAdapter {
             // and it takes it OUTSIDE the ternary, because sitting inside it is
             // how that branch went out unbounded through two review rounds.
             const argsContent = typeof args === 'string'
-              ? boundResult(args)
+              // boundArgumentText, not boundResult: 64KB in raw bytes, the
+              // ceiling the consumer measures. The sibling path in
+              // claude-partial.ts was fixed for exactly this and this one was
+              // missed — the third time on this branch that one of a pair got
+              // the fix and the other did not.
+              ? boundArgumentText(args)
               : boundArguments(args ?? {});
 
             onEvent({
