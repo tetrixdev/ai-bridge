@@ -941,6 +941,7 @@ A consumer that **stores** results has its own decision to make, separate from t
 |---|---|---|
 | one stored result | 1 MB | a `cat` of a large file should not dominate a row |
 | one turn's blocks — **results and arguments together** | 8 MB | bounding results alone bounds nothing: the number of tool calls is the model's choice, and 200 calls at 64 KB of arguments is 12 MB on its own |
+| one turn's **prose** (text and thinking) | 4 MB, budgeted separately | it grows delta by delta with no ceiling of its own and shares the row; kept apart from tool output because an answer is what a reader came for, and cutting it to make room for a `cat` is the wrong trade |
 | one assembling result | 16 MB | held in memory until its final chunk arrives |
 | all assembling results at once | 32 MB | the sender picks the `tool_call_id` each buffer is keyed by, so the count is not the receiver's to choose |
 | results assembling at once | 64 | as above, for the number of buffers rather than their size |
