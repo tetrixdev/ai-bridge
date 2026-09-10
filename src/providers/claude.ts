@@ -815,13 +815,6 @@ function describePart(part: unknown): string {
 }
 
 /**
- * Keep the permission denials that fit, and say how many did not.
- *
- * Which tools were refused is the useful part — an empty answer with three
- * denials reads very differently from one with none — and that survives even
- * when the refused arguments do not.
- */
-/**
  * What the CLI reported about a turn, whether it succeeded or failed.
  *
  * @param result the CLI's `result` frame
@@ -857,6 +850,13 @@ function doneDataFrom(
   };
 }
 
+/**
+ * Keep the permission denials that fit, and say how many did not.
+ *
+ * Which tools were refused is the useful part — an empty answer with three
+ * denials reads very differently from one with none — and that survives even
+ * when the refused arguments do not.
+ */
 function boundDenials(denials: unknown[]): unknown[] {
   const BUDGET = 32 * 1024;
   const kept: unknown[] = [];
