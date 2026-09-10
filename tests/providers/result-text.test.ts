@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { boundArguments, boundResult, safeStringify, replaceLoneSurrogates, replaceLoneSurrogateEscapes, MAX_ARGUMENT_BYTES, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
+import { boundArgumentText, boundArguments, boundResult, safeStringify, replaceLoneSurrogates, replaceLoneSurrogateEscapes, MAX_ARGUMENT_BYTES, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
 
 /** What the whole stream frame costs once encoded, as bridge.ts sends it. */
 function frameBytes(result: string): number {
@@ -224,6 +224,32 @@ describe('replaceLoneSurrogateEscapes', () => {
       for (let i = 0; i < length; i += 1) text += pool[Math.floor(Math.random() * pool.length)];
       expect(replaceLoneSurrogateEscapes(text), text).toBe(REF(text));
     }
+  });
+});
+
+describe('boundArgumentText', () => {
+  it('spends the ceiling on content, not on escaping', () => {
+    // The argument budget is a RAW byte number — that is the unit every
+    // consumer measures it in. Measuring the JSON-escaped size instead spends
+    // the ceiling on quotes and newlines: a real Write, full of both, kept only
+    // 62% of what it was allowed.
+    const quoted = '{"content":"' + '"line\n'.repeat(40_000);
+
+    const bounded = boundArgumentText(quoted);
+    const kept = Buffer.byteLength(bounded, 'utf8');
+
+    expect(kept).toBeLessThanOrEqual(65536);
+    // Comfortably most of the ceiling, rather than the ~62% the escaped
+    // measurement left.
+    expect(kept).toBeGreaterThan(60_000);
+  });
+
+  it('still bounds plain text to the same ceiling', () => {
+    expect(Buffer.byteLength(boundArgumentText('z'.repeat(300_000)), 'utf8')).toBeLessThanOrEqual(65536);
+  });
+
+  it('leaves something short alone', () => {
+    expect(boundArgumentText('{"a":1}')).toBe('{"a":1}');
   });
 });
 

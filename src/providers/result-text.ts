@@ -59,18 +59,28 @@ function sliceWholeCharacters(text: string, end: number): string {
  * The marker is inside the budget, not added after it.
  */
 export function boundResult(text: string): string {
-  return boundText(text, MAX_RESULT_BYTES);
+  return boundText(text, MAX_RESULT_BYTES, encodedBytes);
 }
 
 /**
- * Bound text to an explicit budget.
+ * Bound text that is itself a tool call's arguments.
  *
- * Exported with the budget as an argument because there are two of them — a
- * result may be 256KB, a tool call's arguments only 64KB — and a caller that
- * reaches for `boundResult` on an argument path picks the wrong one silently.
+ * Measured in RAW bytes, because that is the unit every consumer uses for this
+ * budget — `strlen` on the recorded JSON, `TextEncoder` in the component. A
+ * result is different: it travels as a JSON string INSIDE the frame, so the
+ * escaped size is what counts against the frame cap.
+ *
+ * Getting that backwards silently spent the ceiling on escaping: a real `Write`
+ * full of quotes and newlines kept only 62% of what it was allowed. It is the
+ * same unit mistake made once for boundArguments, on the sibling path, when
+ * this stopped being boundResult.
  */
-export function boundText(text: string, budget: number): string {
-  return boundWellFormed(replaceLoneSurrogates(text), budget);
+export function boundArgumentText(text: string): string {
+  return boundText(text, MAX_ARGUMENT_BYTES, (t) => Buffer.byteLength(t, 'utf8'));
+}
+
+function boundText(text: string, budget: number, measure: (text: string) => number): string {
+  return boundWellFormed(replaceLoneSurrogates(text), budget, measure);
 }
 
 /**
@@ -118,8 +128,8 @@ export function replaceLoneSurrogates(text: string): string {
   return pieces.join('');
 }
 
-function boundWellFormed(text: string, budget: number): string {
-  if (encodedBytes(text) <= budget) return text;
+function boundWellFormed(text: string, budget: number, measure: (text: string) => number): string {
+  if (measure(text) <= budget) return text;
 
   const markerFor = (shown: number): string =>
     `\n…[truncated by the bridge: showing ${shown} of ${text.length} characters]`;
@@ -133,7 +143,7 @@ function boundWellFormed(text: string, budget: number): string {
   while (low < high) {
     const mid = Math.ceil((low + high) / 2);
     const candidate = sliceWholeCharacters(text, mid);
-    if (encodedBytes(candidate + markerFor(candidate.length)) <= budget) {
+    if (measure(candidate + markerFor(candidate.length)) <= budget) {
       low = mid;
     } else {
       high = mid - 1;
