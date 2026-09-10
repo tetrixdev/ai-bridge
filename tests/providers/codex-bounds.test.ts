@@ -217,6 +217,7 @@ describe("codex's own words for how a tool call ended", () => {
     },
   });
 
+  /** Replay one MCP call with these extra item fields and return its tool_result data. */
   async function resultFor(extra: Record<string, unknown>): Promise<Record<string, unknown>> {
     const events = await replay([
       { type: 'thread.started', thread_id: 't1' },
