@@ -124,6 +124,11 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
     sawDone: stream.some((f) => f.event === 'done'),
     spawned: bridgeLog.join('').includes('Executing Claude request'),
     text: stream.filter((f) => f.event === 'block_delta').map((f) => f.data.content).join(''),
+    // What the server was told about the tools that ran on this machine.
+    toolBlocks: stream.filter((f) => f.event === 'block_start' && f.data.block_type === 'tool_call')
+      .map((f) => ({ name: f.data.tool_name, id: f.data.tool_call_id })),
+    toolResults: stream.filter((f) => f.event === 'tool_result').map((f) => f.data),
+    doneData: stream.find((f) => f.event === 'done')?.data ?? null,
     // Arrival times of the text deltas, relative to the first stream frame.
     // Counting deltas alone cannot tell streaming apart from a CLI that
     // buffered the whole answer and flushed it in pieces at the end.
@@ -297,6 +302,39 @@ try {
     check('...while server-declared tools still work in isolated',
       r.toolCalled && /4471|Director/.test(r.text),
       `called=${r.toolCalled}, said: ${r.text.slice(0, 160)}`);
+
+    // Tool names and results. A tool that runs on this machine never reaches
+    // the server any other way — the block and its result are the only account
+    // of it there will ever be.
+    r = await turn({
+      isolation: 'workspace',
+      args: ['--allow-dir', repo],
+      request: aiRequest({
+        working_dir: repo,
+        message: 'Run these two shell commands with the Bash tool, in separate calls: '
+          + '`echo alpha`, then `echo beta`. Then reply with just: done.',
+      }),
+      timeoutMs: 300_000,
+    });
+
+    check('a locally-run tool reaches the server with its name',
+      r.toolBlocks.length >= 2 && r.toolBlocks.every((t) => t.name === 'Bash'),
+      `got ${JSON.stringify(r.toolBlocks)}`);
+
+    check('...and what it returned',
+      r.toolResults.some((x) => String(x.result).includes('alpha'))
+      && r.toolResults.some((x) => String(x.result).includes('beta')),
+      `got ${JSON.stringify(r.toolResults).slice(0, 200)}`);
+
+    check('...paired to the call that produced it',
+      r.toolResults.every((x) => r.toolBlocks.some((t) => t.id === x.tool_call_id)),
+      `call ids ${JSON.stringify(r.toolBlocks.map((t) => t.id))}`);
+
+    check('the turn reports its cache tokens, model and cost',
+      r.doneData?.usage?.cache_read_input_tokens > 0
+      && typeof r.doneData?.model === 'string'
+      && r.doneData?.cost_usd > 0,
+      `got ${JSON.stringify(r.doneData).slice(0, 200)}`);
 
     // Partial streaming. The unit tests replay captured output, so they prove
     // the mapping and nothing about whether the CLI actually chunks for us.

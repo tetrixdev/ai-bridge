@@ -33,6 +33,7 @@
 
 import type { AdapterStreamEvent } from './base.js';
 import { createLogger } from '../utils/logger.js';
+import { boundArgumentText, boundArguments } from './result-text.js';
 
 const log = createLogger('ClaudePartial');
 
@@ -354,13 +355,23 @@ export function normaliseToolArguments(buffered: string | undefined): string {
   if (raw === '') return '{}';
 
   try {
-    return JSON.stringify(JSON.parse(raw));
+    // Bounded by STRUCTURE: a Write call's arguments are a whole file, and an
+    // oversized frame tears down the connection rather than being dropped.
+    // Truncating the encoded text instead would make it stop parsing, and a
+    // consumer would then lose every argument including the small ones that
+    // matter most.
+    return boundArguments(JSON.parse(raw));
   } catch {
     // Truncated or malformed JSON — the CLI died mid-block, or the shape
     // changed. Forward it verbatim rather than inventing `{}`: a consumer that
     // fails to parse this can say so, where a silently empty argument object
     // would look like a tool deliberately called with no arguments.
     log.warn('Tool arguments did not parse as JSON — forwarding verbatim', { length: raw.length });
-    return raw;
+
+    // The ARGUMENT ceiling, not the result one. Bounding this at 256KB while
+    // the consumer caps arguments at 64KB is the same mismatch the frame paths
+    // were fixed for: rendered in full live, truncated on reload, and the two
+    // reporting sizes that differ by 4x.
+    return boundArgumentText(raw);
   }
 }

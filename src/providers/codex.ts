@@ -28,6 +28,7 @@ import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, 
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
+import { boundArgumentText, boundArguments, boundResult, safeStringify } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
@@ -419,9 +420,23 @@ export class CodexAdapter extends ProviderAdapter {
             // Argument payload — codex sometimes ships this pre-stringified,
             // sometimes as an object. Normalise to a JSON string so the chat
             // UI doesn't have to special-case the shape.
+            // The bound is OUTSIDE the ternary. Inside it, the pre-stringified
+            // branch — which the comment above says Codex sometimes takes —
+            // went out unbounded, and a 1.8MB argument payload then tore down
+            // the connection. Guarded too, for the readline listener.
+            // The object branch bounds by STRUCTURE, like the other adapters:
+            // keys survive and the result stays valid JSON. The pre-stringified
+            // branch has only text to work with, so it takes the text bound —
+            // and it takes it OUTSIDE the ternary, because sitting inside it is
+            // how that branch went out unbounded through two review rounds.
             const argsContent = typeof args === 'string'
-              ? args
-              : JSON.stringify(args ?? {});
+              // boundArgumentText, not boundResult: 64KB in raw bytes, the
+              // ceiling the consumer measures. The sibling path in
+              // claude-partial.ts was fixed for exactly this and this one was
+              // missed — the third time on this branch that one of a pair got
+              // the fix and the other did not.
+              ? boundArgumentText(args)
+              : boundArguments(args ?? {});
 
             onEvent({
               event: 'block_start',
@@ -449,7 +464,7 @@ export class CodexAdapter extends ProviderAdapter {
             const errorMsg = typeof errorField === 'string'
               ? errorField
               : errorField != null
-                ? JSON.stringify(errorField)
+                ? safeStringify(errorField, '"unserialisable error"')
                 : undefined;
 
             // Result. Codex emits a single combined item for begin+end of an
@@ -457,11 +472,26 @@ export class CodexAdapter extends ProviderAdapter {
             // tool_result follows immediately after the tool_call block.
             const resultText = status === 'error' || errorMsg
               ? `Error: ${errorMsg ?? 'tool call failed'}`
-              : (typeof result === 'string' ? result : JSON.stringify(result ?? null));
+              : (typeof result === 'string' ? result : safeStringify(result ?? null, 'null'));
 
             onEvent({
               event: 'tool_result',
-              data: { tool_call_id: toolCallId, result: resultText },
+              data: {
+                tool_call_id: toolCallId,
+                result: boundResult(resultText),
+                // Structural, alongside the `Error: ` prefix above rather than
+                // instead of it: the prefix stays for consumers that already
+                // read it, but a tool legitimately printing "Error: no matches"
+                // is indistinguishable from a failure by text alone.
+                //
+                // Set ONLY when Codex actually reported something. The protocol
+                // says absent means "not reported" and never "succeeded", so
+                // deriving `false` from a missing status would be an
+                // authoritative claim made out of nothing.
+                ...(typeof status === 'string' || errorMsg !== undefined
+                  ? { is_error: status === 'error' || errorMsg !== undefined }
+                  : {}),
+              },
             });
 
             log.info('Codex MCP tool call surfaced', {

@@ -34,6 +34,7 @@ import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt }
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
+import { boundArguments, boundResult, safeStringify } from './result-text.js';
 import { ClaudePartialStreamMapper } from './claude-partial.js';
 import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
@@ -266,6 +267,8 @@ export class ClaudeAdapter extends ProviderAdapter {
 
     return new Promise<string | null>((resolve, reject) => {
       let sessionId: string | null = null;
+      let model: string | null = null;
+      let providerVersion: string | null = null;
       let settled = false;
 
       // Owns the turn's block indices. Both paths allocate from it: partial
@@ -367,7 +370,71 @@ export class ClaudeAdapter extends ProviderAdapter {
         if (type === 'system' && (parsed as Record<string, unknown>)['subtype'] === 'init') {
           // Extract session ID from init event
           sessionId = (parsed['session_id'] as string) ?? null;
-          log.debug('Session init', { sessionId, model: parsed['model'] });
+          // The model the CLI actually resolved, and the CLI's own version.
+          // The server asks for an alias ("sonnet"); only this says what ran.
+          model = typeof parsed['model'] === 'string' ? parsed['model'] : null;
+          providerVersion = typeof parsed['claude_code_version'] === 'string'
+            ? parsed['claude_code_version']
+            : null;
+          log.debug('Session init', { sessionId, model, providerVersion });
+          return;
+        }
+
+        // Tool results. The CLI reports them on `user` frames, and the bridge
+        // used to drop them on the floor — so a server could see that a tool
+        // ran and never what it returned, while the Codex and Gemini adapters
+        // both forwarded theirs. The tool_use_id matches the tool_call_id
+        // already carried on the tool_call block, so a consumer can pair them.
+        if (type === 'user') {
+          const message = parsed['message'] as Record<string, unknown> | undefined;
+
+          if (settled) {
+            // The one path where a result vanishes. Correct — nothing may
+            // follow `done` — but it is exactly the backgrounded-sub-agent case
+            // this handling exists for, so a real occurrence must be
+            // diagnosable. The assistant handler logs its equivalent.
+            const ids = Array.isArray(message?.['content'])
+              ? (message['content'] as Array<Record<string, unknown>>)
+                .filter((e) => typeof e === 'object' && e !== null && e['type'] === 'tool_result')
+                .map((e) => e['tool_use_id'])
+              : [];
+            log.warn('Tool result received after stream settled — dropping', {
+              requestId, sessionId, toolCallIds: ids,
+            });
+
+            return;
+          }
+
+          const content = message?.['content'];
+          if (!Array.isArray(content)) return;
+
+          for (const entry of content as Array<Record<string, unknown>>) {
+            // Guarded because this runs inside the readline 'line' listener: a
+            // throw here is an uncaughtException, and the CLI installs no
+            // handler for those, so it would take down the daemon and every
+            // other turn on it — not merely fail this request.
+            if (typeof entry !== 'object' || entry === null) continue;
+            if (entry['type'] !== 'tool_result') continue;
+            const toolUseId = entry['tool_use_id'];
+            if (typeof toolUseId !== 'string') continue;
+
+            const isError = entry['is_error'];
+            // Through the deferral queue like every other whole-message event.
+            // A backgrounded sub-agent reports its results while the main agent
+            // is still writing, so emitting directly put tool output inside an
+            // open text block and delivered results before the block_start of
+            // the call they belong to — measured, 5 of 6 out of order on a real
+            // turn. The comment that used to say this could not happen was
+            // right only for foreground sub-agents.
+            emitWholeMessage({
+              event: 'tool_result',
+              data: {
+                tool_call_id: toolUseId,
+                result: flattenToolResult(entry['content']),
+                ...(typeof isError === 'boolean' ? { is_error: isError } : {}),
+              },
+            });
+          }
           return;
         }
 
@@ -499,7 +566,18 @@ export class ClaudeAdapter extends ProviderAdapter {
                 event: 'block_delta',
                 data: {
                   block_index: index,
-                  content: JSON.stringify(toolInput ?? {}),
+                  // Guarded for the same reason describePart is: this runs in
+                  // the readline listener, and a sub-agent's tool_use input
+                  // reaches here unstreamed, so a structure too deep to encode
+                  // would take down the daemon rather than fail one request.
+                  // Bounded like a result is. A sub-agent's Write call carries
+                  // a whole file as its arguments, and an oversized frame is
+                  // answered with a CLOSE_TOO_BIG that tears down the
+                  // connection — every in-flight request on the bridge with it.
+                  // boundArguments, not boundResult: this holds the parsed
+                  // object, so oversized VALUES can be replaced while every key
+                  // survives and the result stays valid JSON.
+                  content: boundArguments(toolInput ?? {}),
                 },
               });
 
@@ -550,17 +628,31 @@ export class ClaudeAdapter extends ProviderAdapter {
           }
 
           const usage = parsed['usage'] as Record<string, unknown> | undefined;
-          const inputTokens = usage ? (usage['input_tokens'] as number) ?? null : null;
-          const outputTokens = usage ? (usage['output_tokens'] as number) ?? null : null;
 
           settleBlocks();
           onEvent({
             event: 'done',
             data: {
               usage: {
-                input_tokens: inputTokens,
-                output_tokens: outputTokens,
+                input_tokens: num(usage?.['input_tokens']),
+                output_tokens: num(usage?.['output_tokens']),
+                cache_creation_input_tokens: num(usage?.['cache_creation_input_tokens']),
+                cache_read_input_tokens: num(usage?.['cache_read_input_tokens']),
               },
+              model,
+              provider_version: providerVersion,
+              stop_reason: typeof parsed['stop_reason'] === 'string' ? parsed['stop_reason'] : null,
+              cost_usd: num(parsed['total_cost_usd']),
+              duration_ms: num(parsed['duration_ms']),
+              duration_api_ms: num(parsed['duration_api_ms']),
+              num_turns: num(parsed['num_turns']),
+              // Bounded: each denial carries the refused call's whole input,
+              // so one denied large write would otherwise make the TERMINAL
+              // frame oversized — and a `done` that does not arrive hangs the
+              // request rather than costing one event.
+              ...(Array.isArray(parsed['permission_denials'])
+                ? { permission_denials: boundDenials(parsed['permission_denials']) }
+                : {}),
             },
           });
           settled = true;
@@ -573,9 +665,19 @@ export class ClaudeAdapter extends ProviderAdapter {
         // request mid-stream. A genuine hard rate-limit surfaces through the
         // result event / non-zero exit, which the normal error path handles.
         if (type === 'rate_limit_event') {
+          const info = parsed['rate_limit_info'];
           log.debug('Claude rate limit event (informational)', {
-            status: (parsed['rate_limit_info'] as Record<string, unknown> | undefined)?.['status'],
+            status: (info as Record<string, unknown> | undefined)?.['status'],
           });
+          // Forwarded, not just logged: how much of the operator's window is
+          // spent and when it resets is something the server can act on, and
+          // a log on someone else's machine is not.
+          if (!settled && typeof info === 'object' && info !== null) {
+            onEvent({
+              event: 'rate_limit',
+              data: { provider: 'claude', info: info as Record<string, unknown> },
+            });
+          }
           return;
         }
 
@@ -634,4 +736,114 @@ export class ClaudeAdapter extends ProviderAdapter {
     // Claude CLI has no dynamic model listing — return known aliases
     return CLAUDE_MODELS;
   }
+}
+
+/** Read a numeric field, or null when it is absent or not a number. */
+function num(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Reduce a tool result's content to the text a server can display.
+ *
+ * Claude sends this either as a plain string or as an array of content blocks,
+ * and the array form is what a tool returning structured output produces. A
+ * naive `String(content)` turns that into "[object Object]", which is worse
+ * than dropping it: the server would show something that looks like output.
+ */
+function flattenToolResult(content: unknown): string {
+  if (typeof content === 'string') return boundResult(content);
+  if (!Array.isArray(content)) return boundResult(content == null ? '' : describePart(content));
+
+  return boundResult(content
+    .map((part) => {
+      if (typeof part === 'string') return part;
+      if (typeof part === 'object' && part !== null) {
+        const text = (part as Record<string, unknown>)['text'];
+        if (typeof text === 'string') return text;
+      }
+      // A null element would otherwise render as the literal word "null".
+      if (part === null || part === undefined) return '';
+      return describePart(part);
+    })
+    .join(''));
+}
+
+/**
+ * Describe a result part that carries no text of its own.
+ *
+ * Only genuinely UNREADABLE parts are replaced: an image or audio block is
+ * megabytes of base64 — one screenshot measured at 617,411 characters against
+ * 2.1.261 — which is not output anyone can read and which a server cannot do
+ * anything with on this path. A file the assistant wants to hand back has its
+ * own route in the `attachment` event.
+ *
+ * Everything else is forwarded whole. An earlier version capped any non-text
+ * part at 4KB, which threw away exactly the readable structured output a
+ * server most wants — an MCP embedded resource carrying plain text became
+ * `[resource: 5 KB]` — and was a regression against forwarding it verbatim.
+ * Size is bounded once, on the assembled result, where the actual constraint
+ * lives.
+ */
+function describePart(part: unknown): string {
+  const record = typeof part === 'object' && part !== null ? part as Record<string, unknown> : {};
+  const type = typeof record['type'] === 'string' ? record['type'] as string : 'unknown';
+
+  // Three shapes carry binary, and only knowing one of them means a perfectly
+  // good MCP image reads as a broken one — or worse, an embedded resource's
+  // base64 blob is forwarded verbatim, which is the case this exists to stop.
+  //
+  //   Anthropic : { type: 'image', source: { media_type, data } }
+  //   MCP image : { type: 'image', mimeType, data }
+  //   MCP blob  : { type: 'resource', resource: { mimeType, blob } }
+  const resource = typeof record['resource'] === 'object' && record['resource'] !== null
+    ? record['resource'] as Record<string, unknown>
+    : undefined;
+  const source = typeof record['source'] === 'object' && record['source'] !== null
+    ? record['source'] as Record<string, unknown>
+    : undefined;
+  const holder = source ?? resource ?? record;
+  const binary = holder['data'] ?? holder['blob'];
+  const isBinary = type === 'image' || type === 'audio'
+    || (resource !== undefined && typeof holder['blob'] === 'string');
+
+  if (isBinary) {
+    const media = ['media_type', 'mimeType', 'mime_type']
+      .map((key) => holder[key])
+      .find((value): value is string => typeof value === 'string') ?? type;
+    // base64 is 4 characters per 3 bytes. A malformed part says so rather than
+    // reporting a confident "0 KB", which is indistinguishable from a tiny one.
+    const size = typeof binary === 'string'
+      ? `${Math.round((binary.length * 3) / 4 / 1024)} KB`
+      : 'size unknown';
+
+    return `[${type}: ${media}, ${size}]`;
+  }
+
+  return safeStringify(part, `[${type}: could not be serialised]`);
+}
+
+/**
+ * Keep the permission denials that fit, and say how many did not.
+ *
+ * Which tools were refused is the useful part — an empty answer with three
+ * denials reads very differently from one with none — and that survives even
+ * when the refused arguments do not.
+ */
+function boundDenials(denials: unknown[]): unknown[] {
+  const BUDGET = 32 * 1024;
+  const kept: unknown[] = [];
+  let used = 0;
+
+  for (const denial of denials) {
+    const size = Buffer.byteLength(safeStringify(denial, '{}'), 'utf8');
+    if (used + size > BUDGET) {
+      kept.push({ omitted: denials.length - kept.length, reason: 'too large to forward' });
+      break;
+    }
+    kept.push(denial);
+    used += size;
+  }
+
+  return kept;
 }
