@@ -331,15 +331,13 @@ try {
       r.toolResults.every((x) => r.toolBlocks.some((t) => t.id === x.tool_call_id)),
       `call ids ${JSON.stringify(r.toolBlocks.map((t) => t.id))}`);
 
-    // Finite, not positive. This checks that the bridge FORWARDS what the CLI
-    // reported, and a cold cache legitimately reports zero cache reads — as
-    // does a plan that bills nothing. Requiring a positive number makes the
-    // check fail for a reason that has nothing to do with what it is testing.
-    // Zero is legitimate — a cold cache reports no cache reads, and a plan can
-    // bill nothing — but negative is not, for a count or for money. Accepting
-    // it would let a regression that forwards -1 pass an end-to-end check.
+    // This checks that the bridge FORWARDS what the CLI reported, so zero is
+    // legitimate — a cold cache reports no cache reads, and a plan can bill
+    // nothing. Negative is not, for a count or for money: accepting it would
+    // let a regression that forwards -1 pass an end-to-end check.
     /** A reported count or amount: finite, and never negative. */
     const counted = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+
     // A result too large for one frame. The unit tests prove the splitter; only
     // this says whether a result that big ever reaches the wire, and whether
     // every piece survives a real WebSocket — where an oversized frame is not
