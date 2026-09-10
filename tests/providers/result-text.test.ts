@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { boundResult, safeStringify, replaceLoneSurrogates, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
+import { boundArguments, boundResult, safeStringify, replaceLoneSurrogates, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
 
 /** What the whole stream frame costs once encoded, as bridge.ts sends it. */
 function frameBytes(result: string): number {
@@ -23,9 +23,27 @@ function frameBytes(result: string): number {
 
 const SERVER_FRAME_CAP = 1024 * 1024;
 
-/** Local check — String.prototype.isWellFormed is ES2024, past this lib target. */
+/**
+ * An INDEPENDENT well-formedness check.
+ *
+ * Deliberately not `replaceLoneSurrogates(t) === t`, which is what this was
+ * first written as: defining the check in terms of the function under test
+ * makes every assertion using it a tautology, and substituting a no-op for the
+ * implementation left them all passing. Scans for an unpaired surrogate
+ * directly.
+ */
 function isWellFormed(text: string): boolean {
-  return replaceLoneSurrogates(text) === text;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xdc00 && code <= 0xdfff) return false;
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = i + 1 < text.length ? text.charCodeAt(i + 1) : 0;
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      i += 1;
+    }
+  }
+
+  return true;
 }
 
 describe('boundResult', () => {
@@ -132,5 +150,59 @@ describe('safeStringify', () => {
 
   it('falls back when the value encodes to undefined', () => {
     expect(safeStringify(undefined, '{}')).toBe('{}');
+  });
+});
+
+describe('boundArguments', () => {
+  it('leaves ordinary arguments as plain JSON', () => {
+    expect(boundArguments({ file_path: '/a', n: 1 })).toBe(JSON.stringify({ file_path: '/a', n: 1 }));
+  });
+
+  it('keeps the small keys and replaces only the oversized value', () => {
+    // The whole point. Truncating the encoded text loses every argument
+    // including `file_path`, which is twenty bytes and the most useful field
+    // there is for working out what a turn actually did.
+    const args = { file_path: '/etc/passwd', mode: 'overwrite', content: 'x'.repeat(2_000_000) };
+
+    const parsed = JSON.parse(boundArguments(args)) as Record<string, unknown>;
+
+    expect(parsed['file_path']).toBe('/etc/passwd');
+    expect(parsed['mode']).toBe('overwrite');
+    expect(parsed['content']).toHaveProperty('__truncated__');
+  });
+
+  it('stays valid JSON, which truncating the text cannot', () => {
+    const bounded = boundArguments({ a: 'y'.repeat(2_000_000) });
+    expect(() => JSON.parse(bounded)).not.toThrow();
+  });
+
+  it('says how big the value really was, and shows its start', () => {
+    const parsed = JSON.parse(boundArguments({ body: 'abcdefgh'.repeat(300_000) })) as
+      { body: { __truncated__: { bytes: number; head: string } } };
+
+    expect(parsed.body.__truncated__.bytes).toBeGreaterThan(2_000_000);
+    expect(parsed.body.__truncated__.head.startsWith('abcdefgh')).toBe(true);
+  });
+
+  it('sacrifices the fewest fields it can', () => {
+    // Largest first: one oversized value goes, the other large-but-affordable
+    // one stays.
+    const parsed = JSON.parse(boundArguments({
+      big: 'x'.repeat(2_000_000),
+      small: 'y'.repeat(1000),
+    })) as Record<string, unknown>;
+
+    expect(parsed['big']).toHaveProperty('__truncated__');
+    expect(parsed['small']).toBe('y'.repeat(1000));
+  });
+
+  it('falls back to bounding the text when there are no keys to preserve', () => {
+    const bounded = boundArguments('z'.repeat(2_000_000));
+    expect(bounded).toContain('truncated by the bridge');
+  });
+
+  it('keeps the frame under the server cap', () => {
+    const bounded = boundArguments({ content: String.fromCodePoint(0x4e16).repeat(1_000_000) });
+    expect(Buffer.byteLength(JSON.stringify(bounded), 'utf8')).toBeLessThan(SERVER_FRAME_CAP);
   });
 });

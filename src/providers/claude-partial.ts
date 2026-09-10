@@ -33,7 +33,7 @@
 
 import type { AdapterStreamEvent } from './base.js';
 import { createLogger } from '../utils/logger.js';
-import { boundResult } from './result-text.js';
+import { boundArguments, boundResult } from './result-text.js';
 
 const log = createLogger('ClaudePartial');
 
@@ -355,9 +355,12 @@ export function normaliseToolArguments(buffered: string | undefined): string {
   if (raw === '') return '{}';
 
   try {
-    // Bounded: a Write call's arguments are a whole file, and an oversized
-    // frame tears down the connection rather than being dropped.
-    return boundResult(JSON.stringify(JSON.parse(raw)));
+    // Bounded by STRUCTURE: a Write call's arguments are a whole file, and an
+    // oversized frame tears down the connection rather than being dropped.
+    // Truncating the encoded text instead would make it stop parsing, and a
+    // consumer would then lose every argument including the small ones that
+    // matter most.
+    return boundArguments(JSON.parse(raw));
   } catch {
     // Truncated or malformed JSON — the CLI died mid-block, or the shape
     // changed. Forward it verbatim rather than inventing `{}`: a consumer that

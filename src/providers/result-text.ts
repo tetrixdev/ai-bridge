@@ -76,7 +76,11 @@ export function boundResult(text: string): string {
  * surrogate — allocates nothing.
  */
 export function replaceLoneSurrogates(text: string): string {
-  let rebuilt: string[] | null = null;
+  // Spans, not per-character strings: rebuilding one string per code unit cost
+  // 300ms and 20MB on a large input, inside the readline listener this file's
+  // header says must not block.
+  let pieces: string[] | null = null;
+  let copiedTo = 0;
 
   for (let i = 0; i < text.length; i += 1) {
     const code = text.charCodeAt(i);
@@ -92,11 +96,15 @@ export function replaceLoneSurrogates(text: string): string {
       }
     }
 
-    if (rebuilt === null) rebuilt = Array.from({ length: text.length }, (_, n) => text[n] as string);
-    rebuilt[i] = '\ufffd';
+    if (pieces === null) pieces = [];
+    pieces.push(text.slice(copiedTo, i), '\ufffd');
+    copiedTo = i + 1;
   }
 
-  return rebuilt === null ? text : rebuilt.join('');
+  if (pieces === null) return text;
+  pieces.push(text.slice(copiedTo));
+
+  return pieces.join('');
 }
 
 function boundWellFormed(text: string): string {
@@ -136,4 +144,52 @@ export function safeStringify(value: unknown, fallback: string): string {
   } catch {
     return fallback;
   }
+}
+
+/**
+ * Bound a tool call's ARGUMENTS, keeping them valid JSON.
+ *
+ * Truncating the encoded string — which is what this used to do — is wrong in a
+ * way that is worse than the size problem it solved. The marker lands inside a
+ * JSON object, so the whole thing stops parsing, and a consumer then records
+ * "arguments could not be parsed" and loses ALL of them: a `Write` call's
+ * `file_path` is twenty bytes and the single most useful field for anyone
+ * auditing what happened, discarded because `content` was large.
+ *
+ * So the structure is bounded instead of the text. Every key survives; only the
+ * values too big to carry are replaced, by an object that says what was there.
+ * The result is still valid JSON, still has `file_path`, and still says plainly
+ * that something was cut.
+ */
+export function boundArguments(value: unknown): string {
+  const encoded = safeStringify(value, '{}');
+  if (encodedBytes(encoded) <= MAX_RESULT_BYTES) return encoded;
+
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    // Nothing keyed to preserve — fall back to bounding the text.
+    return boundResult(encoded);
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  // Largest first, so the fewest fields are sacrificed.
+  const bySize = [...entries].sort(
+    (a, b) => safeStringify(b[1], '""').length - safeStringify(a[1], '""').length,
+  );
+
+  const trimmed = new Map(entries);
+  for (const [key, original] of bySize) {
+    const asText = safeStringify(original, '""');
+    trimmed.set(key, {
+      __truncated__: {
+        bytes: Buffer.byteLength(asText, 'utf8'),
+        head: typeof original === 'string' ? original.slice(0, 200) : undefined,
+      },
+    });
+
+    const candidate = safeStringify(Object.fromEntries(trimmed), '{}');
+    if (encodedBytes(candidate) <= MAX_RESULT_BYTES) return candidate;
+  }
+
+  // Even the keys alone do not fit.
+  return safeStringify({ __truncated__: { bytes: Buffer.byteLength(encoded, 'utf8') } }, '{}');
 }

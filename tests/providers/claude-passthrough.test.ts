@@ -500,8 +500,20 @@ describe('tool call arguments', () => {
     });
 
     const delta = of(events, 'block_delta')[0]!;
+    const content = (delta.data as { content: string }).content;
+
     expect(frameBytes(delta)).toBeLessThan(1024 * 1024);
-    expect((delta.data as { content: string }).content).toContain('truncated by the bridge');
+
+    // Still valid JSON, and every key survives. Truncating the encoded TEXT
+    // instead makes it stop parsing, and a consumer then records "arguments
+    // could not be parsed" and loses all of them — including `file_path`,
+    // twenty bytes and the most useful field there is for working out what
+    // happened, thrown away because `content` was large.
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    expect(parsed['file_path']).toBe('/tmp/a');
+    expect(parsed['content']).toHaveProperty('__truncated__');
+    expect((parsed['content'] as { __truncated__: { bytes: number } }).__truncated__.bytes)
+      .toBeGreaterThan(1_000_000);
   });
 
   it('leaves ordinary arguments untouched', async () => {

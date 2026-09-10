@@ -56,7 +56,7 @@ import {
 } from '../mcp/cli-config.js';
 import { RequestRefusal } from '../errors.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundResult, safeStringify } from './result-text.js';
+import { boundArguments, boundResult, safeStringify } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
@@ -379,7 +379,7 @@ export class GeminiAdapter extends ProviderAdapter {
               block_index: blockIndex,
               // Guarded: an encode that throws inside the readline
               // listener would take down the daemon, not just this turn.
-              content: boundResult(safeStringify(parsed['parameters'] ?? {}, '{}')),
+              content: boundArguments(parsed['parameters'] ?? {}),
             },
           });
 

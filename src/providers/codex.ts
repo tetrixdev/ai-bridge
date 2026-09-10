@@ -420,11 +420,13 @@ export class CodexAdapter extends ProviderAdapter {
             // Argument payload — codex sometimes ships this pre-stringified,
             // sometimes as an object. Normalise to a JSON string so the chat
             // UI doesn't have to special-case the shape.
-            const argsContent = typeof args === 'string'
-              ? args
-              // Guarded: this runs in the readline listener, where a
-              // structure too deep to encode would take down the daemon.
-              : boundResult(safeStringify(args ?? {}, '{}'));
+            // The bound is OUTSIDE the ternary. Inside it, the pre-stringified
+            // branch — which the comment above says Codex sometimes takes —
+            // went out unbounded, and a 1.8MB argument payload then tore down
+            // the connection. Guarded too, for the readline listener.
+            const argsContent = boundResult(
+              typeof args === 'string' ? args : safeStringify(args ?? {}, '{}'),
+            );
 
             onEvent({
               event: 'block_start',

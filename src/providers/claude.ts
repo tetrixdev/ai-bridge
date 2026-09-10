@@ -34,7 +34,7 @@ import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt }
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundResult, safeStringify } from './result-text.js';
+import { boundArguments, boundResult, safeStringify } from './result-text.js';
 import { ClaudePartialStreamMapper } from './claude-partial.js';
 import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
@@ -574,7 +574,10 @@ export class ClaudeAdapter extends ProviderAdapter {
                   // a whole file as its arguments, and an oversized frame is
                   // answered with a CLOSE_TOO_BIG that tears down the
                   // connection — every in-flight request on the bridge with it.
-                  content: boundResult(safeStringify(toolInput ?? {}, '{}')),
+                  // boundArguments, not boundResult: this holds the parsed
+                  // object, so oversized VALUES can be replaced while every key
+                  // survives and the result stays valid JSON.
+                  content: boundArguments(toolInput ?? {}),
                 },
               });
 
