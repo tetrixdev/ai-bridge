@@ -209,6 +209,7 @@ describe('codex tool call arguments', () => {
  * the frame contradicts it.
  */
 describe("codex's own words for how a tool call ended", () => {
+  /** One completed MCP call item, with these fields folded in. */
   const mcpCall = (extra: Record<string, unknown>) => ({
     type: 'item.completed',
     item: {

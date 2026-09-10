@@ -1701,6 +1701,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   // Message Sending
   // -------------------------------------------------------------------------
 
+  /**
+   * Put one frame on the wire, or something smaller that says why not.
+   *
+   * The single serialisation point, and so the single place a frame's size can
+   * be checked once for every field it carries — including fields added later.
+   */
   private send(message: BridgeToServerMessage): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       log.warn('Cannot send message — WebSocket not open', { type: message.type });

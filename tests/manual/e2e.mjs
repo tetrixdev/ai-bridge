@@ -338,6 +338,7 @@ try {
     // Zero is legitimate — a cold cache reports no cache reads, and a plan can
     // bill nothing — but negative is not, for a count or for money. Accepting
     // it would let a regression that forwards -1 pass an end-to-end check.
+    /** A reported count or amount: finite, and never negative. */
     const counted = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
     // A result too large for one frame. The unit tests prove the splitter; only
     // this says whether a result that big ever reaches the wire, and whether

@@ -15,7 +15,9 @@ import {
   MAX_TOTAL_RESULT_BYTES,
 } from '../../src/providers/result-text.js';
 
+/** What a string costs on the wire: its length once JSON has encoded it. */
 const encoded = (text: string) => Buffer.byteLength(JSON.stringify(text), 'utf8');
+/** Join chunks back the way a consumer must: in order, with no separator. */
 const reassemble = (frames: { result: string }[]) => frames.map((f) => f.result).join('');
 
 describe('splitting a tool result', () => {
