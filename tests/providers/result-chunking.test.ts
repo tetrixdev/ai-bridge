@@ -102,7 +102,12 @@ describe('splitting a tool result', () => {
       expect(encoded(frame.result)).toBeLessThanOrEqual(MAX_RESULT_BYTES);
     }
 
-    const carried = frames.reduce((n, f) => n + Buffer.byteLength(f.result, 'utf8'), 0);
+    // Summed as JSON encodes it, because that is the unit the ceiling is
+    // written in. A raw-byte sum does not test the documented limit at all, and
+    // it hid that the truncation notice was being paid for out of the per-frame
+    // budget only — so replacing the final frame could push the whole result
+    // past the total ceiling.
+    const carried = frames.reduce((n, f) => n + encoded(f.result), 0);
     expect(carried).toBeLessThanOrEqual(MAX_TOTAL_RESULT_BYTES);
   });
 

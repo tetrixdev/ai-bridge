@@ -313,6 +313,26 @@ describe('a fallback frame must be well-formed, not merely small', () => {
     expect(/(?:^|[^\ud800-\udbff])[\udc00-\udfff]/.test(message)).toBe(false);
   });
 
+  it('does not put a lone surrogate back by slicing AFTER scrubbing', () => {
+    // Order matters and was inconsistent: `message` sliced then scrubbed,
+    // `code` scrubbed then sliced. Scrubbing first approves a pair the slice
+    // then cuts in half, so the terminal frame carries a lone surrogate after
+    // all — the exact failure the scrub was added to prevent.
+    const { bridge, sent } = bridgeWithFakeSocket();
+
+    send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'error',
+      // The emoji straddles the 200-code-unit cut.
+      data: { code: 'c'.repeat(199) + '😀', message: 'm'.repeat(2 * 1024 * 1024) },
+    });
+
+    expect(sent).toHaveLength(1);
+    const code = String((JSON.parse(sent[0]!) as { data: Record<string, unknown> }).data['code']);
+
+    expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(code)).toBe(false);
+    expect(/(?:^|[^\ud800-\udbff])[\udc00-\udfff]/.test(code)).toBe(false);
+  });
+
   it('bounds the error code as well as the message', () => {
     // Copied onto the same frame verbatim, an oversized code puts the terminal
     // back over the cap by another route.

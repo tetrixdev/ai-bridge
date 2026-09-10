@@ -375,10 +375,19 @@ try {
       r.toolCalled && resultFrames.length > 0,
       `called=${r.toolCalled}, ${resultFrames.length} result frames`);
 
-    check('every tool_result frame fits on the wire',
+    // The number PROTOCOL.md states for a result, not the frame guard's 900 KB
+    // backstop. Measured on the RESULT as JSON encodes it, which is the unit the
+    // cap is written in. Checking the whole frame against 900 KB would pass a
+    // regression emitting 500 KB results — out of contract, but under the
+    // backstop, so nothing would notice.
+    const MAX_RESULT_BYTES = 256 * 1024;
+    const resultBytes = (x) => Buffer.byteLength(JSON.stringify(x.result ?? ''), 'utf8');
+
+    check('every tool_result frame fits within the documented result size',
       resultFrames.length > 0
+      && resultFrames.every((x) => resultBytes(x) <= MAX_RESULT_BYTES)
       && resultFrames.every((x) => Buffer.byteLength(JSON.stringify(x), 'utf8') < 900 * 1024),
-      `largest ${Math.max(0, ...resultFrames.map((x) => Buffer.byteLength(JSON.stringify(x), 'utf8')))}`);
+      `largest result ${Math.max(0, ...resultFrames.map(resultBytes))} of ${MAX_RESULT_BYTES}`);
 
     // Either the CLI handed us the whole payload and we chunked it, or the CLI
     // cut it first. Both are correct. What must never happen is the BRIDGE

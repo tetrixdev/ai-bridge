@@ -1886,7 +1886,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
           // frame this whole path exists to guarantee, and the request would
           // hang to timeout anyway. `trySend` measures size; nothing measured
           // well-formedness.
-          code: replaceLoneSurrogates(String(data['code'] ?? 'provider_error')).slice(0, 200),
+          // Slice FIRST, then scrub. Scrubbing first and slicing after cuts a
+          // pair the scrub had just approved, putting a lone surrogate back —
+          // which was the order used for `code` and not for `message`, so one
+          // of the two was wrong.
+          code: replaceLoneSurrogates(String(data['code'] ?? 'provider_error').slice(0, 200)),
           message: replaceLoneSurrogates(String(data['message'] ?? '').slice(0, 2000)),
         },
       };

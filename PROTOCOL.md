@@ -935,7 +935,19 @@ If the stream ends before a `final` chunk arrives, keep what you have and mark i
 - A **whole result**, across all its chunks, is bounded at **16 MB of JSON-encoded bytes** — the wire cost, which is what the receiver has to hold. Past that the final chunk carries `truncated_bytes` (counting the raw content bytes dropped) and a marker. There has to be some limit: the reassembling side holds every chunk until the result completes, so an unbounded result is an unbounded allocation on a machine that did not choose to make it.
 - A **`tool_call` block's arguments** are bounded at **64 KB** — the same number the reference server caps them at, so that two truncations cannot compose and destroy each other's evidence. Arguments are not chunked; they are bounded by structure, below.
 
-A consumer that **stores** results has its own decision to make, separate from the transport. The reference server keeps a reassembled result whole in the live stream and bounds it at **1 MB** before writing it to the transcript, marking the cut with `result_truncated_bytes`. That is not the protocol's business, but it is worth saying why: a database write that is too large tends to fail as a whole row, and a turn's prose is in the same row as its tool results. Losing the entire assistant message to one large `cat` is a worse outcome than a marked truncation.
+A consumer that **stores** results has its own decision to make, separate from the transport, and needs more than one bound. The reference server keeps a reassembled result whole in the live stream and, before writing to the transcript, applies:
+
+| Bound | Value | Why |
+|---|---|---|
+| one stored result | 1 MB | a `cat` of a large file should not dominate a row |
+| one turn's blocks — **results and arguments together** | 8 MB | bounding results alone bounds nothing: the number of tool calls is the model's choice, and 200 calls at 64 KB of arguments is 12 MB on its own |
+| one assembling result | 16 MB | held in memory until its final chunk arrives |
+| all assembling results at once | 32 MB | the sender picks the `tool_call_id` each buffer is keyed by, so the count is not the receiver's to choose |
+| results assembling at once | 64 | as above, for the number of buffers rather than their size |
+
+None of that is the protocol's business, but the reasoning is worth stating: a database write that is too large tends to fail as a whole row, and a turn's prose is in the same row as its tool results. Losing the entire assistant message to one large `cat` is a worse outcome than a marked truncation.
+
+Two consequences a consumer should copy. **Spend a turn budget, do not zero it** — cutting one result must not make every later result in the turn store empty. And **say which bound was reached**: "this result was too large" is false about a small result that merely arrived after the budget was gone, and sends a reader at the wrong thing.
 
 Arguments are bounded by **structure**, not by cutting the text. Every key survives that can, and only values too large to carry are replaced, by an object saying what was there:
 

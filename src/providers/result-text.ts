@@ -145,9 +145,24 @@ export function toolResultFrames(text: string): ResultFrame[] {
     // has to come OUT of it. Appended on top it made the last chunk oversized —
     // and an oversized chunk does not merely lose the notice, it goes down the
     // frame guard's fallback path and the result never reassembles at all.
+    // Against BOTH budgets. The frame this replaces is already counted in
+    // `carried`, so paying for the notice out of the per-frame budget alone
+    // could push the whole result past the total ceiling.
+    //
+    // Belt and braces, and said plainly: I could not construct an input that
+    // reaches it. Every frame accepted before a ceiling break is full-size, so
+    // the aggregate budget is never tighter than the per-frame one, and
+    // removing this changes no output I could find. It stays because that is an
+    // argument about the shape of the search rather than a property of this
+    // function — and the last comment in this file that reasoned "the search
+    // cannot choose such a cut" was wrong, and cost a result the server
+    // rejected outright.
+    const aggregateBudget = MAX_TOTAL_RESULT_BYTES - (carried - encodedBytes(last.result));
+    const finalBudget = Math.min(MAX_RESULT_BYTES, aggregateBudget);
+
     let kept = last.result;
-    while (kept.length > 0 && encodedBytes(kept + notice) > MAX_RESULT_BYTES) {
-      const ratio = MAX_RESULT_BYTES / encodedBytes(kept + notice);
+    while (kept.length > 0 && encodedBytes(kept + notice) > finalBudget) {
+      const ratio = finalBudget / encodedBytes(kept + notice);
       // Strictly decreasing, so this terminates whatever the ratio says.
       const next = Math.min(kept.length - 1, Math.max(0, Math.floor(kept.length * ratio * 0.98)));
       kept = sliceWholeCharacters(kept, next);
