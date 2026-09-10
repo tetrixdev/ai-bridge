@@ -130,6 +130,11 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
       .map((f) => ({ name: f.data.tool_name, id: f.data.tool_call_id })),
     toolResults: stream.filter((f) => f.event === 'tool_result').map((f) => f.data),
     doneData: stream.find((f) => f.event === 'done')?.data ?? null,
+    // Every stream frame, verbatim, so a run can be replayed through the OTHER
+    // implementation. Every other check here reads the bridge's output with the
+    // bridge's own eyes; this is the only way to see whether the server can
+    // actually make sense of a real turn.
+    rawStream: stream.map((f) => ({ event: f.event, data: f.data })),
     // Arrival times of the text deltas, relative to the first stream frame.
     // Counting deltas alone cannot tell streaming apart from a CLI that
     // buffered the whole answer and flushed it in pieces at the end.
@@ -317,6 +322,11 @@ try {
       }),
       timeoutMs: 300_000,
     });
+
+    if (process.env['AI_BRIDGE_E2E_DUMP']) {
+      writeFileSync(process.env['AI_BRIDGE_E2E_DUMP'], JSON.stringify(r.rawStream, null, 2));
+      console.log(`        (wrote ${r.rawStream.length} frames to ${process.env['AI_BRIDGE_E2E_DUMP']})`);
+    }
 
     check('a locally-run tool reaches the server with its name',
       r.toolBlocks.length >= 2 && r.toolBlocks.every((t) => t.name === 'Bash'),
