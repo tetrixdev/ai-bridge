@@ -144,3 +144,46 @@ describe('the event data a provider emits', () => {
     }
   });
 });
+
+describe('the cut that arithmetic chooses, not the one that fits', () => {
+  const lone = /[\ud800-\udbff](?![\udc00-\udfff])|(?:^|[^\ud800-\udbff])[\udc00-\udfff]/;
+
+  it('never emits a lone surrogate, even where the ratio search gives up', () => {
+    // A dense run of control characters followed by ordinary text makes the
+    // exact-ratio correction converge too slowly to finish, so the length comes
+    // from the fallback floor. That floor returned a RAW code-unit count, so
+    // the cut landed mid-pair: JSON.stringify escapes each half to a literal
+    // \ud83d and PHP's json_decode rejects the WHOLE frame — both chunks either
+    // side of the split lost, not one character. Measured at 87% of one result.
+    const bodies = [
+      String.fromCharCode(1).repeat(40_000) + 'a'.repeat(3689) + '\u{1D11E}' + 'a'.repeat(400_000),
+      'a'.repeat(20_000) + String.fromCharCode(7).repeat(60_000) + '😀'.repeat(100_000),
+      String.fromCharCode(1).repeat(55_000) + '😀'.repeat(120_000),
+    ];
+
+    for (const body of bodies) {
+      const frames = toolResultFrames(body);
+
+      expect(reassemble(frames)).toBe(body);
+      for (const frame of frames) {
+        expect(lone.test(frame.result)).toBe(false);
+        expect(encoded(frame.result)).toBeLessThanOrEqual(MAX_RESULT_BYTES);
+      }
+    }
+  });
+
+  it('holds across byte-shifted variants of the same content', () => {
+    // One index passing proves nothing: the split depends on where the pair
+    // happens to land. Shifting the prefix by one byte at a time walks the
+    // boundary across every offset within a pair.
+    for (let shift = 0; shift < 8; shift++) {
+      const body = String.fromCharCode(1).repeat(40_000)
+        + 'a'.repeat(3689 + shift)
+        + '𝄞'.repeat(50_000);
+      const frames = toolResultFrames(body);
+
+      expect(reassemble(frames)).toBe(body);
+      expect(frames.some((f) => lone.test(f.result))).toBe(false);
+    }
+  });
+});

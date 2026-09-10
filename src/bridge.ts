@@ -67,6 +67,7 @@ import { resolveApiOrigin } from './attachments/origin.js';
 import { createLogger } from './utils/logger.js';
 import { clampRequestTimeout, clampHeartbeat } from './utils/clamp.js';
 import { FatalBridgeError, RequestRefusal } from './errors.js';
+import { replaceLoneSurrogates } from './providers/result-text.js';
 
 export { FatalBridgeError } from './errors.js';
 
@@ -1878,8 +1879,15 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         request_id: framed['request_id'],
         event: 'error',
         data: {
-          code: data['code'] ?? 'provider_error',
-          message: String(data['message'] ?? '').slice(0, 2000),
+          // Both scrubbed and bounded. `slice` cuts at a UTF-16 code unit and
+          // can leave half a surrogate pair, which `JSON.stringify` escapes to
+          // a literal `\ud83d` — valid UTF-8, valid-looking, and rejected
+          // OUTRIGHT by PHP's `json_decode`. That would destroy the terminal
+          // frame this whole path exists to guarantee, and the request would
+          // hang to timeout anyway. `trySend` measures size; nothing measured
+          // well-formedness.
+          code: replaceLoneSurrogates(String(data['code'] ?? 'provider_error')).slice(0, 200),
+          message: replaceLoneSurrogates(String(data['message'] ?? '').slice(0, 2000)),
         },
       };
     }

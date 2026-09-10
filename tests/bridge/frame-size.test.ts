@@ -291,3 +291,39 @@ describe('the fallbacks the guard itself produces', () => {
     expect(String(frame.data['message'])).toMatch(/\d{7} bytes/);
   });
 });
+
+describe('a fallback frame must be well-formed, not merely small', () => {
+  it('does not emit half a surrogate pair in a terminal error frame', () => {
+    // `slice` cuts at a UTF-16 code unit. Half a pair is escaped by
+    // JSON.stringify to a literal \ud83d — valid UTF-8, valid-looking, and
+    // rejected OUTRIGHT by PHP's json_decode. That destroys the terminal frame
+    // this path exists to guarantee, and the request hangs to timeout anyway.
+    // `trySend` measures size; nothing measured well-formedness.
+    const { bridge, sent } = bridgeWithFakeSocket();
+
+    send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'error',
+      data: { code: 'provider_error', message: 'a'.repeat(1999) + '😀' + 'b'.repeat(2 * 1024 * 1024) },
+    });
+
+    expect(sent).toHaveLength(1);
+    const message = String((JSON.parse(sent[0]!) as { data: Record<string, unknown> }).data['message']);
+
+    expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(message)).toBe(false);
+    expect(/(?:^|[^\ud800-\udbff])[\udc00-\udfff]/.test(message)).toBe(false);
+  });
+
+  it('bounds the error code as well as the message', () => {
+    // Copied onto the same frame verbatim, an oversized code puts the terminal
+    // back over the cap by another route.
+    const { bridge, sent } = bridgeWithFakeSocket();
+
+    send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'error',
+      data: { code: 'c'.repeat(2 * 1024 * 1024), message: 'short' },
+    });
+
+    expect(sent).toHaveLength(1);
+    expect(Buffer.byteLength(sent[0]!, 'utf8')).toBeLessThanOrEqual(900 * 1024);
+  });
+});

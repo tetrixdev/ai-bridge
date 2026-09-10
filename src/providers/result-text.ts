@@ -38,12 +38,14 @@ function encodedBytes(text: string): number {
  * surrogate" — the result is lost behind a protocol error pointing nowhere
  * near the size.
  *
- * Belt and braces, and worth being honest about: the search below cannot
- * currently choose such a cut. The escape costs six bytes where the intact pair
- * costs four, so a split is always more expensive than keeping the pair and
- * never fits where the pair did not. Measured — removing this guard changes no
- * output. It stays because that reasoning is a property of the search, and the
- * next person to change the search should not have to rediscover it.
+ * This guard is LOAD-BEARING, and the comment here used to say the opposite —
+ * that the search could never choose such a cut, and that removing the guard
+ * changed no output. Both claims were false. `fittingLength` picks its cut by
+ * arithmetic (`length * budget / bytes`), not by what fits, so it lands on an
+ * odd index straight through a pair as a matter of course; deleting the guard
+ * fails the chunking tests. Believing that false premise is exactly why the
+ * fallback path in `fittingLength` was written without going through here, and
+ * that shipped a result the server rejected outright.
  */
 function sliceWholeCharacters(text: string, end: number): string {
   const code = text.charCodeAt(end - 1);
@@ -97,9 +99,19 @@ export function toolResultFrames(text: string): ResultFrame[] {
   let carried = 0;
 
   while (pos < clean.length) {
+    // Cut here, not merely at the length `fittingLength` returned. The
+    // invariant belongs at the slice, so a later change to how the length is
+    // chosen cannot reintroduce a split pair — which is precisely how the last
+    // one got in.
     const take = fittingLength(clean, pos, MAX_RESULT_BYTES);
-    const piece = clean.slice(pos, pos + take);
-    const pieceBytes = Buffer.byteLength(piece, 'utf8');
+    const piece = sliceWholeCharacters(clean.slice(pos, pos + take), take);
+
+    // Cannot happen with a 256 KB budget, where one code unit always fits, but
+    // an empty piece would spin this loop for ever — inside the readline
+    // listener, where a stalled event loop never recovers.
+    if (piece.length === 0) break;
+
+    const pieceBytes = encodedBytes(piece);
 
     // The ceiling is on the assembled result, so it is checked before a piece
     // is added rather than after: going over and then trimming would mean the
@@ -108,7 +120,7 @@ export function toolResultFrames(text: string): ResultFrame[] {
 
     frames.push({ result: piece, chunk_index: frames.length, final: false });
     carried += pieceBytes;
-    pos += take;
+    pos += piece.length;
   }
 
   // Everything was too large for even one piece — vanishingly unlikely, since a
@@ -199,7 +211,14 @@ function fittingLength(text: string, pos: number, budget: number): number {
     take = Math.max(1, Math.min(candidate.length - 1, scaled));
   }
 
-  return Math.max(1, Math.min(remaining, Math.floor(budget / 6)));
+  // Six encoded bytes is the worst any code unit costs, so this always fits —
+  // but it has to be cut like every other cut. Returned raw, it split surrogate
+  // pairs: `JSON.stringify` then escapes each half to a literal `\ud83d`, and
+  // PHP's `json_decode` rejects the WHOLE frame, so both chunks either side of
+  // the split are lost rather than one character.
+  const floor = Math.max(1, Math.min(remaining, Math.floor(budget / 6)));
+
+  return sliceWholeCharacters(text.slice(pos, pos + floor), floor).length;
 }
 
 /**
@@ -401,6 +420,12 @@ export const MAX_ARGUMENT_BYTES = 64 * 1024;
  * it. 16 MB covers a very large build log with room to spare; past that a
  * consumer is better served by a marked truncation than by a server falling
  * over.
+ *
+ * Counted in JSON-ENCODED bytes, like the per-frame budget. Counting raw bytes
+ * let content escape at up to six bytes per code unit: a 16 MB result of
+ * control characters became 384 frames and 96 MB on the wire, built in 4.4
+ * seconds of synchronous work inside the readline listener. The number that
+ * needs bounding is what the wire and the receiver actually pay.
  */
 export const MAX_TOTAL_RESULT_BYTES = 16 * 1024 * 1024;
 
