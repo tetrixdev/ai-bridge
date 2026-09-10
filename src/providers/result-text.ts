@@ -62,6 +62,122 @@ export function boundResult(text: string): string {
   return boundText(text, MAX_RESULT_BYTES, encodedBytes);
 }
 
+/** One piece of a tool result, as it goes on the wire. */
+export interface ResultFrame {
+  result: string;
+  /** 0-based. Absent when the result fits in one frame. */
+  chunk_index?: number;
+  /** Absent when the result fits in one frame; true on the last chunk. */
+  final?: boolean;
+  /** On the final chunk only, when the total ceiling cut the result short. */
+  truncated_bytes?: number;
+}
+
+/**
+ * Split a tool result into frames that each fit on the wire.
+ *
+ * A result under the per-frame budget yields exactly ONE frame carrying no
+ * chunk fields — byte-identical to what the bridge sent before chunking
+ * existed, so a server that has never heard of chunks is unaffected by this
+ * change for every result it can already receive. Chunk fields appear only for
+ * results that would otherwise have been truncated, which is the one case
+ * where an older server was already being given something lossy.
+ *
+ * Pieces are cut on whole characters and measured as JSON encodes them, since
+ * a code unit costs between one and six bytes once escaped and a fixed ratio
+ * would be wrong in one direction or the other for most real content.
+ */
+export function toolResultFrames(text: string): ResultFrame[] {
+  const clean = replaceLoneSurrogates(text);
+
+  if (encodedBytes(clean) <= MAX_RESULT_BYTES) return [{ result: clean }];
+
+  const frames: ResultFrame[] = [];
+  let pos = 0;
+  let carried = 0;
+
+  while (pos < clean.length) {
+    const take = fittingLength(clean, pos, MAX_RESULT_BYTES);
+    const piece = clean.slice(pos, pos + take);
+    const pieceBytes = Buffer.byteLength(piece, 'utf8');
+
+    // The ceiling is on the assembled result, so it is checked before a piece
+    // is added rather than after: going over and then trimming would mean the
+    // reassembling side had already been asked to hold more than the limit.
+    if (carried + pieceBytes > MAX_TOTAL_RESULT_BYTES) break;
+
+    frames.push({ result: piece, chunk_index: frames.length, final: false });
+    carried += pieceBytes;
+    pos += take;
+  }
+
+  // Everything was too large for even one piece — vanishingly unlikely, since a
+  // piece is bounded below by one character, but a caller must never get an
+  // empty list and silently emit nothing at all.
+  if (frames.length === 0) {
+    return [{ result: boundResult(clean), chunk_index: 0, final: true }];
+  }
+
+  const last = frames[frames.length - 1]!;
+  last.final = true;
+
+  const dropped = Buffer.byteLength(clean.slice(pos), 'utf8');
+  if (dropped > 0) {
+    last.truncated_bytes = dropped;
+    last.result += `\n…[truncated by the bridge: ${dropped} further bytes over the ${MAX_TOTAL_RESULT_BYTES}-byte ceiling]`;
+  }
+
+  return frames;
+}
+
+/**
+ * The `data` payloads for one tool result, one per frame.
+ *
+ * `is_error` rides on EVERY chunk rather than only the last. It costs sixteen
+ * bytes and removes an ordering dependency: a consumer that sees a partial
+ * result — because the turn was cut short before the final chunk — still knows
+ * whether it is looking at a failure, which is exactly when that matters most.
+ */
+export function toolResultEventData(
+  toolCallId: string,
+  text: string,
+  isError?: boolean,
+): Array<Record<string, unknown>> {
+  const verdict = typeof isError === 'boolean' ? { is_error: isError } : {};
+
+  return toolResultFrames(text).map((frame) => ({
+    tool_call_id: toolCallId,
+    ...frame,
+    ...verdict,
+  }));
+}
+
+/**
+ * How many characters from `pos` still encode within `budget`.
+ *
+ * Guesses from the previous ratio and corrects downward, which settles in two
+ * or three measurements for real content — a binary search would re-encode a
+ * quarter-megabyte slice two dozen times per chunk, synchronously, in the
+ * readline listener this file's header says must not block.
+ */
+function fittingLength(text: string, pos: number, budget: number): number {
+  const remaining = text.length - pos;
+  let take = Math.min(remaining, budget);
+
+  // Bounded: each pass strictly reduces `take`, and the floor below is a length
+  // that cannot fail — six encoded bytes is the worst any code unit costs.
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = sliceWholeCharacters(text.slice(pos, pos + take), take);
+    const bytes = encodedBytes(candidate);
+    if (bytes <= budget) return candidate.length;
+
+    const scaled = Math.floor(candidate.length * (budget / bytes) * 0.98);
+    take = Math.max(1, Math.min(candidate.length - 1, scaled));
+  }
+
+  return Math.max(1, Math.min(remaining, Math.floor(budget / 6)));
+}
+
 /**
  * Bound text that is itself a tool call's arguments.
  *
@@ -250,6 +366,19 @@ export function replaceLoneSurrogateEscapes(json: string): string {
  * same mistake as two implementations of one rule.
  */
 export const MAX_ARGUMENT_BYTES = 64 * 1024;
+
+/**
+ * The largest whole tool result the bridge will carry, across all its chunks.
+ *
+ * A result over `MAX_RESULT_BYTES` is split rather than truncated, so this is
+ * the only remaining ceiling — and there has to be one. The reassembling side
+ * holds every chunk in memory until the result completes, so an unbounded
+ * result is an unbounded allocation on a machine that did not choose to make
+ * it. 16 MB covers a very large build log with room to spare; past that a
+ * consumer is better served by a marked truncation than by a server falling
+ * over.
+ */
+export const MAX_TOTAL_RESULT_BYTES = 16 * 1024 * 1024;
 
 /** How much of an oversized value to keep as a sample. */
 const HEAD_CHARS = 200;

@@ -45,7 +45,7 @@ function check(name, ok, detail = '') {
  * `isolation` of 'omit' leaves `cli_isolation` off the welcome entirely, which
  * is how a server predating this feature behaves.
  */
-async function turn({ isolation = 'workspace', request, args = [], assets = {}, tools = [], timeoutMs = 120_000 }) {
+async function turn({ isolation = 'workspace', request, args = [], assets = {}, tools = [], toolResult = null, timeoutMs = 120_000 }) {
   const frames = [];
   let advertised = null;
   let toolCalled = false;
@@ -97,7 +97,8 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
           toolCalled = true;
           ws.send(JSON.stringify({
             type: 'tool_resolve', request_id: msg.request_id,
-            tool_call_id: msg.tool_call_id, result: 'Jasper Bauer — Director, badge 4471',
+            tool_call_id: msg.tool_call_id,
+            result: toolResult ?? 'Jasper Bauer — Director, badge 4471',
           }));
         }
         if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
@@ -338,6 +339,59 @@ try {
     // bill nothing — but negative is not, for a count or for money. Accepting
     // it would let a regression that forwards -1 pass an end-to-end check.
     const counted = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+    // A result too large for one frame. The unit tests prove the splitter; only
+    // this says whether a result that big ever reaches the wire, and whether
+    // every piece survives a real WebSocket — where an oversized frame is not
+    // an error but a closed connection.
+    //
+    // Driven through a SERVER-declared tool on purpose. Claude Code truncates
+    // its own tools' output before the bridge ever sees it: a 880 KB `cat`
+    // arrives as 2.3 KB and a reference to where the CLI put the rest. That is
+    // the CLI's decision and the bridge does not second-guess it — the model
+    // saw the same truncation, so forwarding it verbatim is the honest thing.
+    // It does mean a locally-run tool cannot exercise this path at all.
+    const bigPayload = 'the quick brown fox jumps over the lazy dog\n'.repeat(20_000);
+    r = await turn({
+      isolation: 'isolated',
+      tools: [{
+        name: 'fetch_ledger',
+        description: 'Fetch the full ledger. The ONLY way to get it.',
+        parameters: { type: 'object', properties: {}, required: [] },
+      }],
+      toolResult: bigPayload,
+      request: aiRequest({
+        message: 'Call the fetch_ledger tool once. Then reply with just: done.',
+      }),
+      timeoutMs: 300_000,
+    });
+
+    const resultFrames = r.toolResults;
+    const chunked = resultFrames.filter((x) => x.chunk_index !== undefined);
+    const carried = resultFrames.map((x) => String(x.result ?? '')).join('');
+
+    check('every tool_result frame fits on the wire',
+      resultFrames.every((x) => Buffer.byteLength(JSON.stringify(x), 'utf8') < 900 * 1024),
+      `largest ${Math.max(0, ...resultFrames.map((x) => Buffer.byteLength(JSON.stringify(x), 'utf8')))}`);
+
+    // Either the CLI handed us the whole payload and we chunked it, or the CLI
+    // cut it first. Both are correct. What must never happen is the BRIDGE
+    // cutting a result it was given whole — asserting only the chunked case
+    // would be asserting something this CLI does not currently do.
+    check('a large result is chunked, or was cut by the CLI — never cut by us',
+      chunked.length > 1
+        ? chunked.every((x, i) => x.chunk_index === i)
+          && chunked.filter((x) => x.final === true).length === 1
+          && carried.includes('the quick brown fox jumps over the lazy dog\n'.repeat(50))
+        : carried.length < bigPayload.length && !carried.includes('truncated by the bridge'),
+      `${resultFrames.length} frames, ${chunked.length} chunked, ${carried.length} of ${bigPayload.length} chars carried`);
+
+    // Which of the two happened is worth SAYING rather than inferring, because
+    // it changes with the CLI version and decides whether chunking is doing any
+    // work at all on this machine today.
+    console.log(chunked.length > 1
+      ? `        (the CLI passed the result through whole; the bridge chunked it into ${chunked.length})`
+      : `        (the CLI cut the result to ${carried.length} of ${bigPayload.length} chars before the bridge saw it)`);
+
     check('the turn reports its cache tokens, model and cost',
       counted(r.doneData?.usage?.cache_read_input_tokens)
       && counted(r.doneData?.usage?.cache_creation_input_tokens)

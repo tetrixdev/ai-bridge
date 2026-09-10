@@ -56,7 +56,7 @@ import {
 } from '../mcp/cli-config.js';
 import { RequestRefusal } from '../errors.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundArguments, boundResult, safeStringify } from './result-text.js';
+import { boundArguments, safeStringify, toolResultEventData } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 /**
@@ -397,22 +397,19 @@ export class GeminiAdapter extends ProviderAdapter {
           const output = (parsed['output'] as string) ?? '';
           const status = parsed['status'] as string;
 
-          onEvent({
-            event: 'tool_result',
-            data: {
-              tool_call_id: toolId,
-              result: boundResult(status === 'error'
-                ? `Error: ${(parsed['error'] as Record<string, unknown>)?.['message'] ?? output}`
-                : output),
-              // Structural, alongside the `Error: ` prefix rather than instead
-              // of it — the prefix stays for consumers that already read it.
-              //
-              // Only when Gemini reported a status. Absent means "not
-              // reported", never "succeeded", so a missing status must not
-              // become an authoritative `false`.
-              ...(typeof status === 'string' ? { is_error: status === 'error' } : {}),
-            },
-          });
+          // `is_error` is structural, alongside the `Error: ` prefix rather
+          // than instead of it — the prefix stays for consumers that already
+          // read it. Passed only when Gemini reported a status: absent means
+          // "not reported", never "succeeded".
+          for (const data of toolResultEventData(
+            toolId,
+            status === 'error'
+              ? `Error: ${(parsed['error'] as Record<string, unknown>)?.['message'] ?? output}`
+              : output,
+            typeof status === 'string' ? status === 'error' : undefined,
+          )) {
+            onEvent({ event: 'tool_result', data });
+          }
           return;
         }
 

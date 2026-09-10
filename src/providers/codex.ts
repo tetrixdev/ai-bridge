@@ -28,7 +28,7 @@ import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, 
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundArgumentText, boundArguments, boundResult, safeStringify } from './result-text.js';
+import { boundArgumentText, boundArguments, safeStringify, toolResultEventData } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
@@ -483,25 +483,20 @@ export class CodexAdapter extends ProviderAdapter {
               ? `Error: ${errorMsg ?? 'tool call failed'}`
               : (typeof result === 'string' ? result : safeStringify(result ?? null, 'null'));
 
-            onEvent({
-              event: 'tool_result',
-              data: {
-                tool_call_id: toolCallId,
-                result: boundResult(resultText),
-                // Structural, alongside the `Error: ` prefix above rather than
-                // instead of it: the prefix stays for consumers that already
-                // read it, but a tool legitimately printing "Error: no matches"
-                // is indistinguishable from a failure by text alone.
-                //
-                // Set ONLY when Codex actually reported a VERDICT. The protocol
-                // says absent means "not reported" and never "succeeded", so
-                // deriving `false` from a missing status would be an
-                // authoritative claim made out of nothing — and `in_progress`
-                // is a status without being a verdict, so it claims nothing
-                // either.
-                ...(failed || succeeded ? { is_error: failed } : {}),
-              },
-            });
+            // `is_error` is structural, alongside the `Error: ` prefix above
+            // rather than instead of it: the prefix stays for consumers that
+            // already read it, but a tool legitimately printing "Error: no
+            // matches" is indistinguishable from a failure by text alone.
+            //
+            // Passed ONLY when Codex reported a VERDICT — absent means "not
+            // reported" and never "succeeded".
+            for (const data of toolResultEventData(
+              toolCallId,
+              resultText,
+              failed || succeeded ? failed : undefined,
+            )) {
+              onEvent({ event: 'tool_result', data });
+            }
 
             log.info('Codex MCP tool call surfaced', {
               server,

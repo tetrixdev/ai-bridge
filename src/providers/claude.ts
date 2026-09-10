@@ -34,7 +34,7 @@ import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt }
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundArguments, boundResult, safeStringify } from './result-text.js';
+import { boundArguments, safeStringify, toolResultEventData } from './result-text.js';
 import { ClaudePartialStreamMapper } from './claude-partial.js';
 import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
@@ -426,14 +426,13 @@ export class ClaudeAdapter extends ProviderAdapter {
             // the call they belong to — measured, 5 of 6 out of order on a real
             // turn. The comment that used to say this could not happen was
             // right only for foreground sub-agents.
-            emitWholeMessage({
-              event: 'tool_result',
-              data: {
-                tool_call_id: toolUseId,
-                result: flattenToolResult(entry['content']),
-                ...(typeof isError === 'boolean' ? { is_error: isError } : {}),
-              },
-            });
+            for (const data of toolResultEventData(
+              toolUseId,
+              flattenToolResult(entry['content']),
+              typeof isError === 'boolean' ? isError : undefined,
+            )) {
+              emitWholeMessage({ event: 'tool_result', data });
+            }
           }
           return;
         }
@@ -751,11 +750,17 @@ function num(value: unknown): number | null {
  * naive `String(content)` turns that into "[object Object]", which is worse
  * than dropping it: the server would show something that looks like output.
  */
+/**
+ * A tool result's content as one string.
+ *
+ * Deliberately NOT bounded here: the emit site splits it into frames, so
+ * bounding at this point would truncate a result that chunking can carry whole.
+ */
 function flattenToolResult(content: unknown): string {
-  if (typeof content === 'string') return boundResult(content);
-  if (!Array.isArray(content)) return boundResult(content == null ? '' : describePart(content));
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return content == null ? '' : describePart(content);
 
-  return boundResult(content
+  return (content
     .map((part) => {
       if (typeof part === 'string') return part;
       if (typeof part === 'object' && part !== null) {

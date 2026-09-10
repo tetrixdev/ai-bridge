@@ -361,25 +361,58 @@ describe('results that are not text', () => {
     expect(result).not.toContain('[resource:');
   });
 
-  it('bounds an enormous result, and says it did', async () => {
-    // A `cat` of a large file is likelier than a screenshot, and an oversized
-    // frame fails as a DROPPED WebSocket message — the server gets nothing and
-    // has no error to act on. A marked truncation is strictly better.
+  it('carries an enormous result WHOLE, in chunks', async () => {
+    // A `cat` of a large file is likelier than a screenshot. This used to be
+    // truncated at 256 KB with a marker; it now crosses in pieces and arrives
+    // complete, which is the point of chunking.
+    const body = 'z'.repeat(900_000);
     const events = await replay({
       lines: [
         { type: 'system', subtype: 'init', session_id: 's' },
         {
           type: 'user',
-          message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'z'.repeat(900_000) }] },
+          message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: body }] },
         },
         { type: 'result', subtype: 'success', session_id: 's', usage: {} },
       ],
     });
 
-    const result = (of(events, 'tool_result')[0]!.data as { result: string }).result;
-    expect(result.length).toBeLessThan(600_000);
-    expect(result).toContain('truncated by the bridge');
-    expect(result).toContain('900000 characters');
+    const chunks = of(events, 'tool_result').map((e) => e.data as Record<string, unknown>);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((c) => c['tool_call_id'] === 't1')).toBe(true);
+    expect(chunks.map((c) => c['chunk_index'])).toEqual(chunks.map((_, i) => i));
+    expect(chunks.slice(0, -1).every((c) => c['final'] === false)).toBe(true);
+    expect(chunks[chunks.length - 1]!['final']).toBe(true);
+
+    // Nothing lost and nothing added: reassembling gives back the original.
+    expect(chunks.map((c) => String(c['result'])).join('')).toBe(body);
+
+    // And every chunk fits on the wire on its own.
+    for (const chunk of chunks) {
+      expect(Buffer.byteLength(JSON.stringify(chunk), 'utf8')).toBeLessThan(900 * 1024);
+    }
+  });
+
+  it('leaves a result that fits in one frame exactly as it was', async () => {
+    // The wire shape for an ordinary result must not change: a server that has
+    // never heard of chunking sees no difference for anything it can already
+    // receive.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'small' }] },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    const chunks = of(events, 'tool_result');
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]!.data).toEqual({ tool_call_id: 't1', result: 'small' });
   });
 
   it('says so when an image part is malformed, rather than claiming 0 KB', async () => {

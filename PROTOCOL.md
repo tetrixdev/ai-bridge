@@ -902,10 +902,38 @@ What a tool returned. Emitted for **both** kinds of tool call:
 
 `is_error` is the authoritative failure signal, and is **absent when the provider did not report one** — absent never means "succeeded". Do not infer failure from the text: a tool legitimately printing `Error: no matches` is indistinguishable from one that failed. (For historical reasons the Codex and Gemini adapters additionally prefix `Error: ` onto a failed result; that prefix is not a substitute for the field.)
 
-**Size.** Two different ceilings, because the two are stored differently:
+##### Chunked results
 
-- A **result** is bounded at 256 KB of JSON-encoded bytes, and anything longer arrives truncated with a marker naming the original length.
-- A **`tool_call` block's arguments** are bounded at **64 KB** — the same number the reference server caps them at, so that two truncations cannot compose and destroy each other's evidence.
+A result larger than one frame arrives **in pieces**, keyed by `tool_call_id`:
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "tool_result",
+  "data": {
+    "tool_call_id": "toolu_01SXtmUHX3mr4tSyyHMNNxsv",
+    "result": "…the first 256 KB…",
+    "chunk_index": 0,
+    "final": false,
+    "is_error": false
+  }
+}
+```
+
+- **`chunk_index`** — 0-based, ascending, one sequence per `tool_call_id`. Two calls can chunk at the same time, so a consumer must key its buffer by the call id and not by arrival order.
+- **`final`** — `true` on the last chunk and only then. Concatenate `result` in index order; the join is exact, with no separator.
+- **`truncated_bytes`** — on the final chunk only, and only when the whole result exceeded the 16 MB ceiling below. It names how many bytes were dropped.
+
+**A result that fits in one frame carries neither `chunk_index` nor `final`** — the shape this event has always had. Chunk fields appear only where a result would previously have been truncated, so a consumer written before chunking existed sees no change to anything it could already receive.
+
+If the stream ends before a `final` chunk arrives, keep what you have and mark it partial. Discarding it loses the only account of what the tool did, which is the thing this event exists to carry.
+
+**Size.** Three ceilings:
+
+- A **single frame's result** holds at most 256 KB of JSON-encoded bytes. Longer results are chunked, not cut.
+- A **whole result**, across all its chunks, is bounded at **16 MB**. Past that the final chunk carries `truncated_bytes` and a marker. There has to be some limit: the reassembling side holds every chunk until the result completes, so an unbounded result is an unbounded allocation on a machine that did not choose to make it.
+- A **`tool_call` block's arguments** are bounded at **64 KB** — the same number the reference server caps them at, so that two truncations cannot compose and destroy each other's evidence. Arguments are not chunked; they are bounded by structure, below.
 
 Arguments are bounded by **structure**, not by cutting the text. Every key survives that can, and only values too large to carry are replaced, by an object saying what was there:
 
