@@ -536,7 +536,7 @@ describe('tool call arguments', () => {
 describe('what the turn cost and how it ran', () => {
   it('reports the cache tokens, which dominate a resumed conversation', async () => {
     const events = await replay({ fixture: 'claude-tool-results-turn.ndjson' });
-    const usage = (of(events, 'done')[0]!.data as { usage: Record<string, number | null> }).usage;
+    const usage = (of(events, 'done')[0]!.data as unknown as { usage: Record<string, number | null> }).usage;
 
     // In this real turn the cache read is four orders of magnitude larger than
     // the input count. A server shown only input/output understates it wildly.
