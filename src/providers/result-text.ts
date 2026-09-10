@@ -260,6 +260,20 @@ function valueBytes(value: unknown): number {
 }
 
 /**
+ * What a key costs once JSON has encoded it, quotes included.
+ *
+ * The raw byte length is not that number: a key holding a quote, a backslash or
+ * a control character grows on encoding — a control character by six. Values
+ * have always been measured encoded (above); keys were not, so an object could
+ * pass the estimate and fail the real check, at which point the keep-what-fits
+ * path discards every sibling argument to make room for a size that was never
+ * really there.
+ */
+function keyBytes(key: string): number {
+  return Buffer.byteLength(JSON.stringify(key), 'utf8');
+}
+
+/**
  * Cut to a length that does not split a surrogate pair.
  *
  * Belt and braces since `replaceLoneSurrogateEscapes` runs over the encoded
@@ -329,7 +343,7 @@ function shrinkEntries(
   const sized = entries.map(([key, value]) => ({
     key: String(key),
     value,
-    bytes: valueBytes(value) + Buffer.byteLength(String(key), 'utf8') + 4,
+    bytes: valueBytes(value) + keyBytes(String(key)) + 2,
   }));
 
   let total = sized.reduce((sum, e) => sum + e.bytes, 2);
@@ -339,7 +353,7 @@ function shrinkEntries(
     if (total <= budget) break;
 
     const shrunkValue = shrinkValue(entry.value, Math.max(budget - (total - entry.bytes), 0), depth);
-    const shrunkBytes = valueBytes(shrunkValue) + Buffer.byteLength(entry.key, 'utf8') + 4;
+    const shrunkBytes = valueBytes(shrunkValue) + keyBytes(entry.key) + 2;
     // Replacing many small values with markers makes the object BIGGER, which
     // is how the first version looped over every key and still did not fit.
     if (shrunkBytes >= entry.bytes) continue;
@@ -359,7 +373,7 @@ function shrinkEntries(
   let used = 2;
   for (const entry of sized) {
     const value = replaced.has(entry.key) ? replaced.get(entry.key) : entry.value;
-    const bytes = valueBytes(value) + Buffer.byteLength(entry.key, 'utf8') + 4;
+    const bytes = valueBytes(value) + keyBytes(entry.key) + 2;
     if (used + bytes > budget - 80) break;
     kept.push([entry.key, value]);
     used += bytes;

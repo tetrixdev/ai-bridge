@@ -470,7 +470,16 @@ export class CodexAdapter extends ProviderAdapter {
             // Result. Codex emits a single combined item for begin+end of an
             // MCP call (unlike local_shell_call which is split), so the
             // tool_result follows immediately after the tool_call block.
-            const resultText = status === 'error' || errorMsg
+            // Codex's own vocabulary for an MCP call is `in_progress` /
+            // `completed` / `failed` (openai/codex, sdk/typescript/src/items.ts);
+            // older builds said `error`. Reading ONLY `error` meant a `failed`
+            // call with no `error` field was reported as a success — the exact
+            // inversion a consumer cannot recover from, since nothing else in
+            // the frame contradicts it.
+            const failed = status === 'failed' || status === 'error' || errorMsg !== undefined;
+            const succeeded = status === 'completed' && errorMsg === undefined;
+
+            const resultText = failed
               ? `Error: ${errorMsg ?? 'tool call failed'}`
               : (typeof result === 'string' ? result : safeStringify(result ?? null, 'null'));
 
@@ -484,13 +493,13 @@ export class CodexAdapter extends ProviderAdapter {
                 // read it, but a tool legitimately printing "Error: no matches"
                 // is indistinguishable from a failure by text alone.
                 //
-                // Set ONLY when Codex actually reported something. The protocol
+                // Set ONLY when Codex actually reported a VERDICT. The protocol
                 // says absent means "not reported" and never "succeeded", so
                 // deriving `false` from a missing status would be an
-                // authoritative claim made out of nothing.
-                ...(typeof status === 'string' || errorMsg !== undefined
-                  ? { is_error: status === 'error' || errorMsg !== undefined }
-                  : {}),
+                // authoritative claim made out of nothing — and `in_progress`
+                // is a status without being a verdict, so it claims nothing
+                // either.
+                ...(failed || succeeded ? { is_error: failed } : {}),
               },
             });
 

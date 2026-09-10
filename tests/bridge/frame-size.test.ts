@@ -149,3 +149,95 @@ describe('the frame size guard', () => {
     expect(sent).toHaveLength(0);
   });
 });
+
+describe('the fallbacks the guard itself produces', () => {
+  const MAX = 900 * 1024;
+
+  it('does not send a stripped `done` that is STILL oversized', () => {
+    // The bug this covers: `stripToEssentials` keeps `usage` and
+    // `cli_session_id`, both straight from the provider and neither bounded
+    // anywhere, and the stripped frame went out without ever being measured.
+    // A guard that answers one oversized frame with another it did not measure
+    // closes the connection exactly as if it were not there.
+    const { bridge, sent } = bridgeWithFakeSocket();
+
+    send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'done',
+      data: {
+        usage: { input_tokens: 1 },
+        cli_session_id: 's'.repeat(2 * 1024 * 1024),
+        permission_denials: ['x'.repeat(1024)],
+      },
+    });
+
+    for (const payload of sent) {
+      expect(Buffer.byteLength(payload, 'utf8')).toBeLessThanOrEqual(MAX);
+    }
+  });
+
+  it('still ends the turn when the oversized field was the session id', () => {
+    // Dropping `done` hangs the request until a timeout, so the guard must fall
+    // through to a smaller terminal rather than give up at the first miss.
+    const { bridge, sent } = bridgeWithFakeSocket();
+
+    send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'done',
+      data: { usage: { input_tokens: 1 }, cli_session_id: 's'.repeat(2 * 1024 * 1024) },
+    });
+
+    expect(sent).toHaveLength(1);
+    const frame = JSON.parse(sent[0]!) as { event: string; request_id: string; data: Record<string, unknown> };
+
+    expect(frame.event).toBe('done');
+    expect(frame.request_id).toBe('r1');
+    expect(frame.data['cli_session_id']).toBeNull();
+  });
+
+  it('keeps usage when usage is not what made the frame too big', () => {
+    // The degradation is ordered, not blanket: the informative fallback is
+    // tried first and only dropped when it does not fit.
+    const { bridge, sent } = bridgeWithFakeSocket();
+
+    send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'done',
+      data: {
+        usage: { input_tokens: 7, output_tokens: 9 },
+        cli_session_id: 'sess-1',
+        permission_denials: ['x'.repeat(2 * 1024 * 1024)],
+      },
+    });
+
+    const frame = JSON.parse(sent[0]!) as { data: Record<string, unknown> };
+
+    expect(frame.data['usage']).toEqual({ input_tokens: 7, output_tokens: 9 });
+    expect(frame.data['cli_session_id']).toBe('sess-1');
+    expect(frame.data).not.toHaveProperty('permission_denials');
+  });
+
+  it('sends nothing at all when even the notice cannot fit', () => {
+    // A request id larger than the cap leaves no correlatable frame to send.
+    // Sending an oversized one anyway is the failure the guard exists to
+    // prevent, and the connection matters more than this one request.
+    const { bridge, sent } = bridgeWithFakeSocket();
+
+    send(bridge, {
+      type: 'stream', request_id: 'r'.repeat(2 * 1024 * 1024), event: 'block_delta',
+      data: { block_index: 0, content: 'x'.repeat(2 * 1024 * 1024) },
+    });
+
+    expect(sent).toHaveLength(0);
+  });
+
+  it('sends nothing oversized for an error frame either', () => {
+    const { bridge, sent } = bridgeWithFakeSocket();
+
+    send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'error',
+      data: { code: 'provider_error', message: 'm'.repeat(2 * 1024 * 1024) },
+    });
+
+    expect(sent).toHaveLength(1);
+    expect(Buffer.byteLength(sent[0]!, 'utf8')).toBeLessThanOrEqual(MAX);
+    expect(JSON.parse(sent[0]!)).toMatchObject({ event: 'error', request_id: 'r1' });
+  });
+});

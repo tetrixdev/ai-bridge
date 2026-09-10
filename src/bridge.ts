@@ -1728,21 +1728,90 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // a worse outcome than the oversized frame this guard exists to prevent
       // — and reachable, because `permission_denials` carries each refused
       // call's whole input, so one denied large write is enough.
-      const stripped = this.stripToEssentials(message);
-      if (stripped !== null) {
-        this.ws.send(JSON.stringify(stripped));
-        log.warn('Sent a terminal frame with its payload stripped', { type: message.type, bytes });
+      //
+      // Every fallback below goes through `trySend`, which measures. A guard
+      // that replaces one oversized frame with another it never measured is
+      // not a guard: `stripToEssentials` keeps `usage` and `cli_session_id`,
+      // both provider-supplied and neither bounded anywhere, so the stripped
+      // frame CAN still be over the cap — and then closes the connection
+      // exactly as if the guard were not here.
+      for (const fallback of this.fallbacksFor(message)) {
+        if (this.trySend(fallback)) {
+          log.warn('Sent a reduced frame in place of an oversized one', { type: message.type, bytes });
 
-        return;
+          return;
+        }
       }
 
-      this.sendOversizedFrameNotice(message, bytes);
+      // Nothing that carries the request id fits, which means the id itself is
+      // the size problem. There is no frame left to send — every one would be
+      // uncorrelatable or oversized — so the connection survives and the
+      // request times out, which is the least bad of three bad outcomes.
+      log.error('Could not reduce a frame to a sendable size', { type: message.type, bytes });
 
       return;
     }
 
     this.ws.send(payload);
     log.debug('Message sent', { type: message.type, bytes });
+  }
+
+  /**
+   * Send a frame only if it fits. Returns whether it went.
+   *
+   * The single measuring point for everything the oversize path produces, so a
+   * new fallback cannot be added without being measured.
+   */
+  private trySend(frame: Record<string, unknown>): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+
+    let payload: string;
+    try {
+      payload = JSON.stringify(frame);
+    } catch {
+      return false;
+    }
+
+    if (Buffer.byteLength(payload, 'utf8') > MAX_FRAME_BYTES) return false;
+
+    this.ws.send(payload);
+
+    return true;
+  }
+
+  /**
+   * Ever-smaller stand-ins for a frame that will not fit, most informative
+   * first. The last one carries nothing but the request id and a reason, so it
+   * fits unless the id alone does not.
+   */
+  private *fallbacksFor(message: BridgeToServerMessage): Generator<Record<string, unknown>> {
+    const stripped = this.stripToEssentials(message);
+    if (stripped !== null) {
+      yield stripped;
+
+      // `usage` and `cli_session_id` are what the server acts on, so they are
+      // worth one attempt — but they come from the provider, and a terminal
+      // frame that cannot be sent at all costs more than either.
+      const data = (stripped['data'] ?? {}) as Record<string, unknown>;
+      yield {
+        ...stripped,
+        data: { ...data, usage: null, cli_session_id: null },
+      };
+    }
+
+    const requestId = (message as { request_id?: string }).request_id;
+    if (requestId === undefined) return;
+
+    const event = (message as { event?: string }).event ?? message.type;
+    yield {
+      type: 'stream',
+      request_id: requestId,
+      event: 'error',
+      data: {
+        code: 'frame_too_large',
+        message: `The bridge dropped a ${event} frame over the ${MAX_FRAME_BYTES}-byte limit.`,
+      },
+    };
   }
 
   /**
@@ -1786,35 +1855,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
 
     return null;
-  }
-
-  /**
-   * Tell the server that a frame was too large, in a frame that is not.
-   *
-   * Losing one event is bad; losing the connection is worse, and losing it
-   * silently is worst — the server sees a turn stop mid-answer with nothing to
-   * explain it.
-   */
-  private sendOversizedFrameNotice(message: BridgeToServerMessage, bytes: number): void {
-    const requestId = (message as { request_id?: string }).request_id;
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || requestId === undefined) return;
-
-    const event = (message as { event?: string }).event ?? message.type;
-    try {
-      this.ws.send(JSON.stringify({
-        type: 'stream',
-        request_id: requestId,
-        event: 'error',
-        data: {
-          code: 'frame_too_large',
-          message: `The bridge dropped a ${event} frame of ${bytes} bytes, over the ${MAX_FRAME_BYTES}-byte limit.`,
-        },
-      }));
-    } catch (err) {
-      log.error('Could not report the oversized frame', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
   }
 
   /**

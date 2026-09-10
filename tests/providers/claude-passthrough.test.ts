@@ -536,14 +536,20 @@ describe('tool call arguments', () => {
 describe('what the turn cost and how it ran', () => {
   it('reports the cache tokens, which dominate a resumed conversation', async () => {
     const events = await replay({ fixture: 'claude-tool-results-turn.ndjson' });
-    const usage = (of(events, 'done')[0]!.data as unknown as { usage: Record<string, number | null> }).usage;
+    // `undefined` is in the value type because TokenUsage's cache members are
+    // optional, and leaving it out made `not.toBeNull()` pass on a field that
+    // was never forwarded at all — an assertion that reads as proof of the
+    // feature while being blind to its absence.
+    const usage = (of(events, 'done')[0]!.data as unknown as {
+      usage: Record<string, number | null | undefined>;
+    }).usage;
 
     // In this real turn the cache read is four orders of magnitude larger than
     // the input count. A server shown only input/output understates it wildly.
     expect(usage['cache_read_input_tokens']).toBeGreaterThan(1000);
     expect(usage['cache_creation_input_tokens']).toBeGreaterThan(0);
-    expect(usage['input_tokens']).not.toBeNull();
-    expect(usage['output_tokens']).not.toBeNull();
+    expect(typeof usage['input_tokens']).toBe('number');
+    expect(typeof usage['output_tokens']).toBe('number');
   });
 
   it('says which model actually ran and which CLI ran it', async () => {

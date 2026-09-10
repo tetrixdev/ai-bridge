@@ -104,6 +104,42 @@ describe('codex tool call arguments', () => {
     expect(() => JSON.parse(content)).not.toThrow();
   });
 
+  it('scrubs a lone surrogate written as an ESCAPE, not just as a character', async () => {
+    // The test above passes a raw lone surrogate, which `replaceLoneSurrogates`
+    // handles at the character level. Pre-stringified arguments carry the OTHER
+    // shape — the six literal characters \ud83d inside already-encoded JSON —
+    // which only `replaceLoneSurrogateEscapes` sees. Without a case for it the
+    // suite was green on half the function.
+    const events = await replay([
+      { type: 'thread.started', thread_id: 't1' },
+      toolCall('{"a":"\\ud83d","path":"/etc/x"}'),
+      { type: 'turn.completed', usage: {} },
+    ]);
+
+    const content = (events.find((e) => e.event === 'block_delta')!.data as { content: string }).content;
+
+    expect(content).not.toContain('\\ud83d');
+    expect(() => JSON.parse(content)).not.toThrow();
+    // The sibling argument survives: a scrub that took the object with it would
+    // pass both assertions above by emitting nothing at all.
+    expect(JSON.parse(content)['path']).toBe('/etc/x');
+  });
+
+  it('leaves an ESCAPED BACKSLASH followed by a surrogate escape alone', async () => {
+    // `\\ud83d` is a literal backslash then the text ud83d — not an escape at
+    // all. Rewriting it corrupts a Windows path or a regex that merely mentions
+    // one, which is a bug the parity-aware scrubber exists to avoid.
+    const events = await replay([
+      { type: 'thread.started', thread_id: 't1' },
+      toolCall('{"re":"\\\\ud83d"}'),
+      { type: 'turn.completed', usage: {} },
+    ]);
+
+    const content = (events.find((e) => e.event === 'block_delta')!.data as { content: string }).content;
+
+    expect(JSON.parse(content)['re']).toBe('\\ud83d');
+  });
+
   it('bounds them when they arrive PRE-STRINGIFIED', async () => {
     const events = await replay([
       { type: 'thread.started', thread_id: 't1' },
@@ -162,5 +198,67 @@ describe('codex tool call arguments', () => {
 
     const delta = events.find((e) => e.event === 'block_delta');
     expect((delta!.data as { content: string }).content).toBe(JSON.stringify({ file_path: '/tmp/a' }));
+  });
+});
+
+/**
+ * Codex reports an MCP call's outcome as `in_progress` / `completed` /
+ * `failed` (openai/codex, sdk/typescript/src/items.ts). The adapter read only
+ * `error`, so a `failed` call carrying no `error` field was forwarded as
+ * `is_error: false` — a success asserted about a failure, and nothing else in
+ * the frame contradicts it.
+ */
+describe("codex's own words for how a tool call ended", () => {
+  const mcpCall = (extra: Record<string, unknown>) => ({
+    type: 'item.completed',
+    item: {
+      id: 'c1', type: 'mcp_tool_call', server: 'bridge', tool: 'write_file',
+      arguments: { path: '/tmp/a' }, ...extra,
+    },
+  });
+
+  async function resultFor(extra: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const events = await replay([
+      { type: 'thread.started', thread_id: 't1' },
+      mcpCall(extra),
+      { type: 'turn.completed', usage: {} },
+    ]);
+
+    return (events.find((e) => e.event === 'tool_result')!.data ?? {}) as Record<string, unknown>;
+  }
+
+  it('reports a `failed` call as an error even with no error field', async () => {
+    const data = await resultFor({ status: 'failed', result: 'partial output' });
+
+    expect(data['is_error']).toBe(true);
+    expect(String(data['result'])).toContain('Error:');
+  });
+
+  it('reports a `completed` call as not an error', async () => {
+    const data = await resultFor({ status: 'completed', result: 'wrote 12 bytes' });
+
+    expect(data['is_error']).toBe(false);
+    expect(data['result']).toBe('wrote 12 bytes');
+  });
+
+  it('still reads the older `error` status', async () => {
+    const data = await resultFor({ status: 'error', error: 'disk full' });
+
+    expect(data['is_error']).toBe(true);
+    expect(String(data['result'])).toContain('disk full');
+  });
+
+  it('claims NOTHING for a status that is not a verdict', async () => {
+    // `in_progress` is a status without being an outcome. Absent means "not
+    // reported"; answering `false` here would invent a success.
+    const data = await resultFor({ status: 'in_progress' });
+
+    expect(data).not.toHaveProperty('is_error');
+  });
+
+  it('claims nothing when the status is missing entirely', async () => {
+    const data = await resultFor({ result: 'ok' });
+
+    expect(data).not.toHaveProperty('is_error');
   });
 });

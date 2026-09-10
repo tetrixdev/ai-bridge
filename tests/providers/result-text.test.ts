@@ -427,3 +427,39 @@ describe('boundArguments', () => {
     expect(Buffer.byteLength(JSON.stringify(bounded), 'utf8')).toBeLessThan(SERVER_FRAME_CAP);
   });
 });
+
+describe('what a KEY costs once JSON has encoded it', () => {
+  it('fits an object whose keys are full of escapes', () => {
+    // Keys were measured raw while values were measured encoded. A key holding
+    // control characters grows sixfold on encoding, so the estimate said the
+    // object fit, the real check said it did not, and the keep-what-fits path
+    // then threw away every sibling argument to make room for a size that was
+    // never really there.
+    const args: Record<string, string> = {};
+    for (let i = 0; i < 600; i++) {
+      args[`k\u0001\u0002\u0003\u0004\u0005${i}`] = 'v'.repeat(80);
+    }
+
+    const encoded = boundArguments(args);
+
+    expect(Buffer.byteLength(encoded, 'utf8')).toBeLessThanOrEqual(MAX_ARGUMENT_BYTES);
+    expect(() => JSON.parse(encoded)).not.toThrow();
+
+    // The point of measuring properly: the arguments that DO fit survive. An
+    // under-estimate makes the budget run out early and discards them.
+    const kept = Object.keys(JSON.parse(encoded)).filter((k) => k.startsWith('k\u0001'));
+    expect(kept.length).toBeGreaterThan(50);
+  });
+
+  it('still fits when every key needs escaping and the values are large', () => {
+    const args: Record<string, unknown> = {
+      'a"b\\c\nd': 'x'.repeat(200_000),
+      'plain': 'ok',
+    };
+
+    const encoded = boundArguments(args);
+
+    expect(Buffer.byteLength(encoded, 'utf8')).toBeLessThanOrEqual(MAX_ARGUMENT_BYTES);
+    expect(JSON.parse(encoded)['plain']).toBe('ok');
+  });
+});

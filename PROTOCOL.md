@@ -785,12 +785,14 @@ For `tool_call` blocks, includes the tool name and id:
 
 Two kinds of call arrive as `tool_call` blocks, and a consumer usually wants to treat them differently:
 
-| | Where it ran | Also arrives as |
-|---|---|---|
-| `mcp__bridge__<tool>` | The **server** resolves it | a separate [`tool_call`](#tool_call) frame carrying parsed arguments |
-| anything else | The operator's **own machine** — the CLI's shell, file reader, editor | nothing else |
+| Where it ran | Also arrives as |
+|---|---|
+| The **server** resolves it | a separate [`tool_call`](#tool-resolution-flow-cli-bridge) frame carrying parsed arguments |
+| The operator's **own machine** — the CLI's shell, file reader, editor, or a tool the bridge itself runs | nothing else |
 
-For a server-resolved tool the block is a shadow of the `tool_call` frame; render one or the other, not both. For a locally-run tool the block is the **only** record that will ever exist, and its `tool_result` the only account of what it did — dropping it is why a chat can end up able to say "4 tool calls" and nothing more.
+For a server-resolved tool the block is a shadow of the `tool_call` frame; render one or the other, not both. For every other call the block is the **only** record that will ever exist, and its `tool_result` the only account of what it did — dropping it is why a chat can end up able to say "4 tool calls" and nothing more.
+
+**The `mcp__bridge__` prefix does not tell the two apart.** It says the tool was declared by the server, not that a frame is coming: a server-declared tool with `execute: "local"` runs on the bridge and reaches the model under the same prefix, with no frame of its own. A consumer that discards a prefixed block on sight therefore deletes exactly those calls and orphans their results. Keep every block, and treat one as a shadow only once the matching `tool_call` frame has actually arrived — reconciling at the end of the turn, since the order of the two is not pinned down.
 
 `tool_call_id` pairs the call to its [`tool_result`](#tool_result).
 

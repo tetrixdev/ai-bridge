@@ -330,10 +330,16 @@ try {
       r.toolResults.every((x) => r.toolBlocks.some((t) => t.id === x.tool_call_id)),
       `call ids ${JSON.stringify(r.toolBlocks.map((t) => t.id))}`);
 
+    // Finite, not positive. This checks that the bridge FORWARDS what the CLI
+    // reported, and a cold cache legitimately reports zero cache reads — as
+    // does a plan that bills nothing. Requiring a positive number makes the
+    // check fail for a reason that has nothing to do with what it is testing.
+    const finite = (v) => typeof v === 'number' && Number.isFinite(v);
     check('the turn reports its cache tokens, model and cost',
-      r.doneData?.usage?.cache_read_input_tokens > 0
+      finite(r.doneData?.usage?.cache_read_input_tokens)
+      && finite(r.doneData?.usage?.cache_creation_input_tokens)
       && typeof r.doneData?.model === 'string'
-      && r.doneData?.cost_usd > 0,
+      && finite(r.doneData?.cost_usd),
       `got ${JSON.stringify(r.doneData).slice(0, 200)}`);
 
     // Partial streaming. The unit tests replay captured output, so they prove
