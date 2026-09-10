@@ -334,12 +334,15 @@ try {
     // reported, and a cold cache legitimately reports zero cache reads — as
     // does a plan that bills nothing. Requiring a positive number makes the
     // check fail for a reason that has nothing to do with what it is testing.
-    const finite = (v) => typeof v === 'number' && Number.isFinite(v);
+    // Zero is legitimate — a cold cache reports no cache reads, and a plan can
+    // bill nothing — but negative is not, for a count or for money. Accepting
+    // it would let a regression that forwards -1 pass an end-to-end check.
+    const counted = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
     check('the turn reports its cache tokens, model and cost',
-      finite(r.doneData?.usage?.cache_read_input_tokens)
-      && finite(r.doneData?.usage?.cache_creation_input_tokens)
+      counted(r.doneData?.usage?.cache_read_input_tokens)
+      && counted(r.doneData?.usage?.cache_creation_input_tokens)
       && typeof r.doneData?.model === 'string'
-      && finite(r.doneData?.cost_usd),
+      && counted(r.doneData?.cost_usd),
       `got ${JSON.stringify(r.doneData).slice(0, 200)}`);
 
     // Partial streaming. The unit tests replay captured output, so they prove
