@@ -33,7 +33,7 @@
 
 import type { AdapterStreamEvent } from './base.js';
 import { createLogger } from '../utils/logger.js';
-import { boundArguments, boundResult } from './result-text.js';
+import { boundArguments, boundText, MAX_ARGUMENT_BYTES } from './result-text.js';
 
 const log = createLogger('ClaudePartial');
 
@@ -368,6 +368,10 @@ export function normaliseToolArguments(buffered: string | undefined): string {
     // would look like a tool deliberately called with no arguments.
     log.warn('Tool arguments did not parse as JSON — forwarding verbatim', { length: raw.length });
 
-    return boundResult(raw);
+    // The ARGUMENT ceiling, not the result one. Bounding this at 256KB while
+    // the consumer caps arguments at 64KB is the same mismatch the frame paths
+    // were fixed for: rendered in full live, truncated on reload, and the two
+    // reporting sizes that differ by 4x.
+    return boundText(raw, MAX_ARGUMENT_BYTES);
   }
 }

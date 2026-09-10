@@ -900,7 +900,20 @@ What a tool returned. Emitted for **both** kinds of tool call:
 
 `is_error` is the authoritative failure signal, and is **absent when the provider did not report one** — absent never means "succeeded". Do not infer failure from the text: a tool legitimately printing `Error: no matches` is indistinguishable from one that failed. (For historical reasons the Codex and Gemini adapters additionally prefix `Error: ` onto a failed result; that prefix is not a substitute for the field.)
 
-**Size.** A result, and a `tool_call` block's arguments, are bounded by the bridge at 256 KB of JSON-encoded bytes — a quarter of the server's 1 MB frame cap. Anything longer arrives truncated with an explicit marker naming the original length. This is not squeamishness about size: an oversized frame is not delivered-and-ignored, it is answered with a `CLOSE_TOO_BIG` that tears down the WebSocket connection and every in-flight request on it. A marked truncation is what a consumer can act on.
+**Size.** Two different ceilings, because the two are stored differently:
+
+- A **result** is bounded at 256 KB of JSON-encoded bytes, and anything longer arrives truncated with a marker naming the original length.
+- A **`tool_call` block's arguments** are bounded at **64 KB** — the same number the reference server caps them at, so that two truncations cannot compose and destroy each other's evidence.
+
+Arguments are bounded by **structure**, not by cutting the text. Every key survives that can, and only values too large to carry are replaced, by an object saying what was there:
+
+```json
+{ "file_path": "/etc/hosts", "content": { "__truncated__": { "bytes": 2000002, "head": "127.0.0.1 …" } } }
+```
+
+That keeps the result valid JSON. Cutting the encoded text instead makes it stop parsing, and a consumer then loses *every* argument — including the twenty-byte `file_path` that says what the call actually did. When breadth rather than size is the problem, the entries that fit are kept and a `__truncated__` key reports how many were not; if the input already uses that name, a free variant is chosen instead.
+
+None of this is squeamishness about size: an oversized frame is not delivered-and-ignored, it is answered with a `CLOSE_TOO_BIG` that tears down the WebSocket connection and every in-flight request on it. A marked truncation is what a consumer can act on.
 
 Binary parts — an image or audio block, an MCP embedded resource carrying a base64 blob — are replaced by a short description of their kind and size rather than inlined. A screenshot is around 600,000 characters of base64: unreadable as output, and two of them exceed the frame cap on their own. A file the assistant means to hand back has its own route in the [`attachment`](#attachment) event.
 

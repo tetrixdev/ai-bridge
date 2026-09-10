@@ -59,7 +59,18 @@ function sliceWholeCharacters(text: string, end: number): string {
  * The marker is inside the budget, not added after it.
  */
 export function boundResult(text: string): string {
-  return boundWellFormed(replaceLoneSurrogates(text));
+  return boundText(text, MAX_RESULT_BYTES);
+}
+
+/**
+ * Bound text to an explicit budget.
+ *
+ * Exported with the budget as an argument because there are two of them — a
+ * result may be 256KB, a tool call's arguments only 64KB — and a caller that
+ * reaches for `boundResult` on an argument path picks the wrong one silently.
+ */
+export function boundText(text: string, budget: number): string {
+  return boundWellFormed(replaceLoneSurrogates(text), budget);
 }
 
 /**
@@ -107,10 +118,10 @@ export function replaceLoneSurrogates(text: string): string {
   return pieces.join('');
 }
 
-function boundWellFormed(text: string): string {
-  if (encodedBytes(text) <= MAX_RESULT_BYTES) return text;
+function boundWellFormed(text: string, budget: number): string {
+  if (encodedBytes(text) <= budget) return text;
 
-  const marker = (shown: number): string =>
+  const markerFor = (shown: number): string =>
     `\n…[truncated by the bridge: showing ${shown} of ${text.length} characters]`;
 
   // Binary search the longest prefix that still fits with its marker. Character
@@ -122,7 +133,7 @@ function boundWellFormed(text: string): string {
   while (low < high) {
     const mid = Math.ceil((low + high) / 2);
     const candidate = sliceWholeCharacters(text, mid);
-    if (encodedBytes(candidate + marker(candidate.length)) <= MAX_RESULT_BYTES) {
+    if (encodedBytes(candidate + markerFor(candidate.length)) <= budget) {
       low = mid;
     } else {
       high = mid - 1;
@@ -131,7 +142,7 @@ function boundWellFormed(text: string): string {
 
   const kept = sliceWholeCharacters(text, low);
 
-  return kept + marker(kept.length);
+  return kept + markerFor(kept.length);
 }
 
 /**
@@ -158,15 +169,61 @@ export function safeStringify(value: unknown, fallback: string): string {
  */
 export function replaceLoneSurrogateEscapes(json: string): string {
   // The common case has no surrogate escapes at all and does no work.
-  if (!/\\u[dD][89abAB]/.test(json) && !/\\u[dD][c-fA-F]/.test(json)) return json;
+  if (!/\\u[dD][89abAB]/.test(json) && !/\\u[dD][c-fC-F]/.test(json)) return json;
 
-  return json.replace(
-    /\\u([dD][89abAB][0-9a-fA-F]{2})(\\u[dD][c-fC-F][0-9a-fA-F]{2})?|\\u[dD][c-fC-F][0-9a-fA-F]{2}/g,
-    (match, high: string | undefined, low: string | undefined) => {
-      if (high !== undefined && low !== undefined) return match; // a real pair
-      return '\\ufffd';
-    },
-  );
+  let out: string[] | null = null;
+  let copiedTo = 0;
+  let i = 0;
+
+  while (i < json.length) {
+    if (json[i] !== '\\') {
+      i += 1;
+      continue;
+    }
+
+    // Backslash PARITY. `\\ud83d` is an escaped backslash followed by the
+    // letter u — a literal, not an escape — and treating it as one silently
+    // rewrote real text: any Write or Edit whose content discusses surrogates,
+    // including this file. A regex that matches `\u` wherever it appears
+    // cannot tell the two apart.
+    let run = i;
+    while (run < json.length && json[run] === '\\') run += 1;
+    const backslashes = run - i;
+
+    if (backslashes % 2 === 0) {
+      i = run;
+      continue;
+    }
+
+    // The final backslash opens an escape at run - 1.
+    const escapeAt = run - 1;
+    const seq = json.slice(escapeAt, escapeAt + 6);
+    const high = /^\\u[dD][89abAB][0-9a-fA-F]{2}$/.test(seq);
+    const low = /^\\u[dD][c-fC-F][0-9a-fA-F]{2}$/.test(seq);
+
+    if (!high && !low) {
+      i = run;
+      continue;
+    }
+
+    if (high) {
+      const next = json.slice(escapeAt + 6, escapeAt + 12);
+      if (/^\\u[dD][c-fC-F][0-9a-fA-F]{2}$/.test(next)) {
+        i = escapeAt + 12; // a well-formed pair
+        continue;
+      }
+    }
+
+    if (out === null) out = [];
+    out.push(json.slice(copiedTo, escapeAt), '\\ufffd');
+    copiedTo = escapeAt + 6;
+    i = copiedTo;
+  }
+
+  if (out === null) return json;
+  out.push(json.slice(copiedTo));
+
+  return out.join('');
 }
 
 /**
@@ -325,7 +382,23 @@ function shrinkEntries(
  * plainly that something was cut.
  */
 export function boundArguments(value: unknown): string {
-  const encoded = replaceLoneSurrogateEscapes(safeStringify(value, '{}'));
+  // Distinguished from `{}`. safeStringify's fallback is "{}", which is under
+  // the cap and returned verbatim — so a value JSON.stringify cannot encode
+  // (this file's own header notes it throws around 5,000 levels of nesting,
+  // where JSON.parse accepts far more) recorded as "called with no arguments".
+  // A deeply nested SIBLING would take file_path down with it, which is the one
+  // field the whole structural bound exists to preserve.
+  let raw: string | undefined;
+  try {
+    raw = JSON.stringify(value);
+  } catch {
+    raw = undefined;
+  }
+  if (raw === undefined) {
+    return JSON.stringify({ __truncated__: { reason: 'arguments could not be encoded' } });
+  }
+
+  const encoded = replaceLoneSurrogateEscapes(raw);
   // RAW bytes, not the escaped size the frame carries. This string is the
   // argument JSON itself, and it is the raw length the consumer stores and caps
   // at the same number. Measuring the escaped form here — which is what the

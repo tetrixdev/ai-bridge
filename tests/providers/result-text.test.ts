@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { boundArguments, boundResult, safeStringify, replaceLoneSurrogates, MAX_ARGUMENT_BYTES, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
+import { boundArguments, boundResult, safeStringify, replaceLoneSurrogates, replaceLoneSurrogateEscapes, MAX_ARGUMENT_BYTES, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
 
 /** What the whole stream frame costs once encoded, as bridge.ts sends it. */
 function frameBytes(result: string): number {
@@ -172,7 +172,76 @@ describe('safeStringify', () => {
   });
 });
 
+describe('replaceLoneSurrogateEscapes', () => {
+  const REF = (json: string): string => {
+    // A parity-tracking reference, written independently of the implementation.
+    let out = '';
+    let i = 0;
+    while (i < json.length) {
+      if (json[i] !== '\\') { out += json[i]; i += 1; continue; }
+      let run = i;
+      while (run < json.length && json[run] === '\\') run += 1;
+      if ((run - i) % 2 === 0) { out += json.slice(i, run); i = run; continue; }
+      out += json.slice(i, run - 1);
+      const at = run - 1;
+      const seq = json.slice(at, at + 6);
+      const high = /^\\u[dD][89abAB][0-9a-fA-F]{2}$/.test(seq);
+      const low = /^\\u[dD][c-fC-F][0-9a-fA-F]{2}$/.test(seq);
+      if (!high && !low) { out += json[at]; i = at + 1; continue; }
+      if (high) {
+        const next = json.slice(at + 6, at + 12);
+        if (/^\\u[dD][c-fC-F][0-9a-fA-F]{2}$/.test(next)) { out += seq + next; i = at + 12; continue; }
+      }
+      out += '\\ufffd';
+      i = at + 6;
+    }
+
+    return out;
+  };
+
+  it('leaves an ESCAPED backslash followed by u alone', () => {
+    // `\\ud83d` is a literal backslash then the letter u, not an escape.
+    // Rewriting it silently corrupted real text — any Write or Edit whose
+    // content discusses surrogates, including the file this lives in.
+    const text = 'a lone high surrogate is \\\\ud83d here';
+    expect(replaceLoneSurrogateEscapes(text)).toBe(text);
+  });
+
+  it('still repairs a genuine unpaired escape', () => {
+    expect(replaceLoneSurrogateEscapes('{"a":"x\\ud83dy"}')).toBe('{"a":"x\\ufffdy"}');
+  });
+
+  it('leaves a genuine PAIR alone', () => {
+    const paired = '{"a":"\\ud83d\\ude00"}';
+    expect(replaceLoneSurrogateEscapes(paired)).toBe(paired);
+  });
+
+  it('agrees with an independent reference over random inputs', () => {
+    const pool = ['\\', 'u', 'd', '8', 'a', 'c', '0', 'f', 'x', '"', '\\ud83d', '\\udc00', '\\\\ud83d'];
+    for (let n = 0; n < 5000; n += 1) {
+      let text = '';
+      const length = 1 + Math.floor(Math.random() * 8);
+      for (let i = 0; i < length; i += 1) text += pool[Math.floor(Math.random() * pool.length)];
+      expect(replaceLoneSurrogateEscapes(text), text).toBe(REF(text));
+    }
+  });
+});
+
 describe('boundArguments', () => {
+  it('says so when a value cannot be encoded at all', () => {
+    // JSON.parse accepts nesting JSON.stringify cannot encode, so an argument
+    // object can arrive that will not go back out. Reporting `{}` for it —
+    // which the safeStringify fallback did — reads as "called with no
+    // arguments", and takes file_path down with it.
+    const deep = JSON.parse('['.repeat(6000) + '1' + ']'.repeat(6000)) as unknown;
+
+    const parsed = JSON.parse(boundArguments({ file_path: '/etc/passwd', payload: deep })) as
+      { __truncated__?: { reason?: string } };
+
+    expect(parsed.__truncated__?.reason).toContain('could not be encoded');
+  });
+
+
   it('finishes quickly on an object with thousands of keys', () => {
     // Re-encoding the whole object once per key is quadratic: 32 seconds for
     // four thousand keys, tens of minutes for twenty thousand, synchronously,

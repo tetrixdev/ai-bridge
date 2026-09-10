@@ -428,6 +428,19 @@ describe('normaliseToolArguments', () => {
     expect(normaliseToolArguments('{"a":  1,\n "b": [2,3] }')).toBe(JSON.stringify({ a: 1, b: [2, 3] }));
   });
 
+  it('bounds unparseable arguments at the ARGUMENT ceiling, not the result one', () => {
+    // A truncated tool call still has to fit what the consumer stores. Bounding
+    // this at the 256KB result cap while arguments are capped at 64KB is the
+    // same mismatch the frame paths were fixed for: rendered in full live,
+    // truncated on reload, the two reporting sizes that differ by 4x.
+    const huge = '{"command":"' + 'x'.repeat(300_000);
+
+    const bounded = normaliseToolArguments(huge);
+
+    expect(Buffer.byteLength(bounded, 'utf8')).toBeLessThanOrEqual(65536);
+    expect(bounded).toContain('truncated by the bridge');
+  });
+
   it('forwards unparseable JSON verbatim rather than inventing empty arguments', () => {
     expect(normaliseToolArguments('{"file_path": "/tmp/tr')).toBe('{"file_path": "/tmp/tr');
   });
