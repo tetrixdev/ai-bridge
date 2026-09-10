@@ -295,7 +295,16 @@ function shrinkEntries(
   }
 
   if (kept.length === 0) return null;
-  kept.push(['__truncated__', { omitted: sized.length - kept.length }]);
+
+  // A key the input does not already use. Writing `__truncated__` blindly
+  // overwrote a genuine argument of that name — a sentinel that can appear in
+  // the data, which is the same mistake as reading failure out of an `Error:`
+  // prefix, and one this file argues against elsewhere.
+  const taken = new Set(sized.map((e) => e.key));
+  let notice = '__truncated__';
+  for (let n = 2; taken.has(notice); n += 1) notice = `__truncated_${n}__`;
+
+  kept.push([notice, { omitted: sized.length - kept.length }]);
 
   return kept;
 }

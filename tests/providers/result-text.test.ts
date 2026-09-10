@@ -191,6 +191,33 @@ describe('boundArguments', () => {
     expect(Object.keys(JSON.parse(bounded)).length).toBeGreaterThan(100);
   });
 
+  it('does not overwrite a real argument named __truncated__', () => {
+    // A sentinel that can appear in the data is the same mistake as reading
+    // failure out of an "Error:" prefix — which this codebase argues against
+    // elsewhere, and which this made anyway.
+    // First, so it falls inside the kept prefix and the collision is actually
+    // exercised rather than the key simply being dropped for space.
+    const many: Record<string, unknown> = {
+      __truncated__: 'a real argument',
+      ...Object.fromEntries(Array.from({ length: 4000 }, (_, i) => [`k${i}`, 'v'.repeat(70)])),
+    };
+
+    const parsed = JSON.parse(boundArguments(many)) as Record<string, unknown>;
+
+    expect(parsed['__truncated__']).toBe('a real argument');
+    // …and the notice still gets through, under a name the input did not use.
+    expect(Object.keys(parsed).some((k) => /^__truncated_\d+__$/.test(k))).toBe(true);
+  });
+
+  it('does not pollute the prototype via a __proto__ argument', () => {
+    // Arguments arrive from JSON.parse, where __proto__ is an own property.
+    const viaJson = JSON.parse('{"__proto__":{"polluted":true},"ok":1}') as unknown;
+
+    boundArguments(viaJson);
+
+    expect(({} as Record<string, unknown>)['polluted']).toBeUndefined();
+  });
+
   it('says how many entries it had to leave out', () => {
     const many = Object.fromEntries(
       Array.from({ length: 4000 }, (_, i) => [`k${i}`, 'v'.repeat(70)]),
