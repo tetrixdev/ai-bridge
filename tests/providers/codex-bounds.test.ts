@@ -87,7 +87,7 @@ describe('codex tool call arguments', () => {
     expect(frameBytes(delta!)).toBeLessThan(SERVER_FRAME_CAP);
   });
 
-  it('bounds them when they arrive as an object', async () => {
+  it('bounds them by STRUCTURE when they arrive as an object', async () => {
     const events = await replay([
       { type: 'thread.started', thread_id: 't1' },
       toolCall({ file_path: '/tmp/a', content: 'x'.repeat(1_500_000) }),
@@ -96,6 +96,14 @@ describe('codex tool call arguments', () => {
 
     const delta = events.find((e) => e.event === 'block_delta');
     expect(frameBytes(delta!)).toBeLessThan(SERVER_FRAME_CAP);
+
+    // Bounding the encoded TEXT here would make it stop parsing, and the
+    // consumer would then lose every argument — including file_path, which is
+    // the field that says what the call actually did.
+    const content = (delta!.data as { content: string }).content;
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    expect(parsed['file_path']).toBe('/tmp/a');
+    expect(parsed['content']).toHaveProperty('__truncated__');
   });
 
   it('bounds an oversized result too', async () => {

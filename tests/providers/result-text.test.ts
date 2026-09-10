@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { boundArguments, boundResult, safeStringify, replaceLoneSurrogates, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
+import { boundArguments, boundResult, safeStringify, replaceLoneSurrogates, MAX_ARGUMENT_BYTES, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
 
 /** What the whole stream frame costs once encoded, as bridge.ts sends it. */
 function frameBytes(result: string): number {
@@ -22,6 +22,25 @@ function frameBytes(result: string): number {
 }
 
 const SERVER_FRAME_CAP = 1024 * 1024;
+
+/**
+ * Does this JSON text contain an unpaired surrogate ESCAPE?
+ *
+ * `JSON.stringify` turns a lone surrogate into the literal `\ud83d`, so the
+ * encoded text is itself well-formed and a well-formedness check cannot see the
+ * problem — while PHP's `json_decode` still rejects the value outright. That is
+ * why the first version of these assertions passed against the bug.
+ */
+function hasLoneSurrogateEscape(json: string): boolean {
+  const escapes = json.match(/\\u[dD][89abAB][0-9a-fA-F]{2}/g) ?? [];
+
+  return escapes.some((high, i) => {
+    const at = json.indexOf(high);
+    const next = json.slice(at + 6, at + 12);
+
+    return !/^\\u[dD][c-fC-F][0-9a-fA-F]{2}$/.test(next) && i >= 0;
+  });
+}
 
 /**
  * An INDEPENDENT well-formedness check.
@@ -154,6 +173,81 @@ describe('safeStringify', () => {
 });
 
 describe('boundArguments', () => {
+  it('finishes quickly on an object with thousands of keys', () => {
+    // Re-encoding the whole object once per key is quadratic: 32 seconds for
+    // four thousand keys, tens of minutes for twenty thousand, synchronously,
+    // in the readline listener. A torn connection reconnects; a stalled event
+    // loop does not.
+    const many = Object.fromEntries(
+      Array.from({ length: 20_000 }, (_, i) => [`k${i}`, 'v'.repeat(30)]),
+    );
+
+    const started = Date.now();
+    const bounded = boundArguments(many);
+
+    expect(Date.now() - started).toBeLessThan(5_000);
+    // …and it keeps what fits rather than discarding everything, which is what
+    // the quadratic version did after all that work.
+    expect(Object.keys(JSON.parse(bounded)).length).toBeGreaterThan(100);
+  });
+
+  it('says how many entries it had to leave out', () => {
+    const many = Object.fromEntries(
+      Array.from({ length: 4000 }, (_, i) => [`k${i}`, 'v'.repeat(70)]),
+    );
+    expect(JSON.parse(boundArguments(many))).toHaveProperty('__truncated__');
+  });
+
+  it('keeps a small sibling of a big NESTED value', () => {
+    // Replacing the whole subtree throws away siblings that would have fitted.
+    const parsed = JSON.parse(boundArguments({
+      file_path: '/a',
+      payload: { meta: { id: 7 }, content: 'x'.repeat(400_000) },
+    })) as { file_path: string; payload: { meta: unknown; content: unknown } };
+
+    expect(parsed.file_path).toBe('/a');
+    expect(parsed.payload.meta).toEqual({ id: 7 });
+    expect(parsed.payload.content).toHaveProperty('__truncated__');
+  });
+
+  it('keeps an array valid JSON', () => {
+    const bounded = boundArguments(['y'.repeat(400_000), 'z'.repeat(400_000)]);
+    expect(() => JSON.parse(bounded)).not.toThrow();
+  });
+
+  it('never cuts the sample mid-surrogate', () => {
+    // A split pair makes PHP reject the argument JSON outright, so one emoji at
+    // the wrong offset loses every argument including file_path.
+    const bounded = boundArguments({
+      content: 'x'.repeat(199) + String.fromCodePoint(0x1f600) + 'y'.repeat(1_000_000),
+    });
+
+    expect(hasLoneSurrogateEscape(bounded), bounded.slice(0, 260)).toBe(false);
+    expect(() => JSON.parse(bounded)).not.toThrow();
+  });
+
+  it('replaces a lone surrogate arriving in an argument value', () => {
+    // boundArguments bypassed replaceLoneSurrogates entirely at first, quietly
+    // undoing the fix made for results.
+    const bounded = boundArguments({ note: `a${String.fromCharCode(0xd83d)}b` });
+    expect(hasLoneSurrogateEscape(bounded), bounded).toBe(false);
+  });
+
+  it('stays under the ceiling the consumer caps at', () => {
+    // ONE number. They used to differ — 256KB here, 64KB there — so everything
+    // in between was emitted whole and then byte-cut into JSON that no longer
+    // parsed, losing every argument.
+    const bounded = boundArguments({ file_path: '/a', content: 'x'.repeat(150_000) });
+
+    // The literal 65536, deliberately: ConversationRecorder::MAX_ARGUMENT_BYTES
+    // is that number, and asserting against our own constant moves with it and
+    // proves nothing about the two agreeing.
+    expect(Buffer.byteLength(bounded, 'utf8')).toBeLessThanOrEqual(65536);
+    expect(MAX_ARGUMENT_BYTES).toBe(65536);
+    expect(() => JSON.parse(bounded)).not.toThrow();
+    expect((JSON.parse(bounded) as { file_path: string }).file_path).toBe('/a');
+  });
+
   it('leaves ordinary arguments as plain JSON', () => {
     expect(boundArguments({ file_path: '/a', n: 1 })).toBe(JSON.stringify({ file_path: '/a', n: 1 }));
   });
@@ -196,9 +290,14 @@ describe('boundArguments', () => {
     expect(parsed['small']).toBe('y'.repeat(1000));
   });
 
-  it('falls back to bounding the text when there are no keys to preserve', () => {
+  it('describes a bare oversized value rather than emitting unparseable text', () => {
+    // No keys to preserve, so there is nothing to keep — but the answer still
+    // has to parse, because a consumer that cannot parse it records nothing at
+    // all rather than "this was too big".
     const bounded = boundArguments('z'.repeat(2_000_000));
-    expect(bounded).toContain('truncated by the bridge');
+
+    const parsed = JSON.parse(bounded) as { __truncated__: { bytes: number } };
+    expect(parsed.__truncated__.bytes).toBeGreaterThan(1_000_000);
   });
 
   it('keeps the frame under the server cap', () => {

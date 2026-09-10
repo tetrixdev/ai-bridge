@@ -147,6 +147,160 @@ export function safeStringify(value: unknown, fallback: string): string {
 }
 
 /**
+ * Replace unpaired surrogate ESCAPES in already-encoded JSON.
+ *
+ * `replaceLoneSurrogates` works on text; by the time a value has been through
+ * `JSON.stringify` a lone surrogate is the six ordinary ASCII characters
+ * `\ud83d`, which that function correctly sees nothing wrong with. PHP's
+ * `json_decode` does not agree — it rejects the value outright with "Single
+ * unpaired UTF-16 surrogate" — so the argument JSON has to be cleaned after
+ * encoding, not before.
+ */
+export function replaceLoneSurrogateEscapes(json: string): string {
+  // The common case has no surrogate escapes at all and does no work.
+  if (!/\\u[dD][89abAB]/.test(json) && !/\\u[dD][c-fA-F]/.test(json)) return json;
+
+  return json.replace(
+    /\\u([dD][89abAB][0-9a-fA-F]{2})(\\u[dD][c-fC-F][0-9a-fA-F]{2})?|\\u[dD][c-fC-F][0-9a-fA-F]{2}/g,
+    (match, high: string | undefined, low: string | undefined) => {
+      if (high !== undefined && low !== undefined) return match; // a real pair
+      return '\\ufffd';
+    },
+  );
+}
+
+/**
+ * Ceiling on a tool call's arguments.
+ *
+ * ONE number, matching the recorder's own cap on the far side. They used to
+ * differ — 256KB here, 64KB there — so everything in between was emitted whole
+ * and then byte-cut by the consumer into JSON that no longer parsed, losing
+ * every argument including the small ones. Two caps in different places is the
+ * same mistake as two implementations of one rule.
+ */
+export const MAX_ARGUMENT_BYTES = 64 * 1024;
+
+/** How much of an oversized value to keep as a sample. */
+const HEAD_CHARS = 200;
+
+/** What a value costs once encoded. */
+function valueBytes(value: unknown): number {
+  return Buffer.byteLength(safeStringify(value, '""'), 'utf8');
+}
+
+/**
+ * Cut to a length that does not split a surrogate pair.
+ *
+ * Belt and braces since `replaceLoneSurrogateEscapes` runs over the encoded
+ * output and would clean up a split anyway — measured: removing this guard
+ * changes no output. It stays because cutting a character in half to then
+ * repair it is a worse way to arrive at the same place, and the repair is not
+ * this function's to rely on.
+ */
+function headOf(text: string): string {
+  const end = text.length <= HEAD_CHARS ? text.length : HEAD_CHARS;
+  const code = text.charCodeAt(end - 1);
+  const splitsAPair = code >= 0xd800 && code <= 0xdbff;
+
+  return text.slice(0, splitsAPair ? end - 1 : end);
+}
+
+/** The stand-in for a value too large to carry. */
+function marker(value: unknown): Record<string, unknown> {
+  return {
+    __truncated__: {
+      bytes: valueBytes(value),
+      ...(typeof value === 'string' ? { head: headOf(value) } : {}),
+    },
+  };
+}
+
+/**
+ * Shrink one value to fit a budget, keeping as much shape as possible.
+ *
+ * Recurses one level into an object or array, so a big `content` beside a small
+ * `meta` costs only the `content` — replacing the whole subtree, which an
+ * earlier version did, threw away siblings that would have fitted easily.
+ */
+function shrinkValue(value: unknown, budget: number, depth: number): unknown {
+  if (valueBytes(value) <= budget) return value;
+  if (depth <= 0 || typeof value !== 'object' || value === null) return marker(value);
+
+  const entries: [string | number, unknown][] = Array.isArray(value)
+    ? value.map((v, i) => [i, v])
+    : Object.entries(value as Record<string, unknown>);
+
+  const shrunk = shrinkEntries(entries, budget, depth - 1);
+  if (shrunk === null) return marker(value);
+
+  return Array.isArray(value)
+    ? shrunk.map(([, v]) => v)
+    : Object.fromEntries(shrunk);
+}
+
+/**
+ * Fit a set of entries into a budget, largest value first.
+ *
+ * Sizes are measured ONCE per entry and the running total is adjusted as values
+ * are replaced. Re-encoding the whole object on every iteration — which is what
+ * this did first — is quadratic: measured at 32 seconds for four thousand keys
+ * and tens of minutes for twenty thousand, synchronously, in the readline
+ * listener this file's header says must not block. A torn connection
+ * reconnects; a stalled event loop does not.
+ *
+ * Returns null when even the keys alone cannot fit.
+ */
+function shrinkEntries(
+  entries: [string | number, unknown][],
+  budget: number,
+  depth: number,
+): [string, unknown][] | null {
+  const sized = entries.map(([key, value]) => ({
+    key: String(key),
+    value,
+    bytes: valueBytes(value) + Buffer.byteLength(String(key), 'utf8') + 4,
+  }));
+
+  let total = sized.reduce((sum, e) => sum + e.bytes, 2);
+  const replaced = new Map<string, unknown>();
+
+  for (const entry of [...sized].sort((a, b) => b.bytes - a.bytes)) {
+    if (total <= budget) break;
+
+    const shrunkValue = shrinkValue(entry.value, Math.max(budget - (total - entry.bytes), 0), depth);
+    const shrunkBytes = valueBytes(shrunkValue) + Buffer.byteLength(entry.key, 'utf8') + 4;
+    // Replacing many small values with markers makes the object BIGGER, which
+    // is how the first version looped over every key and still did not fit.
+    if (shrunkBytes >= entry.bytes) continue;
+
+    replaced.set(entry.key, shrunkValue);
+    total -= entry.bytes - shrunkBytes;
+  }
+
+  if (total <= budget) {
+    return sized.map((e) => [e.key, replaced.has(e.key) ? replaced.get(e.key) : e.value]);
+  }
+
+  // Breadth, not size: thousands of small arguments, none worth replacing.
+  // Keep the ones that fit and say how many did not, rather than returning
+  // nothing — which is what the first version did after all that work.
+  const kept: [string, unknown][] = [];
+  let used = 2;
+  for (const entry of sized) {
+    const value = replaced.has(entry.key) ? replaced.get(entry.key) : entry.value;
+    const bytes = valueBytes(value) + Buffer.byteLength(entry.key, 'utf8') + 4;
+    if (used + bytes > budget - 80) break;
+    kept.push([entry.key, value]);
+    used += bytes;
+  }
+
+  if (kept.length === 0) return null;
+  kept.push(['__truncated__', { omitted: sized.length - kept.length }]);
+
+  return kept;
+}
+
+/**
  * Bound a tool call's ARGUMENTS, keeping them valid JSON.
  *
  * Truncating the encoded string — which is what this used to do — is wrong in a
@@ -156,40 +310,26 @@ export function safeStringify(value: unknown, fallback: string): string {
  * `file_path` is twenty bytes and the single most useful field for anyone
  * auditing what happened, discarded because `content` was large.
  *
- * So the structure is bounded instead of the text. Every key survives; only the
- * values too big to carry are replaced, by an object that says what was there.
- * The result is still valid JSON, still has `file_path`, and still says plainly
- * that something was cut.
+ * So the structure is bounded instead of the text. Every key survives that can;
+ * only the values too big to carry are replaced, by an object saying what was
+ * there. The result is still valid JSON, still has `file_path`, and still says
+ * plainly that something was cut.
  */
 export function boundArguments(value: unknown): string {
-  const encoded = safeStringify(value, '{}');
-  if (encodedBytes(encoded) <= MAX_RESULT_BYTES) return encoded;
+  const encoded = replaceLoneSurrogateEscapes(safeStringify(value, '{}'));
+  // RAW bytes, not the escaped size the frame carries. This string is the
+  // argument JSON itself, and it is the raw length the consumer stores and caps
+  // at the same number. Measuring the escaped form here — which is what the
+  // first version did — compares a budget built in one unit against a total
+  // measured in another, roughly double, so a correct answer looks oversized
+  // and is thrown away.
+  if (Buffer.byteLength(encoded, 'utf8') <= MAX_ARGUMENT_BYTES) return encoded;
 
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    // Nothing keyed to preserve — fall back to bounding the text.
-    return boundResult(encoded);
-  }
+  const shrunk = shrinkValue(value, MAX_ARGUMENT_BYTES, 2);
+  const out = replaceLoneSurrogateEscapes(safeStringify(shrunk, '{}'));
 
-  const entries = Object.entries(value as Record<string, unknown>);
-  // Largest first, so the fewest fields are sacrificed.
-  const bySize = [...entries].sort(
-    (a, b) => safeStringify(b[1], '""').length - safeStringify(a[1], '""').length,
-  );
-
-  const trimmed = new Map(entries);
-  for (const [key, original] of bySize) {
-    const asText = safeStringify(original, '""');
-    trimmed.set(key, {
-      __truncated__: {
-        bytes: Buffer.byteLength(asText, 'utf8'),
-        head: typeof original === 'string' ? original.slice(0, 200) : undefined,
-      },
-    });
-
-    const candidate = safeStringify(Object.fromEntries(trimmed), '{}');
-    if (encodedBytes(candidate) <= MAX_RESULT_BYTES) return candidate;
-  }
-
-  // Even the keys alone do not fit.
-  return safeStringify({ __truncated__: { bytes: Buffer.byteLength(encoded, 'utf8') } }, '{}');
+  // A last resort that is still parseable, rather than a prefix that is not.
+  return Buffer.byteLength(out, 'utf8') <= MAX_ARGUMENT_BYTES
+    ? out
+    : safeStringify({ __truncated__: { bytes: Buffer.byteLength(encoded, 'utf8') } }, '{}');
 }

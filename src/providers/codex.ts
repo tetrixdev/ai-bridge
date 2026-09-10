@@ -28,7 +28,7 @@ import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, 
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundResult, safeStringify } from './result-text.js';
+import { boundArguments, boundResult, safeStringify } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 
 const log = createLogger('CodexAdapter');
@@ -424,9 +424,14 @@ export class CodexAdapter extends ProviderAdapter {
             // branch — which the comment above says Codex sometimes takes —
             // went out unbounded, and a 1.8MB argument payload then tore down
             // the connection. Guarded too, for the readline listener.
-            const argsContent = boundResult(
-              typeof args === 'string' ? args : safeStringify(args ?? {}, '{}'),
-            );
+            // The object branch bounds by STRUCTURE, like the other adapters:
+            // keys survive and the result stays valid JSON. The pre-stringified
+            // branch has only text to work with, so it takes the text bound —
+            // and it takes it OUTSIDE the ternary, because sitting inside it is
+            // how that branch went out unbounded through two review rounds.
+            const argsContent = typeof args === 'string'
+              ? boundResult(args)
+              : boundArguments(args ?? {});
 
             onEvent({
               event: 'block_start',
