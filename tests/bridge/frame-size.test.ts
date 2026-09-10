@@ -99,6 +99,48 @@ describe('the frame size guard', () => {
     expect(JSON.parse(sent[0]!)).toMatchObject({ event: 'error' });
   });
 
+  it('never drops a terminal frame — it strips it instead', () => {
+    // `done` is how the server learns the turn ended. Withholding it hangs the
+    // request until a timeout, which is worse than the oversized frame this
+    // guard exists to prevent — and it is reachable: permission_denials carries
+    // each refused call's whole input, so one denied large write is enough.
+    const { bridge, sent } = bridgeWithFakeSocket();
+
+    send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'done',
+      data: {
+        usage: { input_tokens: 6, output_tokens: 12 },
+        cli_session_id: 'sess-1',
+        permission_denials: [{ tool_input: { content: 'x'.repeat(2 * 1024 * 1024) } }],
+      },
+    });
+
+    expect(sent).toHaveLength(1);
+    const done = JSON.parse(sent[0]!) as { event: string; data: Record<string, unknown> };
+
+    expect(done.event).toBe('done');
+    // The parts the server acts on survive; the informational bulk does not.
+    expect(done.data['usage']).toMatchObject({ input_tokens: 6 });
+    expect(done.data['cli_session_id']).toBe('sess-1');
+    expect(done.data['permission_denials']).toBeUndefined();
+    expect(done.data['truncated_by_bridge']).toBe(true);
+    expect(Buffer.byteLength(sent[0]!, 'utf8')).toBeLessThan(1024 * 1024);
+  });
+
+  it('keeps an oversized error terminal, shortened', () => {
+    const { bridge, sent } = bridgeWithFakeSocket();
+
+    send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'error',
+      data: { code: 'provider_error', message: 'y'.repeat(2 * 1024 * 1024) },
+    });
+
+    const error = JSON.parse(sent[0]!) as { event: string; data: Record<string, unknown> };
+    expect(error.event).toBe('error');
+    expect(error.data['code']).toBe('provider_error');
+    expect(String(error.data['message']).length).toBeLessThanOrEqual(2000);
+  });
+
   it('says nothing extra for a frame with no request to attach it to', () => {
     const { bridge, sent } = bridgeWithFakeSocket();
 

@@ -582,6 +582,33 @@ describe('what the turn cost and how it ran', () => {
     expect(done.permission_denials).toHaveLength(1);
   });
 
+  it('bounds the permission denials so the terminal frame stays sendable', async () => {
+    // A denial carries the refused call's whole input, so a denied large write
+    // would otherwise make `done` itself oversized.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'result', subtype: 'success', session_id: 's', usage: {},
+          permission_denials: [
+            { tool_name: 'Write', tool_input: { content: 'x'.repeat(2_000_000) } },
+            { tool_name: 'Bash', tool_input: { command: 'rm -rf /' } },
+          ],
+        },
+      ],
+    });
+
+    const done = of(events, 'done')[0]!;
+    const bytes = Buffer.byteLength(JSON.stringify({ type: 'stream', request_id: 'r', event: 'done', data: done.data }), 'utf8');
+
+    expect(bytes).toBeLessThan(900 * 1024);
+    // What was refused is the useful part, and it survives even when the
+    // refused arguments do not.
+    const denials = (done.data as { permission_denials: unknown[] }).permission_denials;
+    expect(denials.length).toBeGreaterThan(0);
+    expect(JSON.stringify(denials)).toContain('omitted');
+  });
+
   it('reports a missing field as null rather than inventing a zero', async () => {
     const events = await replay({
       lines: [

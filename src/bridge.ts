@@ -1722,6 +1722,20 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // on it.
     if (bytes > MAX_FRAME_BYTES) {
       log.error('Refusing to send an oversized frame', { type: message.type, bytes });
+
+      // A TERMINAL frame is never dropped. `done` is how the server learns the
+      // turn ended; withholding it hangs the request until a timeout, which is
+      // a worse outcome than the oversized frame this guard exists to prevent
+      // — and reachable, because `permission_denials` carries each refused
+      // call's whole input, so one denied large write is enough.
+      const stripped = this.stripToEssentials(message);
+      if (stripped !== null) {
+        this.ws.send(JSON.stringify(stripped));
+        log.warn('Sent a terminal frame with its payload stripped', { type: message.type, bytes });
+
+        return;
+      }
+
       this.sendOversizedFrameNotice(message, bytes);
 
       return;
@@ -1729,6 +1743,49 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
     this.ws.send(payload);
     log.debug('Message sent', { type: message.type, bytes });
+  }
+
+  /**
+   * Reduce a terminal frame to the part the server cannot do without.
+   *
+   * Returns null for anything that is not terminal — those are safe to drop and
+   * report, because a missing block event costs content while a missing `done`
+   * costs the whole request.
+   */
+  private stripToEssentials(message: BridgeToServerMessage): Record<string, unknown> | null {
+    const framed = message as unknown as Record<string, unknown>;
+    if (framed['type'] !== 'stream') return null;
+
+    const data = (framed['data'] ?? {}) as Record<string, unknown>;
+
+    if (framed['event'] === 'done') {
+      return {
+        type: 'stream',
+        request_id: framed['request_id'],
+        event: 'done',
+        // Usage and the session id are small and the server acts on both.
+        // Everything else the provider reported is informational.
+        data: {
+          usage: data['usage'] ?? null,
+          cli_session_id: data['cli_session_id'] ?? null,
+          truncated_by_bridge: true,
+        },
+      };
+    }
+
+    if (framed['event'] === 'error') {
+      return {
+        type: 'stream',
+        request_id: framed['request_id'],
+        event: 'error',
+        data: {
+          code: data['code'] ?? 'provider_error',
+          message: String(data['message'] ?? '').slice(0, 2000),
+        },
+      };
+    }
+
+    return null;
   }
 
   /**

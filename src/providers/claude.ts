@@ -646,8 +646,12 @@ export class ClaudeAdapter extends ProviderAdapter {
               duration_ms: num(parsed['duration_ms']),
               duration_api_ms: num(parsed['duration_api_ms']),
               num_turns: num(parsed['num_turns']),
+              // Bounded: each denial carries the refused call's whole input,
+              // so one denied large write would otherwise make the TERMINAL
+              // frame oversized — and a `done` that does not arrive hangs the
+              // request rather than costing one event.
               ...(Array.isArray(parsed['permission_denials'])
-                ? { permission_denials: parsed['permission_denials'] }
+                ? { permission_denials: boundDenials(parsed['permission_denials']) }
                 : {}),
             },
           });
@@ -817,4 +821,29 @@ function describePart(part: unknown): string {
   }
 
   return safeStringify(part, `[${type}: could not be serialised]`);
+}
+
+/**
+ * Keep the permission denials that fit, and say how many did not.
+ *
+ * Which tools were refused is the useful part — an empty answer with three
+ * denials reads very differently from one with none — and that survives even
+ * when the refused arguments do not.
+ */
+function boundDenials(denials: unknown[]): unknown[] {
+  const BUDGET = 32 * 1024;
+  const kept: unknown[] = [];
+  let used = 0;
+
+  for (const denial of denials) {
+    const size = Buffer.byteLength(safeStringify(denial, '{}'), 'utf8');
+    if (used + size > BUDGET) {
+      kept.push({ omitted: denials.length - kept.length, reason: 'too large to forward' });
+      break;
+    }
+    kept.push(denial);
+    used += size;
+  }
+
+  return kept;
 }
