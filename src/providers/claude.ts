@@ -621,39 +621,19 @@ export class ClaudeAdapter extends ProviderAdapter {
                 message: errText,
               },
             });
-            onEvent({ event: 'done', data: {} });
+            // The SAME metadata as a successful turn. A turn that fails still
+            // spent tokens and money — often more than one that succeeds — and
+            // this reported `{}`, so the cost of exactly the turns worth
+            // investigating was the cost that got thrown away. Stopping `done`'s
+            // fields being written into the ERROR frame was right; leaving the
+            // accompanying `done` empty was not.
+            onEvent({ event: 'done', data: doneDataFrom(parsed, model, providerVersion) });
             settled = true;
             return;
           }
 
-          const usage = parsed['usage'] as Record<string, unknown> | undefined;
-
           settleBlocks();
-          onEvent({
-            event: 'done',
-            data: {
-              usage: {
-                input_tokens: num(usage?.['input_tokens']),
-                output_tokens: num(usage?.['output_tokens']),
-                cache_creation_input_tokens: num(usage?.['cache_creation_input_tokens']),
-                cache_read_input_tokens: num(usage?.['cache_read_input_tokens']),
-              },
-              model,
-              provider_version: providerVersion,
-              stop_reason: typeof parsed['stop_reason'] === 'string' ? parsed['stop_reason'] : null,
-              cost_usd: num(parsed['total_cost_usd']),
-              duration_ms: num(parsed['duration_ms']),
-              duration_api_ms: num(parsed['duration_api_ms']),
-              num_turns: num(parsed['num_turns']),
-              // Bounded: each denial carries the refused call's whole input,
-              // so one denied large write would otherwise make the TERMINAL
-              // frame oversized — and a `done` that does not arrive hangs the
-              // request rather than costing one event.
-              ...(Array.isArray(parsed['permission_denials'])
-                ? { permission_denials: boundDenials(parsed['permission_denials']) }
-                : {}),
-            },
-          });
+          onEvent({ event: 'done', data: doneDataFrom(parsed, model, providerVersion) });
           settled = true;
           return;
         }
@@ -841,6 +821,42 @@ function describePart(part: unknown): string {
  * denials reads very differently from one with none — and that survives even
  * when the refused arguments do not.
  */
+/**
+ * What the CLI reported about a turn, whether it succeeded or failed.
+ *
+ * @param result the CLI's `result` frame
+ */
+function doneDataFrom(
+  result: Record<string, unknown>,
+  model: string | null,
+  providerVersion: string | null,
+): Record<string, unknown> {
+  const usage = result['usage'] as Record<string, unknown> | undefined;
+
+  return {
+    usage: {
+      input_tokens: num(usage?.['input_tokens']),
+      output_tokens: num(usage?.['output_tokens']),
+      cache_creation_input_tokens: num(usage?.['cache_creation_input_tokens']),
+      cache_read_input_tokens: num(usage?.['cache_read_input_tokens']),
+    },
+    model,
+    provider_version: providerVersion,
+    stop_reason: typeof result['stop_reason'] === 'string' ? result['stop_reason'] : null,
+    cost_usd: num(result['total_cost_usd']),
+    duration_ms: num(result['duration_ms']),
+    duration_api_ms: num(result['duration_api_ms']),
+    num_turns: num(result['num_turns']),
+    // Bounded: each denial carries the refused call's whole input, so one
+    // denied large write would otherwise make the TERMINAL frame oversized —
+    // and a `done` that does not arrive hangs the request rather than costing
+    // one event.
+    ...(Array.isArray(result['permission_denials'])
+      ? { permission_denials: boundDenials(result['permission_denials']) }
+      : {}),
+  };
+}
+
 function boundDenials(denials: unknown[]): unknown[] {
   const BUDGET = 32 * 1024;
   const kept: unknown[] = [];

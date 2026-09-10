@@ -75,6 +75,11 @@ const GEMINI_MODELS: ModelInfo[] = [
 
 const log = createLogger('GeminiAdapter');
 
+/** A reported count, or null — `as number` asserts rather than checks. */
+function geminiNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 export class GeminiAdapter extends ProviderAdapter {
   readonly providerName = 'gemini';
 
@@ -210,6 +215,7 @@ export class GeminiAdapter extends ProviderAdapter {
       let sessionId: string | null = null;
       let blockIndex = 0;
       let settled = false;
+      let reportedModel: string | null = null;
       let inTextBlock = false;
 
       const env = buildSpawnEnv(context.requestId);
@@ -282,7 +288,8 @@ export class GeminiAdapter extends ProviderAdapter {
         // ── init ─────────────────────────────────────────────
         if (type === 'init') {
           sessionId = (parsed['session_id'] as string) ?? null;
-          log.debug('Session init', { sessionId, model: parsed['model'] });
+          reportedModel = typeof parsed['model'] === 'string' ? parsed['model'] : null;
+          log.debug('Session init', { sessionId, model: reportedModel });
           return;
         }
 
@@ -482,16 +489,17 @@ export class GeminiAdapter extends ProviderAdapter {
 
           // Extract usage stats
           const stats = parsed['stats'] as Record<string, unknown> | undefined;
-          const inputTokens = stats ? (stats['input_tokens'] as number) ?? null : null;
-          const outputTokens = stats ? (stats['output_tokens'] as number) ?? null : null;
 
           onEvent({
             event: 'done',
             data: {
               usage: {
-                input_tokens: inputTokens,
-                output_tokens: outputTokens,
+                input_tokens: geminiNumber(stats?.['input_tokens']),
+                output_tokens: geminiNumber(stats?.['output_tokens']),
               },
+              // Read off the init frame, logged, and then thrown away. Absent
+              // tells the server "not reported", and the CLI DID report it.
+              ...(reportedModel !== null ? { model: reportedModel } : {}),
             },
           });
           settled = true;

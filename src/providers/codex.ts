@@ -95,6 +95,18 @@ export function resetCodexCdProbe(): void {
   codexSupportsCdPromise = null;
 }
 
+/**
+ * A reported count, or null.
+ *
+ * `x as number` is a promise to the compiler, not a check: a provider sending
+ * `"100"` would have had the string forwarded as if it were a count, and a
+ * consumer adding it up gets string concatenation. Claude's adapter has always
+ * validated; the siblings asserted.
+ */
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 export class CodexAdapter extends ProviderAdapter {
   readonly providerName = 'codex';
 
@@ -519,15 +531,19 @@ export class CodexAdapter extends ProviderAdapter {
           if (settled) return;
 
           const usage = parsed['usage'] as Record<string, unknown> | undefined;
-          const inputTokens = usage ? (usage['input_tokens'] as number) ?? null : null;
-          const outputTokens = usage ? (usage['output_tokens'] as number) ?? null : null;
 
           onEvent({
             event: 'done',
             data: {
               usage: {
-                input_tokens: inputTokens,
-                output_tokens: outputTokens,
+                input_tokens: numberOrNull(usage?.['input_tokens']),
+                output_tokens: numberOrNull(usage?.['output_tokens']),
+                // Codex says `cached_input_tokens`, and it was being dropped.
+                // PROTOCOL.md is emphatic that the cache counts are not a
+                // detail: a consumer shown only input and output understates a
+                // resumed turn by orders of magnitude and cannot reconcile its
+                // own numbers against the provider's bill.
+                cache_read_input_tokens: numberOrNull(usage?.['cached_input_tokens']),
               },
             },
           });

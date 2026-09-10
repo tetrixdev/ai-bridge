@@ -783,3 +783,99 @@ describe('the terminal frame, and the parts that are not text', () => {
     expect(result).not.toContain('BBBBBBBBBB');
   });
 });
+
+describe('the counters a mis-key would hide', () => {
+  /** A `result` frame with exactly these usage numbers. */
+  const withUsage = (usage: Record<string, number>, extra: Record<string, unknown> = {}) => ({
+    lines: [
+      { type: 'system', subtype: 'init', session_id: 's', model: 'claude-x' },
+      { type: 'result', subtype: 'success', session_id: 's', usage, ...extra },
+    ],
+  });
+
+  it('reads each cache counter from its OWN key', async () => {
+    // The test protecting these asserted `cache_read > 1000` and
+    // `cache_creation > 0`, which both hold when the two read the SAME source
+    // key — so a swapped or mis-keyed cache counter passed. PROTOCOL.md calls
+    // these "not a detail": distinct values are the only thing that can tell.
+    const events = await replay(withUsage({
+      input_tokens: 11,
+      output_tokens: 22,
+      cache_creation_input_tokens: 33,
+      cache_read_input_tokens: 44,
+    }));
+
+    const usage = (of(events, 'done')[0]!.data as unknown as {
+      usage: Record<string, number | null | undefined>;
+    }).usage;
+
+    expect(usage).toEqual({
+      input_tokens: 11,
+      output_tokens: 22,
+      cache_creation_input_tokens: 33,
+      cache_read_input_tokens: 44,
+    });
+  });
+
+  it('reads each duration from its OWN key', async () => {
+    // `duration_api_ms` was asserted nowhere, so it could be filled from
+    // `duration_ms` and nothing would notice.
+    const events = await replay(withUsage({}, {
+      duration_ms: 8000, duration_api_ms: 3000, num_turns: 2, total_cost_usd: 0.5,
+    }));
+
+    const done = of(events, 'done')[0]!.data as unknown as Record<string, unknown>;
+
+    expect(done['duration_ms']).toBe(8000);
+    expect(done['duration_api_ms']).toBe(3000);
+    expect(done['num_turns']).toBe(2);
+    expect(done['cost_usd']).toBe(0.5);
+  });
+
+  it('keeps what a FAILED turn cost', async () => {
+    // A turn that fails still spent tokens and money, often more than one that
+    // succeeds — and this reported `{}`, so the cost of exactly the turns worth
+    // investigating was the cost thrown away.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's', model: 'claude-x' },
+        {
+          type: 'result', subtype: 'error_during_execution', session_id: 's', is_error: true,
+          errors: ['it went wrong'],
+          usage: { input_tokens: 100, output_tokens: 5 },
+          total_cost_usd: 0.41, num_turns: 2, duration_ms: 900,
+        },
+      ],
+    });
+
+    expect(of(events, 'error')).toHaveLength(1);
+
+    const done = of(events, 'done')[0]!.data as unknown as Record<string, unknown>;
+
+    expect(done['cost_usd']).toBe(0.41);
+    expect(done['num_turns']).toBe(2);
+    expect((done['usage'] as Record<string, unknown>)['input_tokens']).toBe(100);
+  });
+
+  it('measures the denial budget in BYTES, not code units', async () => {
+    // The unit in the code was right and the test used ASCII, where the two are
+    // equal — so measuring in UTF-16 length passed. Multi-byte denials are what
+    // tell the difference: 3 bytes per character against 1 code unit.
+    const denial = (i: number) => ({
+      tool_name: 'Write', tool_use_id: `tu_${i}`,
+      tool_input: { content: '漢'.repeat(4000) },
+    });
+    const events = await replay(withUsage({}, {
+      permission_denials: [denial(1), denial(2), denial(3), denial(4)],
+    }));
+
+    const done = of(events, 'done')[0]!.data as unknown as Record<string, unknown>;
+    const encoded = Buffer.byteLength(JSON.stringify(done['permission_denials']), 'utf8');
+
+    // 4 denials x ~12 KB of encoded bytes is over the 32 KB budget, so some are
+    // omitted. Measured in code units the same input looks like ~16 KB and all
+    // four would be kept.
+    expect(encoded).toBeLessThanOrEqual(33 * 1024);
+    expect(JSON.stringify(done['permission_denials'])).toContain('omitted');
+  });
+});
