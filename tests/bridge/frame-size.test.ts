@@ -240,4 +240,54 @@ describe('the fallbacks the guard itself produces', () => {
     expect(Buffer.byteLength(sent[0]!, 'utf8')).toBeLessThanOrEqual(MAX);
     expect(JSON.parse(sent[0]!)).toMatchObject({ event: 'error', request_id: 'r1' });
   });
+  it('reduces a frame it cannot even encode, instead of throwing', () => {
+    // `send` runs inside a readline listener. An exception there is caught by
+    // nothing and takes the process down — a worse outcome than any frame.
+    const { bridge, sent } = bridgeWithFakeSocket();
+    const circular: Record<string, unknown> = { block_index: 0 };
+    circular['self'] = circular;
+
+    expect(() => send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'block_delta', data: circular,
+    })).not.toThrow();
+
+    expect(sent).toHaveLength(1);
+    const frame = JSON.parse(sent[0]!) as { event: string; request_id: string; data: Record<string, unknown> };
+
+    expect(frame.event).toBe('error');
+    expect(frame.request_id).toBe('r1');
+    expect(frame.data['code']).toBe('frame_too_large');
+    expect(String(frame.data['message'])).toContain('could not encode');
+  });
+
+  it('still ends the turn when the terminal frame is the unencodable one', () => {
+    const { bridge, sent } = bridgeWithFakeSocket();
+    const usage: Record<string, unknown> = { input_tokens: 1 };
+    usage['self'] = usage;
+
+    expect(() => send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'done',
+      data: { usage, cli_session_id: 'sess-1' },
+    })).not.toThrow();
+
+    expect(sent).toHaveLength(1);
+    const frame = JSON.parse(sent[0]!) as { event: string; data: Record<string, unknown> };
+
+    // The first fallback carries the circular usage and cannot be encoded
+    // either; the second drops it, so the turn still ends.
+    expect(frame.event).toBe('done');
+    expect(frame.data['usage']).toBeNull();
+  });
+
+  it('says how far over the limit the frame was', () => {
+    const { bridge, sent } = bridgeWithFakeSocket();
+
+    send(bridge, {
+      type: 'stream', request_id: 'r1', event: 'tool_result',
+      data: { tool_call_id: 't1', result: 'x'.repeat(2 * 1024 * 1024) },
+    });
+
+    const frame = JSON.parse(sent[0]!) as { data: Record<string, unknown> };
+    expect(String(frame.data['message'])).toMatch(/\d{7} bytes/);
+  });
 });

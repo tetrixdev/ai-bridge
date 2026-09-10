@@ -1707,8 +1707,23 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return;
     }
 
-    const payload = JSON.stringify(message);
-    const bytes = Buffer.byteLength(payload, 'utf8');
+    // `JSON.stringify` throws on a circular structure or a BigInt. Nothing
+    // reaching here should hold either — every field is parsed from CLI output
+    // or built locally — but this runs inside a readline listener, where an
+    // exception is not caught by anything and takes the process with it. A
+    // frame that cannot be encoded is treated exactly like one that is too
+    // large: reduced to something that can be.
+    let payload: string | null = null;
+    try {
+      payload = JSON.stringify(message);
+    } catch (err) {
+      log.error('Could not encode a frame', {
+        type: message.type,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    const bytes = payload === null ? -1 : Buffer.byteLength(payload, 'utf8');
 
     // The one place a frame is serialised, and so the one place its size can be
     // checked once for every field rather than at each producer.
@@ -1720,8 +1735,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // the cap, and the failure is a message the server can read rather than a
     // CLOSE_TOO_BIG that tears the connection down with every in-flight request
     // on it.
-    if (bytes > MAX_FRAME_BYTES) {
-      log.error('Refusing to send an oversized frame', { type: message.type, bytes });
+    if (payload === null || bytes > MAX_FRAME_BYTES) {
+      if (payload !== null) log.error('Refusing to send an oversized frame', { type: message.type, bytes });
 
       // A TERMINAL frame is never dropped. `done` is how the server learns the
       // turn ended; withholding it hangs the request until a timeout, which is
@@ -1735,7 +1750,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // both provider-supplied and neither bounded anywhere, so the stripped
       // frame CAN still be over the cap — and then closes the connection
       // exactly as if the guard were not here.
-      for (const fallback of this.fallbacksFor(message)) {
+      for (const fallback of this.fallbacksFor(message, bytes)) {
         if (this.trySend(fallback)) {
           log.warn('Sent a reduced frame in place of an oversized one', { type: message.type, bytes });
 
@@ -1755,6 +1770,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.ws.send(payload);
     log.debug('Message sent', { type: message.type, bytes });
   }
+
 
   /**
    * Send a frame only if it fits. Returns whether it went.
@@ -1784,7 +1800,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * first. The last one carries nothing but the request id and a reason, so it
    * fits unless the id alone does not.
    */
-  private *fallbacksFor(message: BridgeToServerMessage): Generator<Record<string, unknown>> {
+  private *fallbacksFor(message: BridgeToServerMessage, bytes: number): Generator<Record<string, unknown>> {
     const stripped = this.stripToEssentials(message);
     if (stripped !== null) {
       yield stripped;
@@ -1815,7 +1831,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       event: 'error',
       data: {
         code: 'frame_too_large',
-        message: `The bridge dropped a ${event} frame over the ${MAX_FRAME_BYTES}-byte limit.`,
+        message: bytes < 0
+          ? `The bridge dropped a ${event} frame it could not encode.`
+          : `The bridge dropped a ${event} frame of ${bytes} bytes, over the ${MAX_FRAME_BYTES}-byte limit.`,
       },
     };
   }
