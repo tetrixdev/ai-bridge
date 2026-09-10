@@ -394,7 +394,14 @@ export class GeminiAdapter extends ProviderAdapter {
         // ── tool_result ──────────────────────────────────────
         if (type === 'tool_result') {
           const toolId = parsed['tool_id'] as string;
-          const output = (parsed['output'] as string) ?? '';
+          // Validated, not asserted. `as string` is a promise to the compiler,
+          // not a check: an array or object here reached `replaceLoneSurrogates`
+          // and threw `text.charCodeAt is not a function` INSIDE the readline
+          // listener, where nothing catches it — no `uncaughtException` handler
+          // exists — taking the daemon down with every in-flight request on it.
+          // Both sibling adapters already guard this.
+          const raw = parsed['output'];
+          const output = typeof raw === 'string' ? raw : safeStringify(raw ?? '', '');
           const status = parsed['status'] as string;
 
           // `is_error` is structural, alongside the `Error: ` prefix rather

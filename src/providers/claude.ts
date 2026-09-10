@@ -34,7 +34,7 @@ import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt }
 import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundArguments, safeStringify, toolResultEventData } from './result-text.js';
+import { boundArguments, replaceLoneSurrogateEscapes, safeStringify, toolResultEventData } from './result-text.js';
 import { ClaudePartialStreamMapper } from './claude-partial.js';
 import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
@@ -809,8 +809,14 @@ function describePart(part: unknown): string {
     : undefined;
   const holder = source ?? resource ?? record;
   const binary = holder['data'] ?? holder['blob'];
+  // A base64 payload is binary whatever the part calls itself. Keying on the
+  // TYPE NAME let a `document` part carrying a PDF in `source.data` fall through
+  // to `safeStringify`, which inlines the whole thing: measured at 1.2 million
+  // characters across five frames. That used to be capped at 256 KB by
+  // `boundResult`; removing that bound in favour of chunking turned a bounded
+  // leak into one with a 16 MB ceiling.
   const isBinary = type === 'image' || type === 'audio'
-    || (resource !== undefined && typeof holder['blob'] === 'string');
+    || ((source !== undefined || resource !== undefined) && typeof binary === 'string');
 
   if (isBinary) {
     const media = ['media_type', 'mimeType', 'mime_type']
@@ -841,12 +847,28 @@ function boundDenials(denials: unknown[]): unknown[] {
   let used = 0;
 
   for (const denial of denials) {
-    const size = Buffer.byteLength(safeStringify(denial, '{}'), 'utf8');
+    // Scrubbed, not merely measured. A denial carries the refused call's whole
+    // input — model-authored text, which is exactly where a lone surrogate
+    // comes from — and this was the one field on the TERMINAL frame passed
+    // through raw. `JSON.stringify` succeeds and the frame is small, so neither
+    // the size guard nor the encode fallback engages; PHP's `json_decode` then
+    // rejects the whole document and the turn's only terminal is lost, leaving
+    // the request to hang to a timeout.
+    const encoded = replaceLoneSurrogateEscapes(safeStringify(denial, '{}'));
+    const size = Buffer.byteLength(encoded, 'utf8');
     if (used + size > BUDGET) {
       kept.push({ omitted: denials.length - kept.length, reason: 'too large to forward' });
       break;
     }
-    kept.push(denial);
+
+    let clean: unknown = denial;
+    try {
+      clean = JSON.parse(encoded);
+    } catch {
+      clean = { omitted: 1, reason: 'could not be encoded' };
+    }
+
+    kept.push(clean);
     used += size;
   }
 

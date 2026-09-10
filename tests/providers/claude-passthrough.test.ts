@@ -696,3 +696,90 @@ describe('rate limit status', () => {
     expect(events.map((e) => e.event)).toEqual(['done']);
   });
 });
+
+describe('the terminal frame, and the parts that are not text', () => {
+  it('scrubs a lone surrogate out of a permission denial', async () => {
+    // A denial carries the refused call's whole input — model-authored text,
+    // which is exactly where a lone surrogate comes from — and it was the one
+    // field on the TERMINAL frame passed through raw. The frame is small, so
+    // the size guard never engages; JSON.stringify succeeds, so the encode
+    // fallback never engages. PHP's json_decode then rejects the whole document
+    // and the turn's only terminal is lost, leaving the request to time out.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'result', subtype: 'success', session_id: 's', usage: {},
+          permission_denials: [{
+            tool_name: 'Write', tool_use_id: 'tu_1',
+            tool_input: { file_path: '/tmp/a', content: 'hi \ud83d' },
+          }],
+        },
+      ],
+    });
+
+    const done = of(events, 'done')[0]!.data as Record<string, unknown>;
+    const encoded = JSON.stringify(done);
+
+    expect(/\\ud83d(?!\\ude)/i.test(encoded)).toBe(false);
+    expect(() => JSON.parse(encoded)).not.toThrow();
+    // Scrubbed, not dropped: the denial is still reported.
+    expect(JSON.stringify(done['permission_denials'])).toContain('Write');
+  });
+
+  it('describes a document part instead of inlining its base64', async () => {
+    // Keyed on the TYPE NAME, a `document` carrying a PDF in `source.data` fell
+    // through to safeStringify and was inlined whole — measured at 1.2 million
+    // characters. `boundResult` used to cap that at 256 KB; removing it in
+    // favour of chunking raised the ceiling to 16 MB.
+    const base64 = 'A'.repeat(1_200_000);
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: {
+            content: [{
+              type: 'tool_result', tool_use_id: 't1',
+              content: [{
+                type: 'document',
+                source: { type: 'base64', media_type: 'application/pdf', data: base64 },
+              }],
+            }],
+          },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    const results = of(events, 'tool_result').map((e) => (e.data as { result: string }).result);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!).not.toContain(base64.slice(0, 200));
+    expect(results[0]!).toContain('application/pdf');
+    expect(results[0]!).toMatch(/\d+ KB/);
+  });
+
+  it('still describes an image part', async () => {
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        {
+          type: 'user',
+          message: {
+            content: [{
+              type: 'tool_result', tool_use_id: 't1',
+              content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'B'.repeat(40_000) } }],
+            }],
+          },
+        },
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+    });
+
+    const result = (of(events, 'tool_result')[0]!.data as { result: string }).result;
+
+    expect(result).toContain('image/png');
+    expect(result).not.toContain('BBBBBBBBBB');
+  });
+});
