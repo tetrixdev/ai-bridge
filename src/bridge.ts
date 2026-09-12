@@ -16,7 +16,9 @@
  *   - Lifecycle event emission
  */
 
+import { createReadStream, statSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
+import { basename } from 'node:path';
 import WebSocket from 'ws';
 import type {
   ProviderCapability,
@@ -60,6 +62,8 @@ import { attachmentDirFor, removeAttachmentDir } from './attachments/store.js';
 import {
   ATTACH_FILE_TOOL,
   ATTACH_FILE_TOOL_DEFINITION,
+  mimeTypeFor,
+  resolveUploadPath,
   uploadAttachment,
   type UploadContext,
 } from './attachments/upload.js';
@@ -322,6 +326,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly onTestRequest?: BridgeOptions['onTestRequest'];
 
   private sessionId: string | null = null;
+  /** Files going out right now, so a cancel can stop one. */
+  private readonly transfers = new Map<string, () => void>();
+
   private serverConfig: ServerConfig = {
     heartbeat_interval: DEFAULT_HEARTBEAT_SECONDS,
     request_timeout: DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -494,6 +501,29 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       throw new Error('path is required and must be a string');
     }
 
+    // Where the file should END UP is the server's call, because only the
+    // server knows what this machine is. A machine somebody works on makes
+    // files that belong on its own disk; a machine that is only AI compute has
+    // no disk anybody can reach once the process ends.
+    if (this.serverConfig.attachments === 'device') {
+      const path = resolveUploadPath(rawPath, ctx);
+      const stat = statSync(path);
+
+      // No id: nothing was uploaded, so nothing minted one. The server makes it
+      // and remembers the path, and asks for the bytes if anybody clicks.
+      this.sendStreamEvent(requestId, 'attachment', {
+        id: null,
+        name: basename(path),
+        mime_type: mimeTypeFor(path),
+        size: stat.size,
+        path,
+        ...(description ? { description } : {}),
+      });
+
+      log.info('Attachment kept on this machine', { requestId, path, size: stat.size });
+      return `Offered "${basename(path)}" in the chat. It stays on this machine and is sent only if they open it.`;
+    }
+
     const uploaded = await uploadAttachment(rawPath, description, ctx);
 
     this.sendStreamEvent(requestId, 'attachment', {
@@ -512,6 +542,59 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     });
 
     return `Sent "${uploaded.name}" to the user in the chat.`;
+  }
+
+  /**
+   * Send a file this machine kept, in pieces, because the server asked.
+   *
+   * The path came from here originally and it still gets re-resolved: it went
+   * out over a socket and came back, so it is input on the way in however it
+   * started. Anything outside the working directory is refused, by the same
+   * function the upload path uses, so there is one rule rather than two.
+   *
+   * `stream_end` is sent on EVERY path including failure. The server bounds
+   * silence rather than duration, so a bridge that dies quietly costs whoever
+   * clicked that whole window before their download gives up.
+   */
+  private async handleAttachmentRead(message: { id: string; path: string }): Promise<void> {
+    const { id } = message;
+    try {
+      // Any turn's context will do for the guard: the working directory is the
+      // machine's, not the request's. Without one there is nothing to resolve
+      // against and refusing is the only safe answer.
+      const ctx = [...this.uploadContexts.values()][0];
+      if (!ctx) throw new Error('no working directory is established on this machine');
+
+      const path = resolveUploadPath(message.path, ctx);
+      const stream = createReadStream(path, { highWaterMark: 64 * 1024 });
+      this.transfers.set(id, () => stream.destroy());
+
+      for await (const chunk of stream) {
+        // Stopped while we were reading. Silence is not enough: the loop would
+        // run to the end of the file first.
+        if (!this.transfers.has(id)) return;
+        this.send({ type: 'stream_chunk', id, data: (chunk as Buffer).toString('base64') });
+      }
+      this.send({ type: 'stream_end', id });
+    } catch (error) {
+      // The message reaches a person: it is shown where their download should
+      // have been, so "ENOENT" alone would be no use to them.
+      this.send({
+        type: 'stream_end',
+        id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      this.transfers.delete(id);
+    }
+  }
+
+  /** The reader went away. Stop reading: otherwise this machine works through a
+   *  file for somebody who closed the tab. */
+  private cancelTransfer(id: string): void {
+    const stop = this.transfers.get(id);
+    this.transfers.delete(id);
+    stop?.();
   }
 
   /**
@@ -800,6 +883,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         break;
       case 'local_call':
         this.handleLocalCallMessage(message);
+        break;
+      case 'attachment_read':
+        void this.handleAttachmentRead(message as unknown as { id: string; path: string });
+        break;
+      case 'stream_cancel':
+        this.cancelTransfer((message as unknown as { id: string }).id);
         break;
       default:
         log.warn('Unknown message type received', { type: (message as { type: string }).type });
