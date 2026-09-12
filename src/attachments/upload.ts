@@ -211,3 +211,30 @@ export async function uploadAttachment(
     ...(body.url ? { url: body.url } : {}),
   };
 }
+
+/**
+ * A guess at what a file is, from its name.
+ *
+ * A guess is all this can be: the alternative is sniffing content, and the
+ * server treats the answer as a claim either way — it serves every attachment
+ * with `nosniff` and a download disposition, so a wrong type costs a label and
+ * not a security property.
+ *
+ * Short on purpose. The long tail is `application/octet-stream`, which is the
+ * honest answer for a file nobody can identify, and a browser saving it does
+ * the right thing regardless.
+ */
+const TYPES: Record<string, string> = {
+  txt: 'text/plain', md: 'text/markdown', csv: 'text/csv',
+  json: 'application/json', xml: 'application/xml', yaml: 'text/yaml', yml: 'text/yaml',
+  html: 'text/html', css: 'text/css', js: 'text/javascript', ts: 'text/plain',
+  pdf: 'application/pdf', zip: 'application/zip', gz: 'application/gzip',
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  svg: 'image/svg+xml', webp: 'image/webp',
+  mp3: 'audio/mpeg', wav: 'audio/wav', mp4: 'video/mp4', webm: 'video/webm',
+};
+
+export function mimeTypeFor(path: string): string {
+  const ext = path.split('.').pop()?.toLowerCase() ?? '';
+  return TYPES[ext] ?? 'application/octet-stream';
+}

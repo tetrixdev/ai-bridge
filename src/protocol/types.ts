@@ -370,7 +370,9 @@ export type BridgeToServerMessage =
   | BridgeErrorMessage
   | ProvidersUpdateMessage
   | PostureMessage
-  | LocalResultMessage;
+  | LocalResultMessage
+  | StreamChunkMessage
+  | StreamEndMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Bridge Messages
@@ -448,6 +450,52 @@ export interface ServerConfig {
   heartbeat_interval: number;
   /** Maximum seconds for a single AI request. */
   request_timeout: number;
+  /**
+   * What should happen to a file the assistant hands back.
+   *
+   * `server` uploads it, which is what has always happened and remains the
+   * default when a server does not say. `device` keeps it here and streams it
+   * when the server asks, for the case where this machine is somewhere
+   * somebody works rather than a processor: the file is one of a thousand on
+   * this disk, and sending a copy away takes a copy of their work for no
+   * reason.
+   *
+   * The server decides because only the server knows which of those it is.
+   */
+  attachments?: 'server' | 'device';
+}
+
+/** Data payload for `attachment_read` — the server asking for a file this
+ *  machine kept. `id` names the TRANSFER, not the file. */
+export interface AttachmentReadMessage {
+  type: 'attachment_read';
+  id: string;
+  path: string;
+}
+
+/** One piece of a file on its way back. `data` is base64: these are text
+ *  frames, and a third more bytes on the wire is cheaper than a second
+ *  protocol for binary and a second set of framing bugs to find. */
+export interface StreamChunkMessage {
+  type: 'stream_chunk';
+  id: string;
+  data: string;
+}
+
+/** The end of a transfer, sent on EVERY path including failure. A server
+ *  bounds silence rather than duration, so a bridge that dies quietly costs
+ *  the reader that whole window before their download fails. */
+export interface StreamEndMessage {
+  type: 'stream_end';
+  id: string;
+  error?: string;
+}
+
+/** The reader went away. Stop: otherwise this machine keeps reading a file for
+ *  somebody who closed the tab. */
+export interface StreamCancelMessage {
+  type: 'stream_cancel';
+  id: string;
 }
 
 /** A single prior turn in a conversation's history. */
@@ -599,7 +647,9 @@ export type ServerToBridgeMessage =
   | ErrorMessage
   | ConnectionErrorMessage
   | TokenRefreshMessage
-  | LocalCallMessage;
+  | LocalCallMessage
+  | AttachmentReadMessage
+  | StreamCancelMessage;
 
 // ---------------------------------------------------------------------------
 // Stream Event Types and Data
@@ -679,11 +729,25 @@ export interface ToolResultData {
  * is the answer. A server that does not understand the event ignores it.
  */
 export interface AttachmentEventData {
-  /** The id the server assigned when the bridge uploaded the file. */
-  id: string;
+  /**
+   * The id the server assigned when the bridge uploaded the file.
+   *
+   * NULL when the file was KEPT rather than uploaded: nothing uploaded it, so
+   * nothing minted an id, and the server makes one when it records the offer.
+   */
+  id: string | null;
   name: string;
   mime_type: string;
   size: number;
+  /**
+   * Where the file is on this machine, when it stayed here.
+   *
+   * Present only in `device` mode, and it is what tells the server the bytes
+   * have not been sent. It comes back later in an `attachment_read`, and is
+   * re-resolved against the working directory then: it left this machine, so
+   * it is input on the way back however it started.
+   */
+  path?: string;
   /** Whatever the model said the file is, when it said anything. */
   description?: string;
 }
