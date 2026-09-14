@@ -1180,7 +1180,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // kills the whole turn to report one failed tool.
     const turnLife = this.serverConfig.silence_timeout ?? DEFAULT_SILENCE_TIMEOUT_SECONDS;
     const resolveSeconds = turnLife > 0
-      ? Math.max(Math.floor(turnLife * 0.9), 10)
+      // Strictly BELOW the silence bound, which a floor of 10 quietly defeated:
+      // at a bound of 10 it returned 10, the two timers raced, and an
+      // unanswered tool call could end the whole turn with
+      // `silence_timeout_exceeded` instead of handing the CLI a tool error it
+      // could report and carry on from.
+      ? Math.max(1, Math.min(Math.floor(turnLife * 0.9), turnLife - 1))
       : TOOL_RESOLVE_TIMEOUT_MAX_S;
     this.toolResolver.setTimeoutMs(Math.min(resolveSeconds, TOOL_RESOLVE_TIMEOUT_MAX_S) * 1000);
 

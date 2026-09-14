@@ -47,6 +47,7 @@ function check(name, ok, detail = '') {
  */
 async function turn({ isolation = 'workspace', request, args = [], assets = {}, tools = [], toolResult = null, silenceTimeout = null, timeoutMs = 120_000 }) {
   const frames = [];
+  let requestSentAt = 0;
   let advertised = null;
   let toolCalled = false;
 
@@ -92,6 +93,7 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
           }));
           if (request) {
             // The port is only known now, so callers write __ORIGIN__.
+            requestSentAt = Date.now();
             ws.send(JSON.stringify(request).replaceAll('__ORIGIN__', origin));
           } else {
             setTimeout(resolve, 400);
@@ -137,9 +139,13 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
     // The longest the bridge said NOTHING. This is the quantity the silence
     // bound measures, so it is the only way to check the bound against a real
     // turn rather than against an assumption about one.
-    maxSilenceMs: stream.reduce((max, f, i) => (
-      i === 0 ? 0 : Math.max(max, (f.__at ?? 0) - (stream[i - 1].__at ?? 0))
-    ), 0),
+    // Counted from when the REQUEST went out, not from the first frame. Starting
+    // at the first frame misses the longest silence a turn can have — the one
+    // before it says anything at all — and makes a one-frame turn report zero.
+    maxSilenceMs: stream.reduce(
+      (max, f, i) => Math.max(max, (f.__at ?? 0) - (i === 0 ? requestSentAt : (stream[i - 1].__at ?? 0))),
+      0,
+    ),
     // Every stream frame, verbatim, so a run can be replayed through the OTHER
     // implementation. Every other check here reads the bridge's output with the
     // bridge's own eyes; this is the only way to see whether the server can

@@ -248,6 +248,19 @@ describe('how long the bridge waits for the server to answer a tool call', () =>
     expect(seconds).toBeLessThan(100);
   });
 
+  it('stays below the silence bound even at its smallest', () => {
+    // A floor of 10 seconds defeated the margin exactly where it mattered: at a
+    // bound of 10, `max(floor(9), 10)` returned 10, the two timers raced, and
+    // an unanswered tool call could end the whole turn rather than handing the
+    // CLI an error it could report and carry on from.
+    for (const bound of [10, 11, 20, 100, 900]) {
+      const seconds = resolverSecondsFor({ request_timeout: 86400, silence_timeout: bound });
+
+      expect(seconds).toBeLessThan(bound);
+      expect(seconds).toBeGreaterThan(0);
+    }
+  });
+
   it('never waits longer than an hour, whatever the silence bound says', () => {
     const seconds = resolverSecondsFor({ request_timeout: 86400, silence_timeout: 86400 });
 
