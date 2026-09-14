@@ -156,7 +156,7 @@ const DEFAULT_REQUEST_TIMEOUT_SECONDS = 86400;
 const DEFAULT_SILENCE_TIMEOUT_SECONDS = 900;
 
 /**
- * How long to wait for the server to resolve a tool call.
+ * Hard ceiling on how long to wait for the server to resolve a tool call.
  *
  * Deliberately NOT the request timeout, which it used to borrow. That value is
  * now a 24-hour backstop, and inheriting it would leave the CLI blocked for a
@@ -1166,13 +1166,23 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       this.serverConfig.silence_timeout = clamped;
     }
 
-    // The tool resolver gets its OWN ceiling. It used to borrow
-    // request_timeout, which is now a 24-hour backstop — inheriting that would
-    // block the CLI for a day on a server that never answers a tool call.
-    const resolveSeconds = this.serverConfig.request_timeout > 0
-      ? Math.min(this.serverConfig.request_timeout, TOOL_RESOLVE_TIMEOUT_MAX_S)
+    // How long to wait for the server to answer a tool call, derived from the
+    // SILENCE bound rather than the wall clock it used to borrow.
+    //
+    // The reasoning it inherited was "do not wait longer than the turn can
+    // live", and the turn's life is now measured by silence — a CLI blocked on
+    // an unanswered tool call emits nothing, so the silence clock is what ends
+    // it. Following the wall clock instead would mean waiting a day.
+    //
+    // Cut slightly SHORT of that bound on purpose: a tool call that fails gives
+    // the CLI an error it can report and continue from, and emitting that
+    // result resets the silence clock. Waiting for the silence clock instead
+    // kills the whole turn to report one failed tool.
+    const turnLife = this.serverConfig.silence_timeout ?? DEFAULT_SILENCE_TIMEOUT_SECONDS;
+    const resolveSeconds = turnLife > 0
+      ? Math.max(Math.floor(turnLife * 0.9), 10)
       : TOOL_RESOLVE_TIMEOUT_MAX_S;
-    this.toolResolver.setTimeoutMs(resolveSeconds * 1000);
+    this.toolResolver.setTimeoutMs(Math.min(resolveSeconds, TOOL_RESOLVE_TIMEOUT_MAX_S) * 1000);
 
     // Adopt the server's CLI isolation posture. Older servers that don't
     // send the field get the safe default (`isolated`) — never the legacy

@@ -8,6 +8,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { buildSpawnEnv } from '../../src/providers/env.js';
 import { clampRequestTimeout, clampSilenceTimeout, clampHeartbeat } from '../../src/utils/clamp.js';
+import { Bridge } from '../../src/bridge.js';
 
 // ---------------------------------------------------------------------------
 // Clamping of server-provided timeout/heartbeat
@@ -186,5 +187,64 @@ describe('BL-002: Gemini settled guard (direct logic test)', () => {
 
     expect(events).toEqual(['done']);
     expect(events.filter((e) => e === 'done').length).toBe(1);
+  });
+});
+
+describe('how long the bridge waits for the server to answer a tool call', () => {
+  /** Apply a welcome config and report the resolver timeout it produced. */
+  function resolverSecondsFor(config: Record<string, unknown>): number {
+    const bridge = new Bridge({
+      serverUrl: 'wss://example.test/ws',
+      token: 'tok',
+      providers: [],
+      adapters: new Map(),
+      sessionStorePath: null,
+      allowedRoots: [],
+      allowNative: false,
+    });
+    let ms = 0;
+    (bridge as unknown as { toolResolver: { setTimeoutMs(v: number): void } }).toolResolver = {
+      setTimeoutMs: (v: number) => { ms = v; },
+    };
+    (bridge as unknown as { handleWelcome(m: unknown): void }).handleWelcome({
+      type: 'welcome',
+      session_id: 's',
+      // `tools` is required: handleWelcome reads its length, and omitting it
+      // leaves an unhandled rejection that the test still passes through.
+      tools: [],
+      config: { heartbeat_interval: 30, ...config },
+    });
+
+    return ms / 1000;
+  }
+
+  it('follows the silence bound, not the 24-hour backstop', () => {
+    // It used to borrow request_timeout. That is now a day, and inheriting it
+    // would block the CLI for a day on a server that never answers.
+    const seconds = resolverSecondsFor({ request_timeout: 86400, silence_timeout: 900 });
+
+    expect(seconds).toBeLessThan(900);
+    expect(seconds).toBeGreaterThan(600);
+  });
+
+  it('stops short of the silence bound, so a failed tool does not kill the turn', () => {
+    // A tool error is something the CLI can report and continue from, and
+    // emitting that result resets the silence clock. Waiting for the silence
+    // clock instead ends the whole turn to report one failed tool.
+    const seconds = resolverSecondsFor({ request_timeout: 86400, silence_timeout: 100 });
+
+    expect(seconds).toBeLessThan(100);
+  });
+
+  it('never waits longer than an hour, whatever the silence bound says', () => {
+    const seconds = resolverSecondsFor({ request_timeout: 86400, silence_timeout: 86400 });
+
+    expect(seconds).toBeLessThanOrEqual(3600);
+  });
+
+  it('falls back to the ceiling when the server bounds nothing', () => {
+    const seconds = resolverSecondsFor({ request_timeout: 0, silence_timeout: 0 });
+
+    expect(seconds).toBe(3600);
   });
 });
