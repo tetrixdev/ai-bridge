@@ -45,7 +45,7 @@ function check(name, ok, detail = '') {
  * `isolation` of 'omit' leaves `cli_isolation` off the welcome entirely, which
  * is how a server predating this feature behaves.
  */
-async function turn({ isolation = 'workspace', request, args = [], assets = {}, tools = [], toolResult = null, timeoutMs = 120_000 }) {
+async function turn({ isolation = 'workspace', request, args = [], assets = {}, tools = [], toolResult = null, silenceTimeout = null, timeoutMs = 120_000 }) {
   const frames = [];
   let advertised = null;
   let toolCalled = false;
@@ -83,7 +83,11 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
             type: 'welcome',
             session_id: 'manual-e2e',
             tools,
-            config: { heartbeat_interval: 30, request_timeout: 300 },
+            config: {
+              heartbeat_interval: 30,
+              request_timeout: 86400,
+              silence_timeout: silenceTimeout ?? 900,
+            },
             ...(isolation === 'omit' ? {} : { cli_isolation: isolation }),
           }));
           if (request) {
@@ -130,6 +134,12 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
       .map((f) => ({ name: f.data.tool_name, id: f.data.tool_call_id })),
     toolResults: stream.filter((f) => f.event === 'tool_result').map((f) => f.data),
     doneData: stream.find((f) => f.event === 'done')?.data ?? null,
+    // The longest the bridge said NOTHING. This is the quantity the silence
+    // bound measures, so it is the only way to check the bound against a real
+    // turn rather than against an assumption about one.
+    maxSilenceMs: stream.reduce((max, f, i) => (
+      i === 0 ? 0 : Math.max(max, (f.__at ?? 0) - (stream[i - 1].__at ?? 0))
+    ), 0),
     // Every stream frame, verbatim, so a run can be replayed through the OTHER
     // implementation. Every other check here reads the bridge's output with the
     // bridge's own eyes; this is the only way to see whether the server can
@@ -422,6 +432,19 @@ try {
     console.log(chunked.length > 1
       ? `        (the CLI passed the result through whole; the bridge chunked it into ${chunked.length})`
       : `        (the CLI cut the result to ${carried.length} of ${bigPayload.length} chars before the bridge saw it)`);
+
+    // How long the bridge actually goes quiet on a real turn, measured rather
+    // than assumed — it is the quantity the silence bound is checked against.
+    //
+    // No assertion on whether a long tool trips the bound: that depends on what
+    // the model decides to do, which varies run to run, and a test whose result
+    // the model chooses is not a test. Measured at 5.2s across a turn that ran
+    // `sleep 25`, so Claude Code keeps talking often enough that ordinary work
+    // never resembles silence — which is the property the bound relies on.
+    check('a real turn never goes quiet for anything like the silence bound',
+      r.maxSilenceMs < 60_000,
+      `longest gap between frames: ${(r.maxSilenceMs / 1000).toFixed(1)}s`);
+    console.log(`        (longest silence on this turn: ${(r.maxSilenceMs / 1000).toFixed(1)}s)`);
 
     check('the turn reports its cache tokens, model and cost',
       counted(r.doneData?.usage?.cache_read_input_tokens)
