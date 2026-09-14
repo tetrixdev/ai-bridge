@@ -444,7 +444,7 @@ try {
     check('a real turn never goes quiet for anything like the silence bound',
       r.maxSilenceMs < 60_000,
       `longest gap between frames: ${(r.maxSilenceMs / 1000).toFixed(1)}s`);
-    console.log(`        (longest silence on this turn: ${(r.maxSilenceMs / 1000).toFixed(1)}s)`);
+    console.log(`        (turn ran ${(r.turnMs / 1000).toFixed(1)}s; longest silence ${(r.maxSilenceMs / 1000).toFixed(1)}s)`);
 
     check('the turn reports its cache tokens, model and cost',
       counted(r.doneData?.usage?.cache_read_input_tokens)
