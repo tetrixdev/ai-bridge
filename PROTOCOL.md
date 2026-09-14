@@ -1231,7 +1231,8 @@ The server also tracks heartbeats. If no `ping` is received for 2x the heartbeat
 | `provider_unavailable` | Requested CLI not installed on bridge | Server falls back or notifies user |
 | `provider_error` | CLI exited with non-zero code | Retry or notify user |
 | `session_lost` | A resume of the requested `cli_session_id` failed (session expired/cleared/created elsewhere) | Recoverable: server wipes the stored session and silently re-issues the turn fresh with history. No `done` follows |
-| `timeout` | Turn exceeded `silence_timeout` or `request_timeout` | Server notifies user, can retry |
+| `silence_timeout_exceeded` | Turn produced nothing for `silence_timeout` seconds; carries `limit_seconds` | Server notifies user, can retry |
+| `request_timeout_exceeded` | Turn ran past the `request_timeout` wall clock; carries `limit_seconds` | Server notifies user, can retry |
 | `bridge_disconnected` | WebSocket connection lost | Auto-reconnect with backoff |
 | `tool_error` | Tool execution failed | CLI handles gracefully in response |
 | `rate_limited` | CLI provider rate limit hit | Exponential backoff, notify user |

@@ -957,20 +957,32 @@ describe('when a turn is stopped by the bridge', () => {
       .toContain('chunk 9');
   });
 
-  it('keeps what the turn had already produced', async () => {
-    // The events were already ours; the CLI's in-flight block died with the
-    // process. Closing what is open before the signal keeps the partial answer.
+  it('closes a block that was still OPEN when the turn was stopped', async () => {
+    // Partial-message frames, deliberately, with no stop of their own. A
+    // whole-message `assistant` frame emits its own block_stop, so the
+    // assertion below would hold whether or not the timeout path closed
+    // anything — the test would pass against the bug it names.
     const events = await replay({
       lines: [
         { type: 'system', subtype: 'init', session_id: 's' },
-        { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'half an answer' }] } },
+        { type: 'stream_event', event: { type: 'message_start', message: { id: 'm1' } } },
+        {
+          type: 'stream_event',
+          event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        },
+        {
+          type: 'stream_event',
+          event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'half an answer' } },
+        },
       ],
       silenceTimeoutSeconds: 0.2,
       holdOpenMs: 5000,
     });
 
+    expect(of(events, 'block_start').length).toBeGreaterThan(0);
     expect(of(events, 'block_delta').map((e) => (e.data as { content: string }).content).join(''))
       .toContain('half an answer');
-    expect(of(events, 'block_stop').length).toBeGreaterThan(0);
+    // The block was open when the kill came, and the turn still closed it.
+    expect(of(events, 'block_stop').length).toBe(of(events, 'block_start').length);
   });
 });

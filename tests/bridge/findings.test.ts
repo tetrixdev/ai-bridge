@@ -38,6 +38,18 @@ describe('SEC-003: Value clamping helpers', () => {
     expect(clampRequestTimeout(999_999_999)).toBe(86_400);
   });
 
+  it('falls back to a safe bound when the value is not a number at all', () => {
+    // The welcome payload is ASSERTED into shape, not validated, so a string or
+    // a null reaches here and Math.max turns it into NaN. Both timers treat a
+    // non-finite value as disabled — so a malformed config would silently
+    // remove the bound, and "the server sent nonsense" is the last moment to
+    // stop bounding a turn.
+    for (const bad of [NaN, Infinity, -Infinity, undefined, null, 'abc']) {
+      expect(clampRequestTimeout(bad as unknown as number)).toBe(10);
+      expect(clampSilenceTimeout(bad as unknown as number)).toBe(10);
+    }
+  });
+
   it('treats silence_timeout the same way at both ends', () => {
     expect(clampSilenceTimeout(0)).toBe(0);
     expect(clampSilenceTimeout(-1)).toBe(10);

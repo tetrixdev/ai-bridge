@@ -36,6 +36,13 @@ export const HEARTBEAT_MAX_S = 300;
  * message into the acceptable range, or 0 to disable it.
  */
 export function clampRequestTimeout(raw: number): number {
+  // A welcome message is typed, not validated: the payload is asserted into
+  // shape, so a string or null arrives here and `Math.max` turns it into NaN.
+  // Both timers treat a non-finite value as DISABLED, so a malformed config
+  // would silently remove the bound rather than fall back to a safe one — and
+  // "the server sent nonsense" is the last moment to stop bounding a turn.
+  if (!Number.isFinite(raw)) return REQUEST_TIMEOUT_MIN_S;
+
   // Zero means the server is taking responsibility for bounding the turn, and
   // clamping it up to ten seconds would turn "no ceiling" into the most
   // aggressive one available.
@@ -46,6 +53,7 @@ export function clampRequestTimeout(raw: number): number {
 
 /** Clamp a raw silence_timeout, with zero meaning "do not bound silence". */
 export function clampSilenceTimeout(raw: number): number {
+  if (!Number.isFinite(raw)) return SILENCE_TIMEOUT_MIN_S;
   if (raw === 0) return 0;
 
   return Math.min(Math.max(raw, SILENCE_TIMEOUT_MIN_S), SILENCE_TIMEOUT_MAX_S);
