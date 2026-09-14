@@ -20,7 +20,7 @@ import type { AdapterStreamEvent } from '../../src/providers/base.js';
 const SERVER_FRAME_CAP = 1024 * 1024;
 
 /** Replay codex NDJSON through the real adapter. */
-async function replay(lines: unknown[]): Promise<AdapterStreamEvent[]> {
+async function replay(lines: unknown[], opts: { silenceSeconds?: number; holdOpenMs?: number } = {}): Promise<AdapterStreamEvent[]> {
   const dir = mkdtempSync(join(tmpdir(), 'codex-'));
   const path = join(dir, 'stream.ndjson');
   writeFileSync(path, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
@@ -29,7 +29,13 @@ async function replay(lines: unknown[]): Promise<AdapterStreamEvent[]> {
     protected override spawnCli(): ChildProcessByStdio<Writable | null, Readable, Readable> {
       return spawn(
         process.execPath,
-        ['-e', 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8"))', path],
+        ['-e', 'const fs = require("fs");'
+          + 'const lines = fs.readFileSync(process.argv[1], "utf8").split("\\n").filter(Boolean);'
+          + 'const hold = Number(process.argv[2] || 0), drip = Number(process.argv[3] || 0);'
+          + 'let i = 0; const tick = () => {'
+          + '  if (i < lines.length) { process.stdout.write(lines[i++] + "\\n"); if (drip > 0) setTimeout(tick, drip); else tick(); }'
+          + '  else if (hold > 0) setTimeout(() => {}, hold);'
+          + '}; tick();', path, String(opts.holdOpenMs ?? 0), '0'],
         { stdio: ['ignore', 'pipe', 'pipe'] },
       ) as ChildProcessByStdio<Writable | null, Readable, Readable>;
     }
@@ -49,7 +55,7 @@ async function replay(lines: unknown[]): Promise<AdapterStreamEvent[]> {
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
-      silenceTimeoutSeconds: 0,
+      silenceTimeoutSeconds: opts.silenceSeconds ?? 0,
       cliSessionId: null,
       attachmentDir: null,
     }, (e) => events.push(e));
@@ -263,5 +269,21 @@ describe("codex's own words for how a tool call ended", () => {
     const data = await resultFor({ result: 'ok' });
 
     expect(data).not.toHaveProperty('is_error');
+  });
+});
+
+describe('a codex turn stopped by the bridge', () => {
+  it('says which bound stopped it, rather than reporting the signal', async () => {
+    // Codex had no timeout test at all, so dropping its getTimeout hook left the
+    // suite green and it went back to "codex CLI exited with code 143".
+    const events = await replay(
+      [{ type: 'thread.started', thread_id: 't1' }],
+      { silenceSeconds: 0.2, holdOpenMs: 5000 },
+    );
+
+    const error = events.find((e) => e.event === 'error')!.data as Record<string, unknown>;
+
+    expect(error['code']).toBe('silence_timeout_exceeded');
+    expect(error['limit_seconds']).toBe(0.2);
   });
 });

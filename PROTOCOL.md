@@ -397,11 +397,11 @@ variable (`a-b` and `a.b`) fail the call rather than one overwriting the other.
 
 **`config.heartbeat_interval`**: Seconds between heartbeat pings. See [Heartbeat](#heartbeat).
 
-**`config.request_timeout`**: A wall-clock ceiling for a single AI request, in seconds. Accepted range 10–86400; `0` means the server bounds the turn itself and wants no ceiling here. Default 86400.
+**`config.request_timeout`**: A wall-clock ceiling for a single AI request, in seconds. Accepted range 10–86400; `0` means the server bounds the turn itself and wants no ceiling here. Default 86400. A numeric string such as `"300"` is accepted; a value that is not a number at all is ignored and the default kept, rather than clamped to the 10-second floor.
 
 **`config.silence_timeout`**: How many seconds a turn may produce **nothing** before the CLI is presumed wedged and killed. Accepted range 10–86400; `0` disables it. Default 900. Optional — a bridge that has never heard of it keeps behaving as it did, and a server that omits it gets the default.
 
-It also sets how long the bridge waits for the server to answer a [`tool_call`](#tool-resolution-flow-cli-bridge), at 90% of the bound and never more than an hour. A CLI blocked on an unanswered tool call emits nothing, so the silence clock is what ends that wait either way; stopping just short of it means the CLI gets a tool error it can report and continue from, rather than the whole turn being killed to report one failed tool.
+It also sets how long the bridge waits for the server to answer a [`tool_call`](#tool-resolution-flow-cli-bridge): 90% of whichever of `silence_timeout` and `request_timeout` would end the turn first, and never more than an hour. A CLI blocked on an unanswered tool call emits nothing, so the silence clock is what ends that wait either way; stopping just short of it means the CLI gets a tool error it can report and continue from, rather than the whole turn being killed to report one failed tool.
 
 **Silence is the bound that kills, and that is the point.** A wall clock cannot tell a stuck CLI from a busy one: an assistant reading a codebase, waiting on a build or running a test suite produces nothing *of interest* for minutes at a time and is working throughout, while a turn streaming tool results continuously for five minutes is in the healthiest state a long turn has.
 

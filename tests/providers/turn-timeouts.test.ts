@@ -108,4 +108,22 @@ describe('the clock that measures silence', () => {
 
     expect(onFire).toHaveBeenCalledTimes(1);
   });
+
+  it('stays stopped after cancel, even when an event arrives afterwards', () => {
+    // Every adapter cancels on child close and THEN runs the finalizer, whose
+    // own `error` and `done` pass through the wrapper that calls notice(). A
+    // notice() that only checked "has it fired" re-armed a fresh clock on a
+    // turn that was already over — and 900 seconds later logged a false
+    // timeout and sent SIGTERM to a dead process.
+    vi.useFakeTimers();
+    const onFire = vi.fn();
+    const timeouts = startTurnTimeouts({ silenceSeconds: 10, requestSeconds: 0, onFire });
+
+    timeouts.cancel();
+    timeouts.notice();
+    timeouts.notice();
+    vi.advanceTimersByTime(60_000);
+
+    expect(onFire).not.toHaveBeenCalled();
+  });
 });

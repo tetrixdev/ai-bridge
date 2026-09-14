@@ -35,13 +35,33 @@ export const HEARTBEAT_MAX_S = 300;
  * Clamp a raw request_timeout value (in seconds) from the server welcome
  * message into the acceptable range, or 0 to disable it.
  */
+/**
+ * A timeout value from a welcome message, as a number of seconds, or null.
+ *
+ * The payload is asserted into shape rather than validated, so this is where
+ * shape is actually checked. A numeric STRING is accepted — `"300"` meant 300
+ * before this change, via `Math.max`'s coercion, and must keep meaning it.
+ * Anything else is null, so the caller keeps its default instead of guessing.
+ * `null` in particular must not become `Number(null)`, which is 0 — "no bound".
+ */
+export function toSeconds(raw: unknown): number | null {
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const n = Number(raw);
+
+    return Number.isFinite(n) ? n : null;
+  }
+
+  return null;
+}
+
 export function clampRequestTimeout(raw: number): number {
-  // A welcome message is typed, not validated: the payload is asserted into
-  // shape, so a string or null arrives here and `Math.max` turns it into NaN.
-  // Both timers treat a non-finite value as DISABLED, so a malformed config
-  // would silently remove the bound rather than fall back to a safe one — and
-  // "the server sent nonsense" is the last moment to stop bounding a turn.
-  if (!Number.isFinite(raw)) return REQUEST_TIMEOUT_MIN_S;
+  // A last-resort guard only: the bridge runs values through toSeconds() first
+  // and keeps its DEFAULT for anything unusable. Here, a non-finite value would
+  // otherwise become NaN, which both timers treat as disabled.
+  const n = toSeconds(raw);
+  if (n === null) return REQUEST_TIMEOUT_MIN_S;
+  raw = n;
 
   // Zero means the server is taking responsibility for bounding the turn, and
   // clamping it up to ten seconds would turn "no ceiling" into the most
@@ -53,7 +73,9 @@ export function clampRequestTimeout(raw: number): number {
 
 /** Clamp a raw silence_timeout, with zero meaning "do not bound silence". */
 export function clampSilenceTimeout(raw: number): number {
-  if (!Number.isFinite(raw)) return SILENCE_TIMEOUT_MIN_S;
+  const n = toSeconds(raw);
+  if (n === null) return SILENCE_TIMEOUT_MIN_S;
+  raw = n;
   if (raw === 0) return 0;
 
   return Math.min(Math.max(raw, SILENCE_TIMEOUT_MIN_S), SILENCE_TIMEOUT_MAX_S);

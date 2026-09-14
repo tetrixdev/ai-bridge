@@ -203,6 +203,31 @@ describe('BL-002: Gemini settled guard (direct logic test)', () => {
 });
 
 describe('how long the bridge waits for the server to answer a tool call', () => {
+  /** A bridge that has processed a welcome with this config. */
+  function welcomed(config: Record<string, unknown>): Bridge {
+    const bridge = new Bridge({
+      serverUrl: 'wss://example.test/ws',
+      token: 'tok',
+      providers: [],
+      adapters: new Map(),
+      sessionStorePath: null,
+      allowedRoots: [],
+      allowNative: false,
+    });
+    (bridge as unknown as { toolResolver: { setTimeoutMs(v: number): void } }).toolResolver = {
+      setTimeoutMs: () => undefined,
+    };
+    (bridge as unknown as { handleWelcome(m: unknown): void }).handleWelcome({
+      type: 'welcome', session_id: 's', tools: [], config: { heartbeat_interval: 30, ...config },
+    });
+
+    return bridge;
+  }
+
+  /** The timeout config a bridge ended up with. */
+  const configOf = (bridge: Bridge) =>
+    (bridge as unknown as { serverConfig: Record<string, unknown> }).serverConfig;
+
   /** Apply a welcome config and report the resolver timeout it produced. */
   function resolverSecondsFor(config: Record<string, unknown>): number {
     const bridge = new Bridge({
@@ -261,10 +286,40 @@ describe('how long the bridge waits for the server to answer a tool call', () =>
     }
   });
 
+  it('stays below the WALL clock too, when that is the bound that fires first', () => {
+    // It followed silence alone, so a server still sending the old
+    // request_timeout: 300 got an 810-second tool wait on a turn that dies at
+    // 300 — and the unanswered tool call ended the turn instead of handing the
+    // CLI a tool error.
+    for (const [request, silence] of [[300, 900], [60, 900], [10, 86400]]) {
+      const seconds = resolverSecondsFor({ request_timeout: request, silence_timeout: silence });
+
+      expect(seconds).toBeLessThan(Math.min(request!, silence!));
+    }
+  });
+
   it('never waits longer than an hour, whatever the silence bound says', () => {
     const seconds = resolverSecondsFor({ request_timeout: 86400, silence_timeout: 86400 });
 
     expect(seconds).toBeLessThanOrEqual(3600);
+  });
+
+  it('keeps the default for a value that is not a number, rather than the 10 s floor', () => {
+    // Clamping garbage to the floor made every turn die at ten seconds — the
+    // most aggressive bound available — for a server whose only mistake was a
+    // type. On main, a numeric string was accepted; that must still hold.
+    const bridge = welcomed({ request_timeout: 'soon', silence_timeout: 'eventually' });
+    const cfg = configOf(bridge);
+
+    expect(cfg['request_timeout']).toBe(86400);
+    expect(cfg['silence_timeout']).toBe(900);
+  });
+
+  it('still accepts a numeric string, as it did before this change', () => {
+    const cfg = configOf(welcomed({ request_timeout: '300', silence_timeout: '600' }));
+
+    expect(cfg['request_timeout']).toBe(300);
+    expect(cfg['silence_timeout']).toBe(600);
   });
 
   it('falls back to the ceiling when the server bounds nothing', () => {

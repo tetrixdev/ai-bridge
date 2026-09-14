@@ -92,6 +92,11 @@ export function startTurnTimeouts(opts: {
 }): TurnTimeouts {
   let fired: TimeoutReason | null = null;
   let firedLimit: number | null = null;
+  // Set by cancel(). notice() must respect it: adapters cancel on child close
+  // and THEN finalize, and the finalizer's own `error`/`done` pass back through
+  // the wrapper that calls notice() — which re-armed a fresh clock on a turn
+  // already over, and later logged a false timeout and signalled a dead child.
+  let cancelled = false;
   let silenceTimer: ReturnType<typeof setTimeout> | null = null;
 
   const fire = (reason: TimeoutReason, limitSeconds: number) => {
@@ -125,11 +130,12 @@ export function startTurnTimeouts(opts: {
 
   return {
     notice: () => {
-      if (fired !== null) return;
+      if (fired !== null || cancelled) return;
       if (silenceTimer) clearTimeout(silenceTimer);
       armSilence();
     },
     cancel: () => {
+      cancelled = true;
       if (silenceTimer) {
         clearTimeout(silenceTimer);
         silenceTimer = null;
