@@ -227,6 +227,7 @@ describe('a probe that was simply wrong about the CLI', () => {
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
+      silenceTimeoutSeconds: 0,
       cliSessionId: null,
       attachmentDir: null,
     }, () => {});
@@ -358,6 +359,7 @@ describe('the adapter when partial messages are unsupported', () => {
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
+      silenceTimeoutSeconds: 0,
       cliSessionId: null,
       attachmentDir: null,
     }, () => {});
@@ -394,6 +396,7 @@ describe('the adapter noticing a rejected flag', () => {
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
+      silenceTimeoutSeconds: 0,
       cliSessionId: null,
       attachmentDir: null,
     }, () => {});

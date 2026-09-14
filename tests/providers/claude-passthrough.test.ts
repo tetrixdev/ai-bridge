@@ -34,7 +34,10 @@ vi.mock('../../src/providers/claude-capabilities.js', () => ({
 const FIXTURES = fileURLToPath(new URL('./fixtures/', import.meta.url));
 
 /** Replay NDJSON — a fixture file, or lines given inline — through the adapter. */
-async function replay(source: { fixture: string } | { lines: unknown[] }): Promise<AdapterStreamEvent[]> {
+async function replay(
+  source: ({ fixture: string } | { lines: unknown[] })
+    & { silenceTimeoutSeconds?: number; holdOpenMs?: number; dripMs?: number },
+): Promise<AdapterStreamEvent[]> {
   // Inline lines go through a temp FILE, not a `node -e` argument. A test that
   // feeds a realistically large payload (an image result is ~600KB of base64)
   // otherwise dies with spawn E2BIG, which looks like a bug in the code under
@@ -56,7 +59,33 @@ async function replay(source: { fixture: string } | { lines: unknown[] }): Promi
     protected override spawnCli(): ChildProcessByStdio<Writable | null, Readable, Readable> {
       return spawn(
         process.execPath,
-        ['-e', 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8"))', path],
+        [
+          '-e',
+          // Optionally STAY ALIVE after writing. A child that exits at once
+          // ends the turn before any silence clock could fire, so a test for
+          // the timeout would pass without ever reaching the code it names.
+          // `drip` writes the lines one at a time with a gap between them, so a
+          // test can drive a turn that is BUSY rather than merely long — which
+          // is the only shape that tells a silence clock from a wall clock.
+          'const fs = require("fs");'
+          + 'const lines = fs.readFileSync(process.argv[1], "utf8").split("\\n").filter(Boolean);'
+          + 'const hold = Number(process.argv[2] || 0);'
+          + 'const drip = Number(process.argv[3] || 0);'
+          + 'if (drip > 0) {'
+          + '  let i = 0;'
+          + '  const tick = () => {'
+          + '    if (i < lines.length) { process.stdout.write(lines[i++] + "\\n"); setTimeout(tick, drip); }'
+          + '    else if (hold > 0) { setTimeout(() => {}, hold); }'
+          + '  };'
+          + '  tick();'
+          + '} else {'
+          + '  process.stdout.write(lines.join("\\n") + "\\n");'
+          + '  if (hold > 0) setTimeout(() => {}, hold);'
+          + '}',
+          path,
+          String(source.holdOpenMs ?? 0),
+          String(source.dripMs ?? 0),
+        ],
         { stdio: ['ignore', 'pipe', 'pipe'] },
       ) as ChildProcessByStdio<Writable | null, Readable, Readable>;
     }
@@ -84,6 +113,7 @@ async function replay(source: { fixture: string } | { lines: unknown[] }): Promi
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
+      silenceTimeoutSeconds: source.silenceTimeoutSeconds ?? 0,
       cliSessionId: null,
       attachmentDir: null,
     }, (e) => events.push(e));
@@ -877,5 +907,70 @@ describe('the counters a mis-key would hide', () => {
     // four would be kept.
     expect(encoded).toBeLessThanOrEqual(33 * 1024);
     expect(JSON.stringify(done['permission_denials'])).toContain('omitted');
+  });
+});
+
+describe('when a turn is stopped by the bridge', () => {
+  it('says why, instead of reporting the signal', async () => {
+    // "claude CLI exited with code 143" is true and unhelpful: 143 is SIGTERM,
+    // which names the mechanism and not the decision. A consumer cannot render
+    // "stopped after 15 minutes" from a signal number.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'working' }] } },
+      ],
+      silenceTimeoutSeconds: 0.2,
+      holdOpenMs: 5000,
+    });
+
+    const error = of(events, 'error')[0]!.data as Record<string, unknown>;
+
+    expect(error['code']).toBe('silence_timeout_exceeded');
+    expect(error['limit_seconds']).toBe(0.2);
+    expect(String(error['message'])).not.toContain('143');
+    // And the turn still ends, so the request is not left hanging.
+    expect(of(events, 'done')).toHaveLength(1);
+  });
+
+  it('does NOT stop a turn that is busy, however long it runs', async () => {
+    // The bug, end to end. A turn streaming continuously for longer than the
+    // bound is in the healthiest state a long turn has, and the old clock — a
+    // wall clock — killed it anyway, punctually, mid-work. Here the turn emits
+    // for roughly a second against a 300 ms bound: under a wall clock it dies,
+    // under a silence clock it finishes.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        ...Array.from({ length: 10 }, (_, i) => ({
+          type: 'assistant',
+          message: { id: `m${i}`, content: [{ type: 'text', text: `chunk ${i} ` }] },
+        })),
+        { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+      ],
+      silenceTimeoutSeconds: 0.3,
+      dripMs: 100,
+    });
+
+    expect(of(events, 'error')).toHaveLength(0);
+    expect(of(events, 'block_delta').map((e) => (e.data as { content: string }).content).join(''))
+      .toContain('chunk 9');
+  });
+
+  it('keeps what the turn had already produced', async () => {
+    // The events were already ours; the CLI's in-flight block died with the
+    // process. Closing what is open before the signal keeps the partial answer.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'half an answer' }] } },
+      ],
+      silenceTimeoutSeconds: 0.2,
+      holdOpenMs: 5000,
+    });
+
+    expect(of(events, 'block_delta').map((e) => (e.data as { content: string }).content).join(''))
+      .toContain('half an answer');
+    expect(of(events, 'block_stop').length).toBeGreaterThan(0);
   });
 });

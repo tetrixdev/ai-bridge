@@ -31,7 +31,7 @@ import { createInterface } from 'node:readline';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
-import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
+import { startTurnTimeouts, clearRequestTimeout, type TurnTimeouts } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
 import { boundArguments, replaceLoneSurrogateEscapes, safeStringify, toolResultEventData } from './result-text.js';
@@ -57,7 +57,16 @@ const log = createLogger('ClaudeAdapter');
 export class ClaudeAdapter extends ProviderAdapter {
   readonly providerName = 'claude';
 
-  async execute(context: ExecutionContext, onEvent: (event: AdapterStreamEvent) => void): Promise<string | null> {
+  async execute(context: ExecutionContext, emit: (event: AdapterStreamEvent) => void): Promise<string | null> {
+    // Every emission resets the silence clock, so the wrapper goes HERE rather
+    // than at each call site — there are a dozen, some inside a deferral queue,
+    // and one missed would make a healthy turn look silent.
+    let timeouts: TurnTimeouts | null = null;
+    const onEvent = (event: AdapterStreamEvent): void => {
+      timeouts?.notice();
+      emit(event);
+    };
+
     const { request, signal, cliSessionId } = context;
     const requestId = request.request_id;
     const userMessage = request.message;
@@ -306,18 +315,28 @@ export class ClaudeAdapter extends ProviderAdapter {
 
       const child = this.spawnCli('claude', args, env, userMessage, context.workingDir);
 
-      // Enforce the server-configured request_timeout. Without this a stuck
-      // CLI would run forever; with it the bridge bounds every turn.
-      const timeoutTimer = startRequestTimeout(
-        context.requestTimeoutSeconds,
-        () => {
-          log.warn('Request timeout — killing claude process', {
+      // Two clocks: silence, which kills, and a wall-clock backstop. Without
+      // either a wedged CLI would run forever.
+      timeouts = startTurnTimeouts({
+        silenceSeconds: context.silenceTimeoutSeconds,
+        requestSeconds: context.requestTimeoutSeconds,
+        onFire: (reason, limitSeconds) => {
+          log.warn('Turn timed out — killing claude process', {
             requestId,
-            timeoutSeconds: context.requestTimeoutSeconds,
+            reason,
+            limitSeconds,
           });
+          // No flush here on purpose. The finalizer's `onBeforeFinalize` runs
+          // on child close and already closes every open block, so everything
+          // this side received survives the kill. Flushing again first looked
+          // prudent and was measurably redundant — removing it changes no
+          // output. What cannot be recovered is whatever the CLI had buffered
+          // internally and not yet written, and no amount of flushing on this
+          // side reaches that.
           child.kill('SIGTERM');
         },
-      );
+      });
+      const timeoutTimer = { cancel: () => timeouts?.cancel() };
 
       // Set up abort handling
       const onAbort = () => {
@@ -349,6 +368,14 @@ export class ClaudeAdapter extends ProviderAdapter {
         // was mid-stream. Close them, or a consumer that commits a block on
         // block_stop drops the last chunk of every cancelled answer.
         onBeforeFinalize: settleBlocks,
+        getTimeout: () => {
+          const reason = timeouts?.reason();
+          const limitSeconds = timeouts?.limit();
+
+          return reason && limitSeconds !== null && limitSeconds !== undefined
+            ? { reason, limitSeconds }
+            : null;
+        },
       });
 
       // Parse NDJSON from stdout line by line

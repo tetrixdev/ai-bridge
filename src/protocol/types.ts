@@ -448,8 +448,21 @@ export interface WelcomeMessage {
 export interface ServerConfig {
   /** Heartbeat interval in SECONDS (not milliseconds). */
   heartbeat_interval: number;
-  /** Maximum seconds for a single AI request. */
+  /**
+   * Wall-clock ceiling for a single AI request, in seconds.
+   *
+   * A backstop rather than the working bound — it cannot tell a stuck CLI from
+   * a busy one. `0` means the server bounds the turn itself and wants none.
+   */
   request_timeout: number;
+  /**
+   * How long a turn may produce NOTHING before the CLI is presumed wedged.
+   *
+   * The bound that actually kills, because silence is the only measure that
+   * separates stuck from busy. Optional: a server that omits it gets the
+   * bridge's default. `0` disables it.
+   */
+  silence_timeout?: number;
   /**
    * What should happen to a file the assistant hands back.
    *
@@ -796,6 +809,14 @@ export interface DoneData {
 export interface StreamErrorData {
   code: string;
   message: string;
+  /**
+   * The limit that was reached, in seconds, on a timeout error.
+   *
+   * Present for `silence_timeout_exceeded` and `request_timeout_exceeded` so a
+   * consumer can say "stopped after 15 minutes" rather than paraphrasing the
+   * message, and can tell the two bounds apart without parsing prose.
+   */
+  limit_seconds?: number;
 }
 
 /** Token usage information. */

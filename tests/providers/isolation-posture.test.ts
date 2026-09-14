@@ -91,6 +91,7 @@ async function launch(
     workingDir,
     signal: new AbortController().signal,
     requestTimeoutSeconds: 30,
+    silenceTimeoutSeconds: 0,
     cliSessionId: null,
     attachmentDir,
   };

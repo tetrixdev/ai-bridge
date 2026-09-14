@@ -49,6 +49,7 @@ async function replay(lines: unknown[]): Promise<AdapterStreamEvent[]> {
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
+      silenceTimeoutSeconds: 0,
       cliSessionId: null,
       attachmentDir: null,
     }, (e) => events.push(e));

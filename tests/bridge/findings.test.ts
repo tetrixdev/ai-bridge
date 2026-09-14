@@ -7,7 +7,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { buildSpawnEnv } from '../../src/providers/env.js';
-import { clampRequestTimeout, clampHeartbeat } from '../../src/utils/clamp.js';
+import { clampRequestTimeout, clampSilenceTimeout, clampHeartbeat } from '../../src/utils/clamp.js';
 
 // ---------------------------------------------------------------------------
 // Clamping of server-provided timeout/heartbeat
@@ -17,16 +17,31 @@ describe('SEC-003: Value clamping helpers', () => {
   // Imports the real clamp helpers from src/utils/clamp.ts so tests exercise
   // the actual production constants.
 
-  it('clamps request_timeout: 0 → 10', () => {
-    expect(clampRequestTimeout(0)).toBe(10);
+  it('treats request_timeout: 0 as "no wall clock", not as the smallest one', () => {
+    // Zero is a server saying it bounds the turn itself. Clamping it UP to ten
+    // seconds turned "no ceiling" into the most aggressive ceiling available —
+    // the opposite of what was asked for, and unsurvivable for any real turn.
+    expect(clampRequestTimeout(0)).toBe(0);
   });
 
   it('clamps request_timeout: negative → 10', () => {
+    // Negative is not a request for anything; it is a bad value.
     expect(clampRequestTimeout(-1)).toBe(10);
   });
 
-  it('clamps request_timeout: huge → 3600', () => {
-    expect(clampRequestTimeout(999_999_999)).toBe(3600);
+  it('clamps request_timeout: huge → 24 h', () => {
+    // The ceiling was an hour, which real agentic work passes — migrations,
+    // large refactors, multi-step research. It is a wall clock and cannot tell
+    // a stuck CLI from a busy one, so it is a backstop now and sized like one;
+    // the silence bound is what actually protects the bridge.
+    expect(clampRequestTimeout(999_999_999)).toBe(86_400);
+  });
+
+  it('treats silence_timeout the same way at both ends', () => {
+    expect(clampSilenceTimeout(0)).toBe(0);
+    expect(clampSilenceTimeout(-1)).toBe(10);
+    expect(clampSilenceTimeout(999_999_999)).toBe(86_400);
+    expect(clampSilenceTimeout(900)).toBe(900);
   });
 
   it('passes through valid request_timeout unchanged', () => {

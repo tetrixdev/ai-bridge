@@ -62,6 +62,8 @@ export interface ExecutionContext {
   signal: AbortSignal;
   /** Maximum seconds the request may run before being aborted (server-configured). */
   requestTimeoutSeconds: number;
+  /** Seconds of silence after which the CLI is presumed wedged. 0 disables. */
+  silenceTimeoutSeconds: number;
   /** CLI session ID if resuming, or null for new session. */
   cliSessionId: string | null;
   /**
@@ -113,6 +115,8 @@ export function createFinalizer(opts: {
   signal: AbortSignal;
   onAbort: () => void;
   onBeforeFinalize?: () => void;
+  /** Why the CLI was killed on purpose, if it was. */
+  getTimeout?: () => { reason: string; limitSeconds: number } | null;
 }): { onRlClose: () => void; onChildClose: (code: number | null) => void } {
   let rlClosed = false;
   let childExitCode: number | null = null;
@@ -131,7 +135,24 @@ export function createFinalizer(opts: {
     // Provider-specific pre-finalize work (e.g. close an open text block)
     opts.onBeforeFinalize?.();
 
-    if (childExitCode !== 0 && childExitCode !== null) {
+    const timedOut = opts.getTimeout?.() ?? null;
+    if (timedOut !== null) {
+      // We killed it, so say that rather than describing the signal. "claude
+      // CLI exited with code 143" is true and unhelpful: 143 is SIGTERM, which
+      // names the mechanism and not the decision, and a consumer cannot render
+      // "stopped after 15 minutes" from a signal number.
+      opts.onEvent({
+        event: 'error',
+        data: {
+          code: timedOut.reason,
+          message: timedOut.reason === 'silence_timeout_exceeded'
+            ? `The ${opts.providerName} CLI produced nothing for ${timedOut.limitSeconds}s and was stopped.`
+            : `The ${opts.providerName} CLI ran past the ${timedOut.limitSeconds}s limit and was stopped.`,
+          limit_seconds: timedOut.limitSeconds,
+        },
+      });
+      opts.onEvent({ event: 'done', data: {} });
+    } else if (childExitCode !== 0 && childExitCode !== null) {
       opts.onEvent({
         event: 'error',
         data: {

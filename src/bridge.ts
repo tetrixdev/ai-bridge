@@ -69,7 +69,7 @@ import {
 } from './attachments/upload.js';
 import { resolveApiOrigin } from './attachments/origin.js';
 import { createLogger } from './utils/logger.js';
-import { clampRequestTimeout, clampHeartbeat } from './utils/clamp.js';
+import { clampRequestTimeout, clampSilenceTimeout, clampHeartbeat } from './utils/clamp.js';
 import { FatalBridgeError, RequestRefusal } from './errors.js';
 import { replaceLoneSurrogates } from './providers/result-text.js';
 
@@ -140,7 +140,29 @@ export interface BridgeOptions {
 }
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
-const DEFAULT_REQUEST_TIMEOUT_SECONDS = 300;
+
+/**
+ * The wall-clock backstop for a turn.
+ *
+ * Was 300, and 300 seconds of WORK is not a sign of anything wrong: a turn
+ * streaming tool results continuously for five minutes is in the healthiest
+ * state a long turn has, and it was killed anyway, punctually, mid-work. The
+ * bound that separates stuck from busy is silence, below. This one stays as a
+ * ceiling and is now high enough to be one.
+ */
+const DEFAULT_REQUEST_TIMEOUT_SECONDS = 86400;
+
+/** How long a turn may produce NOTHING before the CLI is presumed wedged. */
+const DEFAULT_SILENCE_TIMEOUT_SECONDS = 900;
+
+/**
+ * How long to wait for the server to resolve a tool call.
+ *
+ * Deliberately NOT the request timeout, which it used to borrow. That value is
+ * now a 24-hour backstop, and inheriting it would leave the CLI blocked for a
+ * day on a server that simply never answers.
+ */
+const TOOL_RESOLVE_TIMEOUT_MAX_S = 3600;
 
 // Large-but-finite cap (~24 min of retries with backoff); infinite retry could
 // mask configuration errors.
@@ -332,6 +354,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private serverConfig: ServerConfig = {
     heartbeat_interval: DEFAULT_HEARTBEAT_SECONDS,
     request_timeout: DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    silence_timeout: DEFAULT_SILENCE_TIMEOUT_SECONDS,
   };
   /** Timer to detect a missing welcome message after hello is sent. */
   private welcomeTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1112,9 +1135,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       }
     }
 
-    // Clamp request_timeout to a safe range (10–3600 s) before applying — a
-    // malicious or misconfigured server could send 0 or a huge value.
-    if (message.config.request_timeout) {
+    // Clamp request_timeout before applying — a malicious or misconfigured
+    // server could send a huge value. ZERO is meaningful and not a mistake: it
+    // says the server bounds the turn itself and wants no wall clock here.
+    // Tested with `!== undefined` rather than for truthiness, or zero would
+    // silently fall through to the default it is asking to switch off.
+    if (message.config.request_timeout !== undefined && message.config.request_timeout !== null) {
       const raw = message.config.request_timeout;
       const clamped = clampRequestTimeout(raw);
       if (clamped !== raw) {
@@ -1123,11 +1149,30 @@ export class Bridge extends EventEmitter<BridgeEvents> {
           clamped,
         });
       }
-      this.toolResolver.setTimeoutMs(clamped * 1000);
-      // Write the clamped value back so generateScripts (below) uses the same
-      // timeout as the tool resolver.
       this.serverConfig.request_timeout = clamped;
     }
+
+    // How long a turn may go SILENT. This is the bound that kills, because it
+    // is the only one that can tell a wedged CLI from a working one.
+    if (message.config.silence_timeout !== undefined && message.config.silence_timeout !== null) {
+      const raw = message.config.silence_timeout;
+      const clamped = clampSilenceTimeout(raw);
+      if (clamped !== raw) {
+        log.warn('Server silence_timeout is outside safe range — clamping', {
+          received: raw,
+          clamped,
+        });
+      }
+      this.serverConfig.silence_timeout = clamped;
+    }
+
+    // The tool resolver gets its OWN ceiling. It used to borrow
+    // request_timeout, which is now a 24-hour backstop — inheriting that would
+    // block the CLI for a day on a server that never answers a tool call.
+    const resolveSeconds = this.serverConfig.request_timeout > 0
+      ? Math.min(this.serverConfig.request_timeout, TOOL_RESOLVE_TIMEOUT_MAX_S)
+      : TOOL_RESOLVE_TIMEOUT_MAX_S;
+    this.toolResolver.setTimeoutMs(resolveSeconds * 1000);
 
     // Adopt the server's CLI isolation posture. Older servers that don't
     // send the field get the safe default (`isolated`) — never the legacy
@@ -1588,6 +1633,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         workingDir,
         signal,
         requestTimeoutSeconds: this.serverConfig.request_timeout,
+        silenceTimeoutSeconds: this.serverConfig.silence_timeout ?? DEFAULT_SILENCE_TIMEOUT_SECONDS,
         cliSessionId,
         attachmentDir: saved.length > 0 ? attachmentDirFor(request_id) : null,
       };

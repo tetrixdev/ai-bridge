@@ -25,7 +25,7 @@ import { join } from 'node:path';
 import type { ModelInfo } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
-import { startRequestTimeout, clearRequestTimeout } from './timeout.js';
+import { startTurnTimeouts, clearRequestTimeout, type TurnTimeouts } from './timeout.js';
 import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
 import { boundArgumentText, boundArguments, safeStringify, toolResultEventData } from './result-text.js';
@@ -111,6 +111,14 @@ export class CodexAdapter extends ProviderAdapter {
   readonly providerName = 'codex';
 
   async execute(context: ExecutionContext, onEvent: (event: AdapterStreamEvent) => void): Promise<string | null> {
+    // Every emission resets the silence clock; the wrapper goes here so no
+    // call site can be missed.
+    let timeouts: TurnTimeouts | null = null;
+    const emit = onEvent;
+    onEvent = (event: AdapterStreamEvent): void => {
+      timeouts?.notice();
+      emit(event);
+    };
     const { request, signal, cliSessionId } = context;
     const requestId = request.request_id;
     const userMessage = request.message;
@@ -286,16 +294,19 @@ export class CodexAdapter extends ProviderAdapter {
       const child = this.spawnCli('codex', args, env, undefined, context.workingDir);
 
       // Enforce the server-configured request_timeout (ai-bridge#2).
-      const timeoutTimer = startRequestTimeout(
-        context.requestTimeoutSeconds,
-        () => {
+      timeouts = startTurnTimeouts({
+        silenceSeconds: context.silenceTimeoutSeconds,
+        requestSeconds: context.requestTimeoutSeconds,
+        onFire: (reason, limitSeconds) => {
           log.warn('Request timeout — killing codex process', {
             requestId,
-            timeoutSeconds: context.requestTimeoutSeconds,
+            reason,
+            limitSeconds,
           });
           child.kill('SIGTERM');
         },
-      );
+      });
+      const timeoutTimer = { cancel: () => timeouts?.cancel() };
 
       // Set up abort handling
       const onAbort = () => {
@@ -309,6 +320,14 @@ export class CodexAdapter extends ProviderAdapter {
       let stderrBuffer = '';
 
       const finalizer = createFinalizer({
+        getTimeout: () => {
+          const reason = timeouts?.reason();
+          const limitSeconds = timeouts?.limit();
+
+          return reason && limitSeconds !== null && limitSeconds !== undefined
+            ? { reason, limitSeconds }
+            : null;
+        },
         providerName: 'codex',
         terminalEvent: 'turn.completed',
         getSettled: () => settled,

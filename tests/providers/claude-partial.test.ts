@@ -482,6 +482,7 @@ async function replay(fixture: string): Promise<AdapterStreamEvent[]> {
     workingDir: process.cwd(),
     signal: new AbortController().signal,
     requestTimeoutSeconds: 30,
+    silenceTimeoutSeconds: 0,
     cliSessionId: null,
     attachmentDir: null,
   };
@@ -649,6 +650,7 @@ describe('the --include-partial-messages flag', () => {
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
+      silenceTimeoutSeconds: 0,
       cliSessionId: null,
       attachmentDir: null,
     }, () => {});
@@ -710,6 +712,7 @@ describe('a turn that is cut off mid-stream', () => {
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
+      silenceTimeoutSeconds: 0,
       cliSessionId: null,
       attachmentDir: null,
     }, (e) => events.push(e));
@@ -793,6 +796,7 @@ describe('a turn that is cut off mid-stream', () => {
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
+      silenceTimeoutSeconds: 0,
       cliSessionId: null,
       attachmentDir: null,
     }, (e) => events.push(e));
@@ -837,6 +841,7 @@ describe('a request cancelled before the CLI is spawned', () => {
       workingDir: process.cwd(),
       signal: controller.signal,
       requestTimeoutSeconds: 30,
+      silenceTimeoutSeconds: 0,
       cliSessionId: null,
       attachmentDir: null,
     }, (e) => events.push(e));
@@ -889,6 +894,7 @@ describe('a whole-message frame arriving while a partial block is open', () => {
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
+      silenceTimeoutSeconds: 0,
       cliSessionId: null,
       attachmentDir: null,
     }, (e) => events.push(e));
@@ -934,6 +940,7 @@ describe('frames arriving after the turn has ended', () => {
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
+      silenceTimeoutSeconds: 0,
       cliSessionId: null,
       attachmentDir: null,
     }, (e) => events.push(e));
