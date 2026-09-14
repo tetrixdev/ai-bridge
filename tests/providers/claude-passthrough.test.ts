@@ -36,7 +36,7 @@ const FIXTURES = fileURLToPath(new URL('./fixtures/', import.meta.url));
 /** Replay NDJSON — a fixture file, or lines given inline — through the adapter. */
 async function replay(
   source: ({ fixture: string } | { lines: unknown[] })
-    & { silenceTimeoutSeconds?: number; holdOpenMs?: number; dripMs?: number },
+    & { silenceTimeoutSeconds?: number; requestTimeoutSeconds?: number; holdOpenMs?: number; dripMs?: number },
 ): Promise<AdapterStreamEvent[]> {
   // Inline lines go through a temp FILE, not a `node -e` argument. A test that
   // feeds a realistically large payload (an image result is ~600KB of base64)
@@ -112,7 +112,7 @@ async function replay(
       cliIsolation: 'native',
       workingDir: process.cwd(),
       signal: new AbortController().signal,
-      requestTimeoutSeconds: 30,
+      requestTimeoutSeconds: source.requestTimeoutSeconds ?? 30,
       silenceTimeoutSeconds: source.silenceTimeoutSeconds ?? 0,
       cliSessionId: null,
       attachmentDir: null,
@@ -931,6 +931,33 @@ describe('when a turn is stopped by the bridge', () => {
     expect(String(error['message'])).not.toContain('143');
     // And the turn still ends, so the request is not left hanging.
     expect(of(events, 'done')).toHaveLength(1);
+  });
+
+  it('still stops a busy turn when the server asked for a hard ceiling', async () => {
+    // The backstop, end to end. The turn emits continuously — so the silence
+    // clock never fires — and the wall clock stops it anyway. Without a test
+    // here the backstop could be wired to nothing and only the unit test,
+    // which never touches an adapter, would notice.
+    const events = await replay({
+      lines: [
+        { type: 'system', subtype: 'init', session_id: 's' },
+        ...Array.from({ length: 20 }, (_, i) => ({
+          type: 'assistant',
+          message: { id: `m${i}`, content: [{ type: 'text', text: `chunk ${i} ` }] },
+        })),
+      ],
+      silenceTimeoutSeconds: 10,
+      requestTimeoutSeconds: 0.4,
+      dripMs: 60,
+      holdOpenMs: 5000,
+    });
+
+    const error = of(events, 'error')[0]!.data as Record<string, unknown>;
+
+    expect(error['code']).toBe('request_timeout_exceeded');
+    expect(error['limit_seconds']).toBe(0.4);
+    // It got some way through first — this is a ceiling, not a refusal.
+    expect(of(events, 'block_delta').length).toBeGreaterThan(0);
   });
 
   it('does NOT stop a turn that is busy, however long it runs', async () => {
