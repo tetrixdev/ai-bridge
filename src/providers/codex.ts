@@ -298,7 +298,7 @@ export class CodexAdapter extends ProviderAdapter {
         silenceSeconds: context.silenceTimeoutSeconds,
         requestSeconds: context.requestTimeoutSeconds,
         onFire: (reason, limitSeconds) => {
-          log.warn('Request timeout — killing codex process', {
+          log.warn('Turn timed out — killing codex process', {
             requestId,
             reason,
             limitSeconds,

@@ -18,7 +18,7 @@ import { GeminiAdapter } from '../../src/providers/gemini.js';
 import type { AdapterStreamEvent } from '../../src/providers/base.js';
 
 /** Replay gemini NDJSON through the real adapter. */
-async function replay(lines: unknown[]): Promise<AdapterStreamEvent[]> {
+async function replay(lines: unknown[], opts: { silenceSeconds?: number; holdOpenMs?: number } = {}): Promise<AdapterStreamEvent[]> {
   const dir = mkdtempSync(join(tmpdir(), 'gemini-'));
   const path = join(dir, 'stream.ndjson');
   writeFileSync(path, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
@@ -27,7 +27,16 @@ async function replay(lines: unknown[]): Promise<AdapterStreamEvent[]> {
     protected override spawnCli(): ChildProcessByStdio<Writable | null, Readable, Readable> {
       return spawn(
         process.execPath,
-        ['-e', 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8"))', path],
+        [
+          '-e',
+          // Optionally stay alive after writing, so a silence clock has
+          // something to fire against. A child that exits at once ends the turn
+          // before any bound could be reached.
+          'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8"));'
+          + 'const hold = Number(process.argv[2] || 0); if (hold > 0) setTimeout(() => {}, hold);',
+          path,
+          String(opts.holdOpenMs ?? 0),
+        ],
         { stdio: ['ignore', 'pipe', 'pipe'] },
       ) as ChildProcessByStdio<Writable | null, Readable, Readable>;
     }
@@ -47,7 +56,7 @@ async function replay(lines: unknown[]): Promise<AdapterStreamEvent[]> {
       workingDir: process.cwd(),
       signal: new AbortController().signal,
       requestTimeoutSeconds: 30,
-      silenceTimeoutSeconds: 0,
+      silenceTimeoutSeconds: opts.silenceSeconds ?? 0,
       cliSessionId: null,
       attachmentDir: null,
     }, (e) => events.push(e));
@@ -130,5 +139,23 @@ describe('what Gemini reported about the turn', () => {
 
     expect(usage['input_tokens']).toBeNull();
     expect(usage['output_tokens']).toBe(5);
+  });
+});
+
+describe('the silence bound reaches the sibling adapters too', () => {
+  it('stops a gemini turn that has gone quiet, and says which bound it was', async () => {
+    // The shared helper is wired into all three adapters by the same shape of
+    // edit. Without a test on at least one sibling, that wiring could be
+    // removed and only Claude would notice.
+    const events = await replay(
+      [{ type: 'init', session_id: 's1', model: 'gemini-2.5-pro' }],
+      { silenceSeconds: 0.2, holdOpenMs: 5000 },
+    );
+
+    const error = of(events, 'error')[0]!.data as Record<string, unknown>;
+
+    expect(error['code']).toBe('silence_timeout_exceeded');
+    expect(error['limit_seconds']).toBe(0.2);
+    expect(of(events, 'done')).toHaveLength(1);
   });
 });

@@ -235,7 +235,7 @@ export class GeminiAdapter extends ProviderAdapter {
         silenceSeconds: context.silenceTimeoutSeconds,
         requestSeconds: context.requestTimeoutSeconds,
         onFire: (reason, limitSeconds) => {
-          log.warn('Request timeout — killing gemini process', {
+          log.warn('Turn timed out — killing gemini process', {
             requestId,
             reason,
             limitSeconds,
