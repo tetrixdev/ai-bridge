@@ -38,6 +38,7 @@ import { boundArguments, replaceLoneSurrogateEscapes, safeStringify, toolResultE
 import { ClaudePartialStreamMapper } from './claude-partial.js';
 import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
+import { stopTurn } from './stop.js';
 
 /**
  * Known Claude CLI model aliases.
@@ -333,7 +334,7 @@ export class ClaudeAdapter extends ProviderAdapter {
           // output. What cannot be recovered is whatever the CLI had buffered
           // internally and not yet written, and no amount of flushing on this
           // side reaches that.
-          child.kill('SIGTERM');
+          stopTurn(child, { requestId, provider: 'claude' });
         },
       });
       const timeoutTimer = { cancel: () => timeouts?.cancel() };
@@ -342,7 +343,7 @@ export class ClaudeAdapter extends ProviderAdapter {
       const onAbort = () => {
         clearRequestTimeout(timeoutTimer);
         log.info('Request aborted — killing claude process', { requestId });
-        child.kill('SIGTERM');
+        stopTurn(child, { requestId, provider: 'claude' });
       };
       signal.addEventListener('abort', onAbort, { once: true });
 

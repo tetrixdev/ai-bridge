@@ -30,6 +30,7 @@ import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
 import { boundArgumentText, boundArguments, safeStringify, toolResultEventData } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
+import { stopTurn } from './stop.js';
 
 const log = createLogger('CodexAdapter');
 
@@ -303,7 +304,7 @@ export class CodexAdapter extends ProviderAdapter {
             reason,
             limitSeconds,
           });
-          child.kill('SIGTERM');
+          stopTurn(child, { requestId, provider: 'codex' });
         },
       });
       const timeoutTimer = { cancel: () => timeouts?.cancel() };
@@ -312,7 +313,7 @@ export class CodexAdapter extends ProviderAdapter {
       const onAbort = () => {
         clearRequestTimeout(timeoutTimer);
         log.info('Request aborted — killing codex process', { requestId });
-        child.kill('SIGTERM');
+        stopTurn(child, { requestId, provider: 'codex' });
       };
       signal.addEventListener('abort', onAbort, { once: true });
 

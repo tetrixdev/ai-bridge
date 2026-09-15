@@ -925,9 +925,35 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       case 'stream_cancel':
         this.cancelTransfer((message as unknown as { id: string }).id);
         break;
+      case 'ai_cancel':
+        this.cancelRequest((message as unknown as { request_id: string }).request_id);
+        break;
       default:
         log.warn('Unknown message type received', { type: (message as { type: string }).type });
     }
+  }
+
+  /**
+   * Stop a turn because the server asked.
+   *
+   * The same mechanism a bound uses -- abort the request, which ends the CLI's
+   * turn and lets the adapter finalize whatever it had -- so a cancelled turn
+   * and a timed-out one leave the session in the same resumable state.
+   *
+   * An id that is not running is not an error. A cancel racing the answer it
+   * was meant to stop is the ordinary case, and answering it would tell the
+   * server about a turn that has already been reported.
+   */
+  private cancelRequest(requestId: string): void {
+    const controller = this.activeRequests.get(requestId);
+    if (!controller) {
+      log.debug('Cancel for a request that is not running', { requestId });
+
+      return;
+    }
+
+    log.info('Server asked to stop this turn', { requestId });
+    controller.abort();
   }
 
   private onClose(code: number, reason: Buffer): void {

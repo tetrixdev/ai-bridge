@@ -511,6 +511,28 @@ export interface StreamCancelMessage {
   id: string;
 }
 
+/**
+ * Stop a turn that is running, and leave a session that can be resumed.
+ *
+ * The other half of `ai_request`, and it was missing: a server could start work
+ * on somebody's machine and had no way to say "stop" -- so a person watching a
+ * turn go wrong could only wait for a bound to end it, and every bridge-side
+ * bound is measured in minutes.
+ *
+ * What the bridge does with it is what it does when one of its own bounds
+ * fires: end the CLI's turn cleanly, keep what the turn produced, and report
+ * the end of it. A cancelled turn is not an error and is not a failure of the
+ * machine; it is a turn that stopped when it was asked to.
+ *
+ * Unknown ids are ignored rather than answered. A cancel that arrives after the
+ * turn ended is the normal race -- somebody pressed stop as the answer landed
+ * -- and there is nothing to report about it.
+ */
+export interface AiCancelMessage {
+  type: 'ai_cancel';
+  request_id: string;
+}
+
 /** A single prior turn in a conversation's history. */
 export interface ConversationEntry {
   role: string;
@@ -662,7 +684,8 @@ export type ServerToBridgeMessage =
   | TokenRefreshMessage
   | LocalCallMessage
   | AttachmentReadMessage
-  | StreamCancelMessage;
+  | StreamCancelMessage
+  | AiCancelMessage;
 
 // ---------------------------------------------------------------------------
 // Stream Event Types and Data
