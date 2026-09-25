@@ -4,6 +4,9 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { nameFromServer, normaliseName } from '../src/service/naming.js';
 import { deviceOf, readConfig, replaceable, writeConfig } from '../src/service/config.js';
+import { configForInstall } from '../src/service/index.js';
+import { ATTACHMENT_OPTIONS } from '../src/attachments/options.js';
+import { readFileSync } from 'node:fs';
 
 /**
  * What these pin is the rule the whole module exists for: a second install
@@ -95,5 +98,56 @@ describe('the credentials file', () => {
     writeFileSync(path, '# a comment\nNOT_OURS=1\n');
     expect(readConfig(path)).toBeNull();
     expect(readConfig(join(dir, 'missing.env'))).toBeNull();
+  });
+});
+
+describe('settings an install carries', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'bridge-test-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  test('every attachment setting has a flag and an environment variable, and round trips through the file', () => {
+    // The size caps used to have a flag and no variable, so a setup that wrote
+    // AI_BRIDGE_ATTACHMENT_MAX_MB into this file changed nothing.
+    const settings: Record<string, string> = {};
+    for (const [i, option] of ATTACHMENT_OPTIONS.entries()) {
+      expect(option.flag).toMatch(/^--attachment-[a-z-]+ <n>$/);
+      expect(option.env).toMatch(/^AI_BRIDGE_ATTACHMENT_[A-Z_]+$/);
+      settings[option.env] = String(i + 1);
+    }
+    const path = join(dir, 'x.env');
+    writeConfig(path, { server: 'wss://h/bridge', token: 't', name: 'h', settings });
+    expect(readConfig(path)).toEqual({ server: 'wss://h/bridge', token: 't', allowDir: undefined, name: 'h', settings });
+  });
+
+  test('records the install name, which keys its attachment store', () => {
+    const path = join(dir, 'n.env');
+    writeConfig(path, { server: 'wss://h/bridge', token: 't', name: 'repo-a' });
+    expect(readFileSync(path, 'utf8')).toContain('AI_BRIDGE_NAME=repo-a');
+  });
+
+  test('a reinstall keeps the settings it is not given again', () => {
+    // Rotating a token is a reinstall; it must not reset the caps.
+    const existing = {
+      server: 'wss://h/bridge', token: 'old',
+      settings: { AI_BRIDGE_ATTACHMENT_MAX_MB: '500', AI_BRIDGE_ATTACHMENT_TOTAL_MB: '2000' },
+    };
+    const next = configForInstall(
+      { server: 'wss://h/bridge', token: 'new', settings: { AI_BRIDGE_ATTACHMENT_TOTAL_MB: '4000' } },
+      'h',
+      existing,
+    );
+    expect(next.token).toBe('new');
+    expect(next.settings).toEqual({ AI_BRIDGE_ATTACHMENT_MAX_MB: '500', AI_BRIDGE_ATTACHMENT_TOTAL_MB: '4000' });
+  });
+
+  test('lines somebody else added to the file survive a rewrite', () => {
+    const path = join(dir, 'f.env');
+    writeFileSync(path, 'AI_BRIDGE_SERVER=wss://h/bridge\nAI_BRIDGE_TOKEN=t\nSOMETHING_ELSE=kept\n');
+    writeConfig(path, { server: 'wss://h/bridge', token: 't2' });
+    const body = readFileSync(path, 'utf8');
+    expect(body).toContain('SOMETHING_ELSE=kept');
+    expect(body).toContain('AI_BRIDGE_TOKEN=t2');
+    expect(body.match(/AI_BRIDGE_TOKEN=/g)).toHaveLength(1);
   });
 });

@@ -117,6 +117,27 @@ describe('the attachment caps', () => {
     expect(posture.attachmentLimits.maxTotalBytes).toBe(40 * 1024 * 1024);
   });
 
+  it('take the defaults when nothing was set', () => {
+    const posture = resolveOperatorPosture(
+      { allowDir: [], allowNative: false, keepAttachments: false }, SERVER, {},
+    );
+    expect(posture.attachmentLimits).toEqual({
+      maxFileBytes: 25 * 1024 * 1024, maxTotalBytes: 100 * 1024 * 1024, maxCount: 50,
+    });
+    expect(posture.attachmentTimeouts).toEqual({ stallMs: 60_000, ceilingMs: 60 * 60_000 });
+    expect(posture.attachmentCache.ttlMs).toBe(72 * 60 * 60 * 1000);
+    expect(posture.attachmentCache.maxBytes).toBe(1024 * 1024 * 1024);
+  });
+
+  it('take the count cap as a whole number', () => {
+    expect(resolveOperatorPosture(options({ attachmentMaxCount: '120' }), SERVER, {}).attachmentLimits.maxCount)
+      .toBe(120);
+    for (const bad of ['0', '2.5', 'many']) {
+      expect(() => resolveOperatorPosture(options({ attachmentMaxCount: bad }), SERVER, {}))
+        .toThrow(/--attachment-max-count/);
+    }
+  });
+
   it('throw on a value that is not a positive number', () => {
     // A mistyped cap that silently became the default would only be noticed
     // when a large attachment was refused for reasons that make no sense.
@@ -124,5 +145,50 @@ describe('the attachment caps', () => {
       expect(() => resolveOperatorPosture(options({ attachmentMaxMb: bad }), SERVER, {}))
         .toThrow(/--attachment-max-mb/);
     }
+  });
+});
+
+describe('the download clocks', () => {
+  it('convert seconds and minutes', () => {
+    const posture = resolveOperatorPosture(
+      options({ attachmentStallSeconds: '30', attachmentTimeoutMinutes: '240' }), SERVER, {},
+    );
+    expect(posture.attachmentTimeouts).toEqual({ stallMs: 30_000, ceilingMs: 240 * 60_000 });
+  });
+
+  it('refuse zero: a download with no stall clock is the bug being fixed', () => {
+    expect(() => resolveOperatorPosture(options({ attachmentStallSeconds: '0' }), SERVER, {}))
+      .toThrow(/--attachment-stall-seconds/);
+    expect(() => resolveOperatorPosture(options({ attachmentTimeoutMinutes: '-1' }), SERVER, {}))
+      .toThrow(/--attachment-timeout-minutes/);
+  });
+});
+
+describe('the attachment store', () => {
+  it('converts hours and megabytes, and 0 turns it off', () => {
+    const posture = resolveOperatorPosture(
+      options({ attachmentCacheTtlHours: '24', attachmentCacheMaxMb: '0' }), SERVER, {},
+    );
+    expect(posture.attachmentCache.ttlMs).toBe(24 * 60 * 60 * 1000);
+    expect(posture.attachmentCache.maxBytes).toBe(0);
+  });
+
+  it('refuses a negative or unreadable value', () => {
+    expect(() => resolveOperatorPosture(options({ attachmentCacheTtlHours: '-1' }), SERVER, {}))
+      .toThrow(/--attachment-cache-ttl-hours/);
+    expect(() => resolveOperatorPosture(options({ attachmentCacheMaxMb: 'lots' }), SERVER, {}))
+      .toThrow(/--attachment-cache-max-mb/);
+  });
+
+  it('is one per server, never shared between two installs pointed at different servers', () => {
+    const prod = resolveOperatorPosture(options(), SERVER, {}).attachmentCache.dir;
+    const test = resolveOperatorPosture(options(), 'wss://test.example.com/ws', {}).attachmentCache.dir;
+    expect(prod).not.toBe(test);
+  });
+
+  it('follows the install name a service was started with', () => {
+    const a = resolveOperatorPosture(options({ installName: 'repo-a' }), SERVER, {}).attachmentCache.dir;
+    const b = resolveOperatorPosture(options({ installName: 'repo-b' }), SERVER, {}).attachmentCache.dir;
+    expect(a).not.toBe(b);
   });
 });

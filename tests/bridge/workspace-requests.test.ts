@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -67,8 +67,13 @@ function streamEvents(requestId: string): { event: string; data: Record<string, 
     .map((f) => ({ event: f['event'] as string, data: f['data'] as Record<string, unknown> }));
 }
 
-async function startBridge(allowedRoots: AllowedRoot[], adapter: RecordingAdapter): Promise<void> {
+async function startBridge(
+  allowedRoots: AllowedRoot[],
+  adapter: RecordingAdapter,
+  extra: Partial<ConstructorParameters<typeof Bridge>[0]> = {},
+): Promise<void> {
   bridge = new Bridge({
+    ...extra,
     serverUrl: url,
     token: 'tok',
     providers: [{
@@ -194,6 +199,24 @@ describe('hello', () => {
     await startBridge([], new RecordingAdapter());
     const hello = await waitFor((f) => f['type'] === 'hello', 'hello');
     expect(hello).not.toHaveProperty('workspaces');
+  });
+
+  it('reports the attachment limits, in bytes, so a server need not mirror them', async () => {
+    await startBridge([], new RecordingAdapter(), {
+      attachmentLimits: { maxFileBytes: 5 * 1024 * 1024, maxTotalBytes: 20 * 1024 * 1024, maxCount: 7 },
+    });
+    const hello = await waitFor((f) => f['type'] === 'hello', 'hello');
+    expect(hello['attachment_limits']).toEqual({
+      max_file_bytes: 5 * 1024 * 1024, max_total_bytes: 20 * 1024 * 1024, max_count: 7,
+    });
+  });
+
+  it('reports the defaults when the operator set none', async () => {
+    await startBridge([], new RecordingAdapter());
+    const hello = await waitFor((f) => f['type'] === 'hello', 'hello');
+    expect(hello['attachment_limits']).toEqual({
+      max_file_bytes: 25 * 1024 * 1024, max_total_bytes: 100 * 1024 * 1024, max_count: 50,
+    });
   });
 });
 
@@ -378,5 +401,24 @@ describe('attachments', () => {
     expect(events[0]!.event).toBe('error');
     expect(events[0]!.data['code']).toBe('attachment_refused');
     expect(adapter.seen).toEqual([]);
+  });
+});
+
+describe('the attachment store', () => {
+  it('is swept when the bridge starts, so what expired while it was down goes', async () => {
+    const dir = join(root, 'store');
+    mkdirSync(dir);
+    const expired = join(dir, 'a'.repeat(64));
+    const fresh = join(dir, 'b'.repeat(64));
+    writeFileSync(expired, 'x');
+    writeFileSync(fresh, 'y');
+    const longAgo = new Date(Date.now() - 10 * 60 * 60 * 1000);
+    utimesSync(expired, longAgo, longAgo);
+
+    await startBridge([], new RecordingAdapter(), {
+      attachmentCache: { dir, ttlMs: 60 * 60 * 1000, maxBytes: 1024 * 1024 },
+    });
+    expect(existsSync(expired)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
   });
 });

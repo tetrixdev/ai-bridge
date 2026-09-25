@@ -63,9 +63,12 @@ import {
   buildAttachmentPreamble,
   fetchAttachments,
   DEFAULT_ATTACHMENT_LIMITS,
+  DEFAULT_ATTACHMENT_TIMEOUTS,
   type AttachmentLimits,
+  type AttachmentTimeouts,
   type SavedAttachment,
 } from './attachments/fetch.js';
+import { AttachmentCache, type AttachmentCacheSettings } from './attachments/cache.js';
 import { attachmentDirFor, removeAttachmentDir } from './attachments/store.js';
 import {
   ATTACH_FILE_TOOL,
@@ -124,8 +127,18 @@ export interface BridgeOptions {
    * origin of `serverUrl`; `--api` overrides it for split deployments.
    */
   apiOrigin?: string;
-  /** Per-file and per-request attachment size caps. */
+  /** Per-file, per-request and per-request-count attachment caps. */
   attachmentLimits?: AttachmentLimits;
+  /** When a stalled or endless attachment download is given up on. */
+  attachmentTimeouts?: AttachmentTimeouts;
+  /**
+   * Where attachments are kept between turns, and for how long.
+   *
+   * Absent means no store at all, which is what the test suite wants: a
+   * default pointing at the operator's real cache would have the suite fill
+   * and sweep the store of a bridge that is running on the same machine.
+   */
+  attachmentCache?: AttachmentCacheSettings & { dir: string };
   /** Keep downloaded attachments after the turn, for debugging. */
   keepAttachments?: boolean;
   /**
@@ -407,6 +420,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   /** Where attachments come from and go to. */
   private readonly apiOrigin: string;
   private readonly attachmentLimits: AttachmentLimits;
+  private readonly attachmentTimeouts: AttachmentTimeouts;
+  private readonly attachmentCache: AttachmentCache;
+  /** Expires cached attachments on a bridge that is up but not being asked anything. */
+  private attachmentSweepTimer: ReturnType<typeof setInterval> | null = null;
   private readonly keepAttachments: boolean;
   /** Whether the operator permitted the server to select `native`. */
   private readonly allowNative: boolean;
@@ -449,6 +466,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.allowedRootPaths = rootPaths(this.allowedRoots);
     this.apiOrigin = options.apiOrigin ?? resolveApiOrigin(options.serverUrl);
     this.attachmentLimits = options.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS;
+    this.attachmentTimeouts = options.attachmentTimeouts ?? DEFAULT_ATTACHMENT_TIMEOUTS;
+    this.attachmentCache = options.attachmentCache
+      ? new AttachmentCache(options.attachmentCache.dir, options.attachmentCache)
+      : AttachmentCache.disabled();
     this.keepAttachments = options.keepAttachments ?? false;
     this.allowNative = options.allowNative ?? false;
     this.sessionWorkingDirs = new SessionWorkingDirs(
@@ -864,6 +885,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return;
     }
 
+    this.startAttachmentSweeps();
+
     // Keep token in query param for backward compatibility, but also send it
     // in the Authorization header as the primary (log-safe) channel.
     const url = new URL(this.serverUrl);
@@ -889,10 +912,31 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   }
 
   /**
+   * Sweep the attachment store now, and hourly after that.
+   *
+   * On start because files may have expired while the bridge was not running,
+   * and on a timer because a bridge nobody sends a turn to would otherwise keep
+   * them past their TTL for as long as it stays up. After each turn as well —
+   * see the request `finally`. Once per process: reconnects come through here
+   * too, and the first sweep already happened.
+   */
+  private startAttachmentSweeps(): void {
+    if (this.attachmentSweepTimer !== null || this.attachmentCache.dir === null) return;
+    this.attachmentCache.sweep();
+    this.attachmentSweepTimer = setInterval(() => this.attachmentCache.sweep(), 60 * 60 * 1000);
+    // Housekeeping must never be the thing keeping the process alive.
+    this.attachmentSweepTimer.unref();
+  }
+
+  /**
    * Gracefully disconnect from the server.
    */
   async disconnect(): Promise<void> {
     this.isShuttingDown = true;
+    if (this.attachmentSweepTimer !== null) {
+      clearInterval(this.attachmentSweepTimer);
+      this.attachmentSweepTimer = null;
+    }
     this.stopHeartbeat();
     this.clearReconnectTimer();
     this.toolResolver.cancelAll();
@@ -1120,6 +1164,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       ...(this.allowedRoots.length > 0
         ? { workspaces: toWorkspaceRefs(this.allowedRoots) }
         : {}),
+      // The limits this bridge will enforce, so a server can warn in the
+      // composer, with the real number, before anybody waits for an upload —
+      // instead of keeping its own copy of them in step by hand.
+      attachment_limits: {
+        max_file_bytes: this.attachmentLimits.maxFileBytes,
+        max_total_bytes: this.attachmentLimits.maxTotalBytes,
+        max_count: this.attachmentLimits.maxCount,
+      },
     };
     this.send(hello);
     log.info('Hello sent', {
@@ -1832,6 +1884,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
           token: () => this.token,
           expectedOrigin: this.apiOrigin,
           limits: this.attachmentLimits,
+          timeouts: this.attachmentTimeouts,
+          cache: this.attachmentCache,
           signal,
           keep: this.keepAttachments,
         });
@@ -1841,7 +1895,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // present and invisible, and the turn answers as if nothing had been
       // attached.
       const effectiveRequest: AiRequestMessage = saved.length > 0
-        ? { ...request, message: buildAttachmentPreamble(saved) + request.message }
+        ? {
+          ...request,
+          message: buildAttachmentPreamble(saved, { cached: this.attachmentCache.enabled })
+            + request.message,
+        }
         : request;
 
       // State the bridge-owned MCP tools read, keyed by request id so
@@ -1976,6 +2034,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
             error: err instanceof Error ? err.message : String(err),
           });
         }
+      }
+      // After the turn, so what it just added counts against the cap at once
+      // rather than at the next restart. Only turns that brought files can
+      // have grown the store; the hourly timer handles expiry for the rest.
+      if ((request.attachments?.length ?? 0) > 0) {
+        this.attachmentCache.sweep();
       }
     }
   }

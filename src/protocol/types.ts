@@ -213,6 +213,22 @@ export interface HelloMessage {
    * An older server ignores the field.
    */
   workspaces?: WorkspaceRef[];
+  /**
+   * The attachment caps this bridge enforces, so a server can refuse or warn
+   * before the upload rather than mirror the numbers in its own configuration.
+   * Omitted by a bridge that predates the field; an older server ignores it.
+   */
+  attachment_limits?: AttachmentLimitsRef;
+}
+
+/** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
+export interface AttachmentLimitsRef {
+  /** Largest single attachment, in bytes. */
+  max_file_bytes: number;
+  /** Largest total of one request's attachments, in bytes. */
+  max_total_bytes: number;
+  /** Most attachments one request may carry. */
+  max_count: number;
 }
 
 /**

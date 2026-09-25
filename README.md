@@ -72,6 +72,13 @@ one.
 other way. A flag or an environment variable still wins over the file, so a
 service can be pointed at one and overridden by hand for a single run.
 
+`install` takes the same `--attachment-*` flags as a direct run and records them
+in that bridge's credentials file, where the service reads them back — as its
+environment on Linux, through `--env-file` elsewhere. A reinstall that does not
+name a setting keeps the one already recorded, so rotating a token does not put
+the size caps back to their defaults, and lines somebody else added to the file
+are left where they are.
+
 ## Options
 
 | Flag | Environment Variable | Description |
@@ -91,8 +98,13 @@ service can be pointed at one and overridden by hand for a single run.
 | `--allow-dir <path>[=<label>]` | `AI_BRIDGE_ALLOWED_DIRS` | Permit the server to run turns in this directory. Repeatable; the environment variable is path-separator delimited (`:` on POSIX, `;` on Windows). **Off unless you pass it** — without it a named working directory is refused, and so is `workspace` isolation. Read [Working in a repository](#working-in-a-repository) first |
 | `--api <url>` | `AI_BRIDGE_API` | Base URL of the server's HTTP API for attachments, when it is not the same host as `--server`. Defaults to the `https://` origin of `--server` |
 | _(no flag)_ | `AI_BRIDGE_DISABLE_PARTIAL_STREAMING` | Set to `1` to make Claude answers arrive one block at a time instead of streaming in chunks. An escape hatch for a CLI whose partial output misbehaves; the bridge already falls back on its own when the CLI does not support partial messages at all |
-| `--attachment-max-mb <n>` | | Largest single attachment to download (default `25`) |
-| `--attachment-total-mb <n>` | | Largest total of attachments per request (default `100`) |
+| `--attachment-max-mb <n>` | `AI_BRIDGE_ATTACHMENT_MAX_MB` | Largest single attachment to download (default `25`) |
+| `--attachment-total-mb <n>` | `AI_BRIDGE_ATTACHMENT_TOTAL_MB` | Largest total of attachments per request (default `100`) |
+| `--attachment-max-count <n>` | `AI_BRIDGE_ATTACHMENT_MAX_COUNT` | Most attachments one request may carry (default `50`) |
+| `--attachment-stall-seconds <n>` | `AI_BRIDGE_ATTACHMENT_STALL_SECONDS` | Give up on a download that has received nothing for this long (default `60`). A download that keeps moving is never cut off by this |
+| `--attachment-timeout-minutes <n>` | `AI_BRIDGE_ATTACHMENT_TIMEOUT_MINUTES` | Longest one attachment may take in total, however steadily it arrives (default `60`). Raise it with the size caps if you allow files in the gigabytes |
+| `--attachment-cache-ttl-hours <n>` | `AI_BRIDGE_ATTACHMENT_CACHE_TTL_HOURS` | Keep a downloaded attachment for later turns until it has gone unused this long (default `72`). `0` turns the cache off |
+| `--attachment-cache-max-mb <n>` | `AI_BRIDGE_ATTACHMENT_CACHE_MAX_MB` | Cap on what is kept for later turns; least recently used go first (default `1024`). `0` turns the cache off |
 | `--allow-native` | | Permit the server to select `native` isolation — the CLI's full local environment, including your own MCP servers, hooks, plugins and a shell. **Off unless you pass it.** Only for a bridge you run against your own machine |
 | `--keep-attachments` | | Keep downloaded attachments after a turn instead of deleting them. Debugging aid |
 
@@ -190,7 +202,21 @@ A file attached in the chat does not travel over the WebSocket — the server's 
 - only from the origin it is connected to (or `--api`), only over HTTPS, and never following a redirect;
 - into a per-request directory under `~/.cache/ai-bridge/attachments/`, **never into your checkout**;
 - verified against the declared size and SHA-256, failing the turn loudly on a mismatch rather than handing the model a truncated file it will describe as corrupt;
+- given up on when nothing has arrived for a minute (`--attachment-stall-seconds`), not after a fixed two minutes: a large file on a slow link that keeps moving is fine however long it takes, and a dead one fails in a minute rather than making somebody wait out the clock. An hour per file (`--attachment-timeout-minutes`) remains as the outer bound;
 - deleted when the turn ends — on success, error, cancel, and on the bridge process exiting.
+
+### Kept for later turns
+
+The per-turn copy still goes when the turn does, but the same bytes are also kept, for a while, under `~/.cache/ai-bridge/attachment-cache/`, named by their SHA-256. When a later turn attaches the same file it is hard-linked (or copied, on a filesystem that will not link) into that turn's directory instead of being downloaded again, so a 200 MB dump attached in three turns crosses the network once. The assistant is told, in one line of the preamble, that this may happen.
+
+It is a cache, and behaves like one:
+
+- **A miss is an ordinary download.** Anything wrong with the kept copy — gone, expired, the wrong size — means it is fetched again, never that the turn fails.
+- **A hit is re-verified** against the checksum the server sent for *this* turn before the assistant sees it. The kept file and the turn's copy are one inode, so an assistant that edits its copy in place has edited the kept one too; the check turns that into a re-download rather than a wrong answer.
+- **It has a lifetime.** A file unused for 72 hours expires, and the store is capped at 1 GB, least recently used first. Both are settable, and `0` for either turns the store off (and empties it). It is swept on start, after each turn that brought attachments, and hourly.
+- **One store per installed bridge, never per machine.** Two bridges on one machine answer two different servers, and a shared store would hand a file one server's user sent to a turn another server asked for. The store is keyed by the install's name plus a digest of the server and device, so a name later pointed at a different server does not inherit the old server's files either. A bridge run by hand against a server shares the store of the service installed for that same server by default.
+
+`--keep-attachments` is unrelated and unchanged: it keeps the per-turn directories, for debugging, and never cleans them up.
 
 The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. That tool is offered in `workspace` and `native` only. In `isolated`, Claude reaches server-declared tools plus — on a turn that has attachments — permission to read that turn's attachment directory, and nothing else. Codex and Gemini have no equivalent per-path grant: Codex sits at its own read-only sandbox and Gemini at its own defaults, both of which are broader than that. See the posture table in [PROTOCOL.md](PROTOCOL.md). It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
 
