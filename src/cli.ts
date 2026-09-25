@@ -29,41 +29,36 @@ import { buildAllowedRoots, type AllowedRoot } from './workspace/allowlist.js';
 import { resolveApiOrigin } from './attachments/origin.js';
 import { enrol, type EngramConfig } from './local/engram.js';
 import { installBridge, listBridges, pathsFor, readEnvFile, uninstallBridge } from './service/index.js';
+import {
+  ATTACHMENT_OPTIONS,
+  resolveAttachmentSettings,
+  validateAttachmentOptions,
+  type AttachmentOptionValues,
+  type ResolvedAttachmentSettings,
+} from './attachments/options.js';
 
 const log = createLogger('CLI');
-
-/**
- * Parse a megabyte option into bytes.
- *
- * Throws rather than falling back to a default: a mistyped cap that silently
- * becomes 25 MB is one nobody notices until a large attachment is refused for
- * reasons that make no sense.
- */
-function parseMegabytes(raw: string, flag: string): number {
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`${flag} must be a positive number of megabytes (got "${raw}")`);
-  }
-  return Math.floor(value * 1024 * 1024);
-}
 
 /** The parts of BridgeOptions the operator's own flags decide. */
 export interface OperatorPosture {
   allowedRoots: AllowedRoot[];
   apiOrigin: string;
-  attachmentLimits: { maxFileBytes: number; maxTotalBytes: number };
+  attachmentLimits: ResolvedAttachmentSettings['limits'];
+  attachmentTimeouts: ResolvedAttachmentSettings['timeouts'];
+  attachmentCache: ResolvedAttachmentSettings['cache'];
   allowNative: boolean;
   keepAttachments: boolean;
 }
 
 /** Just the option fields this mapping reads. */
-export interface OperatorOptions {
+export interface OperatorOptions extends AttachmentOptionValues {
   allowDir: string[];
   api?: string;
   allowNative: boolean;
   keepAttachments: boolean;
-  attachmentMaxMb: string;
-  attachmentTotalMb: string;
+  /** The install this run is, when a service started it: from AI_BRIDGE_NAME
+   *  or the env file. It keeps one install's attachment store from another's. */
+  installName?: string | undefined;
 }
 
 /**
@@ -84,13 +79,13 @@ export function resolveOperatorPosture(
   serverUrl: string,
   env: NodeJS.ProcessEnv,
 ): OperatorPosture {
+  const attachments = resolveAttachmentSettings(opts, serverUrl, opts.installName);
   return {
     allowedRoots: buildAllowedRoots(opts.allowDir, env['AI_BRIDGE_ALLOWED_DIRS']),
     apiOrigin: resolveApiOrigin(serverUrl, opts.api),
-    attachmentLimits: {
-      maxFileBytes: parseMegabytes(opts.attachmentMaxMb, '--attachment-max-mb'),
-      maxTotalBytes: parseMegabytes(opts.attachmentTotalMb, '--attachment-total-mb'),
-    },
+    attachmentLimits: attachments.limits,
+    attachmentTimeouts: attachments.timeouts,
+    attachmentCache: attachments.cache,
     allowNative: opts.allowNative,
     keepAttachments: opts.keepAttachments,
   };
@@ -195,20 +190,19 @@ program
     '--keep-attachments',
     'Keep downloaded attachments after a turn instead of deleting them. Debugging aid.',
     false,
-  )
-  .option(
-    '--attachment-max-mb <n>',
-    'Largest single attachment the bridge will download, in MB.',
-    '25',
-  )
-  .option(
-    '--attachment-total-mb <n>',
-    'Largest total of attachments per request, in MB.',
-    '100',
-  )
+  );
+
+// Each attachment setting takes its flag, then its environment variable. No
+// commander default: unset has to stay distinguishable from "set to the
+// default", or the env file (lowest precedence) could never fill it in.
+for (const option of ATTACHMENT_OPTIONS) {
+  program.option(option.flag, `${option.description} Or set ${option.env}.`, process.env[option.env] || undefined);
+}
+
+program
   .option(
     '--env-file <path>',
-    'Read AI_BRIDGE_SERVER, AI_BRIDGE_TOKEN and AI_BRIDGE_ALLOW_DIR from this file. What `ai-bridge install` points a service at, so a token lives in one file with one owner rather than inside a service definition anybody can print.',
+    'Read AI_BRIDGE_SERVER, AI_BRIDGE_TOKEN, AI_BRIDGE_ALLOW_DIR and the AI_BRIDGE_ATTACHMENT_* settings from this file. What `ai-bridge install` points a service at, so a token lives in one file with one owner rather than inside a service definition anybody can print.',
   )
   .option(
     '--log-file <path>',
@@ -220,8 +214,9 @@ program
     localTools: boolean; engram?: string; engramToken?: string;
     deviceLabel: string; deviceMode: string; identityFile: string; localDataDir: string;
     allowDir: string[]; api?: string; keepAttachments: boolean; allowNative: boolean;
-    attachmentMaxMb: string; attachmentTotalMb: string; envFile?: string;
-  }) => {
+    envFile?: string; installName?: string;
+  } & AttachmentOptionValues) => {
+    opts.installName = process.env['AI_BRIDGE_NAME'] || undefined;
     // Before anything reads server or token. The file is the lowest precedence
     // of the three sources -- a flag or an environment variable still wins --
     // so a service can be pointed at one and still be overridden by hand for a
@@ -230,8 +225,12 @@ program
       const fromFile = readEnvFile(opts.envFile);
       opts.server ??= fromFile.server;
       opts.token ??= fromFile.token;
+      opts.installName ??= fromFile.name;
       if (fromFile.allowDir && (!opts.allowDir || opts.allowDir.length === 0)) {
         opts.allowDir = [fromFile.allowDir];
+      }
+      for (const option of ATTACHMENT_OPTIONS) {
+        opts[option.key] ??= fromFile.settings?.[option.env];
       }
     }
     // Enable debug logging if requested
@@ -438,6 +437,8 @@ program
       allowedRoots,
       apiOrigin,
       attachmentLimits,
+      attachmentTimeouts: operatorPosture.attachmentTimeouts,
+      attachmentCache: operatorPosture.attachmentCache,
       keepAttachments: operatorPosture.keepAttachments,
       allowNative: operatorPosture.allowNative,
     });
@@ -537,19 +538,33 @@ program
  * overwrite the first's credentials, report success, and leave the machine
  * answering the old server until something restarted it.
  */
-program
+const installCommand = program
   .command('install')
   .description('Install this bridge as a background service that starts with the machine')
   .requiredOption('-s, --server <url>', 'WebSocket server URL, as the web application gave it to you')
   .requiredOption('-t, --token <token>', 'Pairing token, as the web application gave it to you')
   .option('--allow-dir <path>', 'The one folder the assistant may read, write and run things inside')
   .option('--name <name>', 'What to call this bridge. Defaults to the server\'s hostname, so one bridge per server.')
-  .option('--force', 'Replace an install of this name even if it is paired to a different server or machine', false)
-  .action((opts: { server: string; token: string; allowDir?: string; name?: string; force: boolean }) => {
+  .option('--force', 'Replace an install of this name even if it is paired to a different server or machine', false);
+// The same attachment settings as a direct run, recorded in the service's env
+// file. Left out, a reinstall keeps whatever the install it replaces had.
+for (const option of ATTACHMENT_OPTIONS) {
+  installCommand.option(option.flag, option.description);
+}
+installCommand
+  .action((opts: {
+    server: string; token: string; allowDir?: string; name?: string; force: boolean;
+  } & AttachmentOptionValues) => {
     try {
+      validateAttachmentOptions(opts);
+      const settings: Record<string, string> = {};
+      for (const option of ATTACHMENT_OPTIONS) {
+        const value = opts[option.key];
+        if (value !== undefined) settings[option.env] = value;
+      }
       const { name, replaced } = installBridge({
         server: opts.server, token: opts.token, allowDir: opts.allowDir,
-        name: opts.name, force: opts.force,
+        name: opts.name, force: opts.force, settings,
       });
       const paths = pathsFor(name);
       console.log(`${replaced ? 'Replaced' : 'Installed'} "${name}", running in the background.`);

@@ -23,10 +23,15 @@ export { deviceOf, readConfig } from './config.js';
  *  starts. Absent or unreadable is not an error here: the flags and the
  *  environment are still there to supply them, and saying so twice would make a
  *  perfectly ordinary run look broken. */
-export function readEnvFile(path: string): { server?: string; token?: string; allowDir?: string } {
+export function readEnvFile(path: string): {
+  server?: string; token?: string; allowDir?: string; name?: string; settings?: Record<string, string>;
+} {
   const config = readConfig(path);
   if (!config) return {};
-  return { server: config.server, token: config.token, allowDir: config.allowDir };
+  return {
+    server: config.server, token: config.token, allowDir: config.allowDir,
+    name: config.name, settings: config.settings ?? {},
+  };
 }
 
 export interface InstallRequest extends BridgeConfig {
@@ -47,6 +52,23 @@ export interface Installed {
   state: string;
 }
 
+/**
+ * What an install writes, given what it replaces.
+ *
+ * Settings carry over from the install being replaced unless given again.
+ * Rotating a token is a reinstall, and it must not quietly put the size caps
+ * somebody chose back to their defaults.
+ */
+export function configForInstall(req: InstallRequest, name: string, existing: BridgeConfig | null): BridgeConfig {
+  return {
+    server: req.server,
+    token: req.token,
+    allowDir: req.allowDir,
+    name,
+    settings: { ...existing?.settings, ...req.settings },
+  };
+}
+
 export function installBridge(req: InstallRequest): { name: string; replaced: boolean } {
   if (!supported()) {
     throw new Error(
@@ -56,9 +78,9 @@ export function installBridge(req: InstallRequest): { name: string; replaced: bo
   }
   const name = req.name ? normaliseName(req.name) : nameFromServer(req.server);
   const paths = pathsFor(name);
-  const next: BridgeConfig = { server: req.server, token: req.token, allowDir: req.allowDir };
-
   const existing = readConfig(paths.env);
+  const next = configForInstall(req, name, existing);
+
   let replaced = false;
   if (existing) {
     const verdict = replaceable(existing, next);

@@ -13,10 +13,11 @@
  */
 
 import { createHash } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AttachmentRef } from '../protocol/types.js';
 import { RequestRefusal } from '../errors.js';
+import { AttachmentCache } from './cache.js';
 import { assertAllowedAttachmentUrl, AttachmentUrlError } from './origin.js';
 import { disambiguate, ensureAttachmentDir, sanitiseAttachmentName } from './store.js';
 import { createLogger } from '../utils/logger.js';
@@ -28,31 +29,66 @@ export const ATTACHMENT_REFUSED = 'attachment_refused';
 export const ATTACHMENT_TOO_LARGE = 'attachment_too_large';
 export const ATTACHMENT_FAILED = 'attachment_failed';
 
-/** How long a single attachment download may take. */
-const DOWNLOAD_TIMEOUT_MS = 120_000;
-
 /**
- * How many files one turn may carry.
+ * How many files one turn may carry, unless the operator says otherwise.
  *
  * The byte caps bound what lands on disk; they do not bound how long the turn
- * waits. Downloads run in sequence with their own timeout, and the CLI has not
- * been spawned yet, so the request timeout is not running either — five
- * hundred attachments from a slow endpoint would hold the request open for
- * most of a day.
+ * waits. Downloads run in sequence, and the CLI has not been spawned yet, so
+ * the request timeout is not running either — five hundred attachments from a
+ * slow endpoint would hold the request open for most of a day.
  */
-const MAX_ATTACHMENTS = 50;
+export const DEFAULT_MAX_ATTACHMENTS = 50;
 
-/** Caps on what one turn may pull onto the machine. */
+/** Caps on what one turn may pull onto the machine. Reported to the server in `hello`. */
 export interface AttachmentLimits {
   /** Largest single file, in bytes. */
   maxFileBytes: number;
   /** Largest total across one request, in bytes. */
   maxTotalBytes: number;
+  /** Most files one request may carry. */
+  maxCount: number;
 }
 
 export const DEFAULT_ATTACHMENT_LIMITS: AttachmentLimits = {
   maxFileBytes: 25 * 1024 * 1024,
   maxTotalBytes: 100 * 1024 * 1024,
+  maxCount: DEFAULT_MAX_ATTACHMENTS,
+};
+
+/**
+ * When a download is given up on.
+ *
+ * Two clocks, because they catch different things. A fixed total duration —
+ * which is what this used to be, two minutes per file — cannot tell a slow link
+ * from a dead one: it refuses a large file that was arriving perfectly well,
+ * and it makes whoever is waiting sit out the full two minutes on a connection
+ * that died in the first second. Whatever the size cap said, the timeout was
+ * the real ceiling.
+ *
+ * So the working clock is a stall timer: a download that keeps moving is
+ * healthy however long it takes, and one that has moved nothing for a minute is
+ * not. The overall ceiling stays, set high, for the pathological server that
+ * trickles a byte just often enough to never stall.
+ */
+export interface AttachmentTimeouts {
+  /** Longest wait for the next bytes — including the first — before giving up. */
+  stallMs: number;
+  /** Longest a single file may take in total, however steadily it arrives. */
+  ceilingMs: number;
+}
+
+/**
+ * A minute without a byte, an hour in total.
+ *
+ * A minute rides out a laptop changing networks or a server warming a file up
+ * from object storage; nothing that has been silent that long is coming back.
+ * An hour is the default per-file cap (25 MB) at well under a megabit, and
+ * still a gigabyte at a few megabits; an operator who raises the size caps
+ * into gigabytes should raise this with them.
+ */
+export const DEFAULT_ATTACHMENT_TIMEOUTS: AttachmentTimeouts = {
+  stallMs: 60_000,
+  ceilingMs: 60 * 60_000,
 };
 
 /** An attachment that made it onto disk intact. */
@@ -74,16 +110,32 @@ function humanBytes(bytes: number): string {
 }
 
 /**
- * An AbortSignal that fires when either the turn is cancelled or the download
- * takes too long.
+ * An AbortSignal that fires when the turn is cancelled, when the download has
+ * made no progress for `stallMs`, or when it has run past `ceilingMs`.
+ *
+ * `progress()` re-arms the stall clock; `expired` says which clock fired, so
+ * the refusal can name it instead of reporting a generic abort.
  *
  * Built by hand rather than with `AbortSignal.any`, which landed in Node 20.3
  * while this package supports Node 20.0.
  */
-function withTimeout(signal: AbortSignal, ms: number): { signal: AbortSignal; done: () => void } {
+function downloadClock(
+  signal: AbortSignal,
+  timeouts: AttachmentTimeouts,
+): { signal: AbortSignal; progress: () => void; expired: () => string | null; done: () => void } {
   const controller = new AbortController();
+  let expired: string | null = null;
+  const expire = (why: string): void => {
+    expired = why;
+    controller.abort(new Error(why));
+  };
   const onAbort = () => controller.abort(signal.reason);
-  const timer = setTimeout(() => controller.abort(new Error(`timed out after ${ms}ms`)), ms);
+
+  let stall = setTimeout(() => expire(`no data for ${formatDuration(timeouts.stallMs)}`), timeouts.stallMs);
+  const ceiling = setTimeout(
+    () => expire(`still downloading after ${formatDuration(timeouts.ceilingMs)}`),
+    timeouts.ceilingMs,
+  );
 
   if (signal.aborted) {
     onAbort();
@@ -93,11 +145,24 @@ function withTimeout(signal: AbortSignal, ms: number): { signal: AbortSignal; do
 
   return {
     signal: controller.signal,
+    progress: () => {
+      if (controller.signal.aborted) return;
+      clearTimeout(stall);
+      stall = setTimeout(() => expire(`no data for ${formatDuration(timeouts.stallMs)}`), timeouts.stallMs);
+    },
+    expired: () => expired,
     done: () => {
-      clearTimeout(timer);
+      clearTimeout(stall);
+      clearTimeout(ceiling);
       signal.removeEventListener('abort', onAbort);
     },
   };
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 120_000) return `${Math.round(ms / 1000)}s`;
+  return `${Math.round(ms / 60_000)} min`;
 }
 
 /**
@@ -115,12 +180,15 @@ async function downloadOne(
   expectedOrigin: string,
   remainingBytes: number,
   perFileCap: number,
+  timeouts: AttachmentTimeouts,
   signal: AbortSignal,
 ): Promise<number> {
   const url = assertAllowedAttachmentUrl(ref.url, expectedOrigin);
   const cap = Math.min(perFileCap, remainingBytes);
 
-  const { signal: fetchSignal, done } = withTimeout(signal, DOWNLOAD_TIMEOUT_MS);
+  const clock = downloadClock(signal, timeouts);
+  const fetchSignal = clock.signal;
+  let written = 0;
   try {
     const response = await fetch(url, {
       headers: { Authorization: `Bearer ${token()}` },
@@ -139,9 +207,12 @@ async function downloadOne(
     }
 
     const hash = createHash('sha256');
+    // Unlinked first rather than truncated: a name left over from an earlier
+    // attempt at this request may be a hard link into the attachment cache,
+    // and truncating it would empty the cached copy along with it.
+    rmSync(destPath, { force: true });
     const sink = createWriteStream(destPath, { mode: 0o600 });
     const reader = response.body.getReader();
-    let written = 0;
 
     // One error listener for the whole download, latched into a variable.
     // Adding a fresh `once('error')` per backpressure pause is how a large
@@ -158,6 +229,7 @@ async function downloadOne(
         throwIfSinkFailed();
         const { done: finished, value } = await reader.read();
         if (finished) break;
+        clock.progress();
         written += value.byteLength;
         if (written > cap) {
           throw new RequestRefusal(
@@ -188,6 +260,8 @@ async function downloadOne(
             sink.once('error', onError);
             fetchSignal.addEventListener('abort', onAbort, { once: true });
           });
+          // A slow disk is not a stalled server; the wait for it does not count.
+          clock.progress();
         }
       }
       await new Promise<void>((resolve) => sink.end(() => resolve()));
@@ -217,8 +291,16 @@ async function downloadOne(
     }
 
     return written;
+  } catch (err) {
+    // Which clock ran out, and how far it got. "Aborted" says nothing; "no data
+    // for 60s after 180 MB of 200 MB" says whether to retry or to call IT.
+    const why = clock.expired();
+    if (why !== null && !(err instanceof RequestRefusal)) {
+      throw new Error(`${why} (${humanBytes(written)} of ${humanBytes(ref.size)} received)`);
+    }
+    throw err;
   } finally {
-    done();
+    clock.done();
   }
 }
 
@@ -234,26 +316,32 @@ export async function fetchAttachments(opts: {
   /** Operator asked to keep the files after the turn (--keep-attachments). */
   keep?: boolean;
   /**
-   * Read at use time, not captured. Each download may take up to two minutes
-   * and they run in sequence, so a token refresh part-way through a multi-file
-   * turn would otherwise fail every remaining file on an opaque 401.
+   * Read at use time, not captured. Downloads can run for a long time and they
+   * run in sequence, so a token refresh part-way through a multi-file turn
+   * would otherwise fail every remaining file on an opaque 401.
    */
   token: () => string;
   expectedOrigin: string;
   limits: AttachmentLimits;
+  timeouts?: AttachmentTimeouts;
+  /** Files kept from earlier turns. Absent is a store that never hits. */
+  cache?: AttachmentCache;
   signal: AbortSignal;
 }): Promise<SavedAttachment[]> {
-  const { attachments, requestId, token, expectedOrigin, limits, signal, keep = false } = opts;
+  const {
+    attachments, requestId, token, expectedOrigin, limits, signal, keep = false,
+    timeouts = DEFAULT_ATTACHMENT_TIMEOUTS, cache = AttachmentCache.disabled(),
+  } = opts;
   if (attachments.length === 0) {
     return [];
   }
 
   // Refuse on the declared sizes before touching the network, so an obviously
   // oversized request costs nothing.
-  if (attachments.length > MAX_ATTACHMENTS) {
+  if (attachments.length > limits.maxCount) {
     throw new RequestRefusal(
       ATTACHMENT_TOO_LARGE,
-      `The turn carries ${attachments.length} attachments, over the ${MAX_ATTACHMENTS} per-request limit.`,
+      `The turn carries ${attachments.length} attachments, over the ${limits.maxCount} per-request limit.`,
     );
   }
 
@@ -292,10 +380,21 @@ export async function fetchAttachments(opts: {
   const taken = new Set<string>();
   const saved: SavedAttachment[] = [];
   let usedBytes = 0;
+  let reused = 0;
 
   for (const ref of attachments) {
     const name = disambiguate(sanitiseAttachmentName(ref.name, ref.id), taken);
     const destPath = join(dir, name);
+
+    // A copy kept from an earlier turn, verified against this turn's checksum,
+    // stands in for the download. The declared size already passed the caps
+    // above, and a hit is exactly that size, so it is counted the same way.
+    if (await cache.take(ref.sha256, ref.size, destPath)) {
+      reused++;
+      usedBytes += ref.size;
+      saved.push({ id: ref.id, name, path: destPath, mimeType: ref.mime_type, size: ref.size });
+      continue;
+    }
 
     let written: number;
     try {
@@ -306,6 +405,7 @@ export async function fetchAttachments(opts: {
         expectedOrigin,
         limits.maxTotalBytes - usedBytes,
         limits.maxFileBytes,
+        timeouts,
         signal,
       );
     } catch (err) {
@@ -321,6 +421,7 @@ export async function fetchAttachments(opts: {
       throw new RequestRefusal(code, `Attachment "${ref.name}" could not be fetched: ${message}`);
     }
 
+    cache.put(ref.sha256, written, destPath);
     usedBytes += written;
     saved.push({
       id: ref.id,
@@ -334,6 +435,7 @@ export async function fetchAttachments(opts: {
   log.info('Attachments saved', {
     requestId,
     count: saved.length,
+    reused,
     bytes: usedBytes,
     dir,
   });
@@ -349,7 +451,10 @@ export async function fetchAttachments(opts: {
  * attached. Absolute paths, because the CLI's own file tools take paths and
  * the model should not have to guess at the working directory.
  */
-export function buildAttachmentPreamble(saved: SavedAttachment[]): string {
+export function buildAttachmentPreamble(
+  saved: SavedAttachment[],
+  opts: { cached?: boolean } = {},
+): string {
   if (saved.length === 0) return '';
 
   const lines = saved.map(
@@ -365,6 +470,13 @@ export function buildAttachmentPreamble(saved: SavedAttachment[]): string {
     'Read them from those paths when the request refers to them. They are outside '
     + 'the working directory and are deleted when this turn ends, so copy anything '
     + 'that needs to persist.',
+    // One line, only when it is true. Without it the assistant treats a file
+    // from an earlier turn as lost for good, and asks again for something the
+    // machine may well still have.
+    ...(opts.cached
+      ? ['A file attached in an earlier turn may still be on this machine: attached again, it is '
+        + 'reused from there instead of downloaded, and fetched again if it is gone.']
+      : []),
     '',
   ].join('\n');
 }

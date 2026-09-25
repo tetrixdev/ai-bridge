@@ -6,14 +6,16 @@
  * left on disk afterwards, and none of those are exercised by a stub.
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { fetchAttachments, buildAttachmentPreamble } from '../../src/attachments/fetch.js';
 import { attachmentDirFor, removeAttachmentDir } from '../../src/attachments/store.js';
+import { AttachmentCache } from '../../src/attachments/cache.js';
 import { RequestRefusal } from '../../src/errors.js';
 import type { AttachmentRef } from '../../src/protocol/types.js';
 
@@ -25,7 +27,7 @@ const bodies = new Map<string, Buffer>();
 let seenAuth: (string | undefined)[] = [];
 
 const REQUEST_ID = 'req_fetch_test';
-const LIMITS = { maxFileBytes: 1024 * 1024, maxTotalBytes: 2 * 1024 * 1024 };
+const LIMITS = { maxFileBytes: 1024 * 1024, maxTotalBytes: 2 * 1024 * 1024, maxCount: 50 };
 
 function sha256(buf: Buffer): string {
   return createHash('sha256').update(buf).digest('hex');
@@ -48,6 +50,26 @@ beforeAll(async () => {
     seenAuth.push(req.headers['authorization']);
     const path = (req.url ?? '').split('?')[0] ?? '';
 
+    // Headers and a first chunk, then nothing, for ever: a dead connection
+    // that never closes.
+    if (path === '/stall') {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      res.write(Buffer.alloc(100));
+      return;
+    }
+    // Steady and slow: a chunk every 50ms. Healthy, however long it takes.
+    if (path === '/slow') {
+      const body = bodies.get(path) ?? Buffer.alloc(0);
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      let at = 0;
+      const tick = setInterval(() => {
+        if (res.destroyed) { clearInterval(tick); return; }
+        res.write(body.subarray(at, at + 100));
+        at += 100;
+        if (at >= body.byteLength) { clearInterval(tick); res.end(); }
+      }, 50);
+      return;
+    }
     if (path === '/redirect') {
       res.writeHead(302, { Location: 'https://evil.example.com/x' });
       res.end();
@@ -67,6 +89,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  // The stall route holds its connections open by design.
+  server.closeAllConnections();
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
@@ -94,7 +118,7 @@ describe('fetchAttachments', () => {
     const saved = await fetchAttachments({
       attachments: [ref('/big.bin', body)],
       requestId: REQUEST_ID, token: () => 'tok-abc', expectedOrigin: origin,
-      limits: { maxFileBytes: 5_000_000, maxTotalBytes: 10_000_000 },
+      limits: { maxFileBytes: 5_000_000, maxTotalBytes: 10_000_000, maxCount: 50 },
       signal: new AbortController().signal,
     });
 
@@ -171,7 +195,7 @@ describe('fetchAttachments', () => {
     const understated = ref('/lie.bin', body, { size: 10 });
     await expect(fetchAttachments({
       attachments: [understated], requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
-      limits: { maxFileBytes: 100_000, maxTotalBytes: 100_000 },
+      limits: { maxFileBytes: 100_000, maxTotalBytes: 100_000, maxCount: 50 },
       signal: new AbortController().signal,
     })).rejects.toThrow();
   });
@@ -233,8 +257,8 @@ describe('fetchAttachments', () => {
 
   it('reads the token per file, so a refresh mid-turn does not 401 the rest', async () => {
     // The server tops up long-lived tokens mid-connection. Downloads run in
-    // sequence with a two-minute timeout each, so a token captured once at the
-    // start would fail every remaining file on an opaque 401.
+    // sequence and a large one can run for a long time, so a token captured once
+    // at the start would fail every remaining file on an opaque 401.
     const a = Buffer.from('first');
     const b = Buffer.from('second');
     bodies.set('/one.txt', a);
@@ -282,6 +306,149 @@ describe('fetchAttachments', () => {
   });
 });
 
+describe('the download clocks', () => {
+  it('gives up on a download that has stopped moving, and says how far it got', async () => {
+    const body = Buffer.alloc(1000);
+    const stalled = ref('/stall', body, { url: `${origin}/stall` });
+    const started = Date.now();
+    const err = await fetchAttachments({
+      attachments: [stalled], requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
+      limits: LIMITS, timeouts: { stallMs: 200, ceilingMs: 60_000 },
+      signal: new AbortController().signal,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(RequestRefusal);
+    expect(err).toMatchObject({ code: 'attachment_failed' });
+    // Named, with the progress: whoever reads this can tell a dead link from a
+    // file that was simply too big for the time allowed.
+    expect((err as Error).message).toMatch(/no data for 200ms \(100 B of 1000 B received\)/);
+    // Caught by the stall clock, not by waiting out the ceiling.
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  it('lets a download that keeps moving run past the stall window', async () => {
+    // Twelve chunks, 50ms apart: well over the 150ms stall window in total,
+    // never 150ms without a byte. A total-duration timeout would have cut it.
+    const body = randomBytes(1200);
+    bodies.set('/slow', body);
+    const saved = await fetchAttachments({
+      attachments: [ref('/slow', body, { url: `${origin}/slow` })],
+      requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
+      limits: LIMITS, timeouts: { stallMs: 150, ceilingMs: 60_000 },
+      signal: new AbortController().signal,
+    });
+    expect(readFileSync(saved[0]!.path).equals(body)).toBe(true);
+  });
+
+  it('still has a ceiling, for a server that trickles just fast enough never to stall', async () => {
+    const body = randomBytes(3000);
+    bodies.set('/slow', body);
+    await expect(fetchAttachments({
+      attachments: [ref('/slow', body, { url: `${origin}/slow` })],
+      requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
+      limits: LIMITS, timeouts: { stallMs: 1000, ceilingMs: 300 },
+      signal: new AbortController().signal,
+    })).rejects.toThrow(/still downloading after 300ms/);
+  });
+});
+
+describe('the per-request count cap', () => {
+  it('is the operator\'s setting, not a constant', async () => {
+    const body = Buffer.from('x');
+    bodies.set('/one.txt', body);
+    const three = Array.from({ length: 3 }, (_, i) => ref('/one.txt', body, { id: `att_${i}` }));
+    await expect(fetchAttachments({
+      attachments: three, requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
+      limits: { ...LIMITS, maxCount: 2 }, signal: new AbortController().signal,
+    })).rejects.toThrow(/over the 2 per-request limit/);
+
+    const saved = await fetchAttachments({
+      attachments: three, requestId: REQUEST_ID, token: () => 't', expectedOrigin: origin,
+      limits: { ...LIMITS, maxCount: 3 }, signal: new AbortController().signal,
+    });
+    expect(saved).toHaveLength(3);
+  });
+});
+
+describe('attachments kept between turns', () => {
+  let storeRoot: string;
+  const NEXT_TURN = 'req_fetch_test_next';
+
+  beforeEach(() => {
+    storeRoot = mkdtempSync(join(tmpdir(), 'fetch-cache-'));
+  });
+  afterEach(() => {
+    removeAttachmentDir(NEXT_TURN);
+    rmSync(storeRoot, { recursive: true, force: true });
+  });
+
+  function cache(): AttachmentCache {
+    return new AttachmentCache(join(storeRoot, 'scope'), { ttlMs: 60_000, maxBytes: 10_000_000 });
+  }
+
+  it('does not download a file a second time', async () => {
+    const body = randomBytes(50_000);
+    bodies.set('/dump.sql', body);
+    const store = cache();
+    const once = { attachments: [ref('/dump.sql', body)], token: () => 't', expectedOrigin: origin,
+      limits: LIMITS, cache: store, signal: new AbortController().signal };
+
+    await fetchAttachments({ ...once, requestId: REQUEST_ID });
+    expect(seenAuth).toHaveLength(1);
+
+    const again = await fetchAttachments({ ...once, requestId: NEXT_TURN });
+    expect(seenAuth).toHaveLength(1);
+    // At the new turn's own path, exactly as a download would have put it.
+    expect(again[0]!.path).toBe(join(attachmentDirFor(NEXT_TURN), 'dump.sql'));
+    expect(readFileSync(again[0]!.path).equals(body)).toBe(true);
+  });
+
+  it('downloads again, silently, when the kept copy no longer matches', async () => {
+    const body = Buffer.from('the real file');
+    bodies.set('/a.txt', body);
+    const store = cache();
+    const once = { attachments: [ref('/a.txt', body)], token: () => 't', expectedOrigin: origin,
+      limits: LIMITS, cache: store, signal: new AbortController().signal };
+
+    const first = await fetchAttachments({ ...once, requestId: REQUEST_ID });
+    // The assistant edits its copy in place; the kept one is the same inode.
+    writeFileSync(first[0]!.path, 'scribbled over');
+
+    const again = await fetchAttachments({ ...once, requestId: NEXT_TURN });
+    expect(seenAuth).toHaveLength(2);
+    expect(readFileSync(again[0]!.path, 'utf8')).toBe('the real file');
+  });
+
+  it('downloads as it always did when the kept copy has been evicted', async () => {
+    const body = Buffer.from('evicted');
+    bodies.set('/e.txt', body);
+    const store = cache();
+    const once = { attachments: [ref('/e.txt', body)], token: () => 't', expectedOrigin: origin,
+      limits: LIMITS, cache: store, signal: new AbortController().signal };
+    await fetchAttachments({ ...once, requestId: REQUEST_ID });
+    new AttachmentCache(store.dir, { ttlMs: 0, maxBytes: 0 }).sweep();
+
+    const again = await fetchAttachments({ ...once, requestId: NEXT_TURN });
+    expect(seenAuth).toHaveLength(2);
+    expect(readFileSync(again[0]!.path, 'utf8')).toBe('evicted');
+  });
+
+  it('never trusts a kept copy over a checksum the server did not send', async () => {
+    // A hit is keyed on the digest, so a ref whose digest is wrong cannot be
+    // satisfied by some other file that happens to be kept.
+    const body = Buffer.from('kept');
+    bodies.set('/k.txt', body);
+    const store = cache();
+    await fetchAttachments({ attachments: [ref('/k.txt', body)], requestId: REQUEST_ID, token: () => 't',
+      expectedOrigin: origin, limits: LIMITS, cache: store, signal: new AbortController().signal });
+
+    const wrong = ref('/k.txt', body, { sha256: sha256(Buffer.from('else')) });
+    await expect(fetchAttachments({ attachments: [wrong], requestId: NEXT_TURN, token: () => 't',
+      expectedOrigin: origin, limits: LIMITS, cache: store, signal: new AbortController().signal }))
+      .rejects.toThrow(/checksum/);
+  });
+});
+
 describe('buildAttachmentPreamble', () => {
   it('is empty when nothing was attached', () => {
     expect(buildAttachmentPreamble([])).toBe('');
@@ -298,6 +465,15 @@ describe('buildAttachmentPreamble', () => {
     expect(text).toContain('2 files');
     // The model needs to know these do not survive the turn.
     expect(text).toMatch(/deleted when this turn ends/);
+  });
+
+  it('says, in one line, that a file from an earlier turn may still be here — when it may', () => {
+    const one = [{ id: 'a', name: 'a.txt', path: '/cache/a.txt', mimeType: 'text/plain', size: 5 }];
+    const withStore = buildAttachmentPreamble(one, { cached: true });
+    const without = buildAttachmentPreamble(one);
+    expect(withStore).toMatch(/earlier turn may still be on this machine/);
+    expect(without).not.toMatch(/earlier turn/);
+    expect(withStore.split('\n').length - without.split('\n').length).toBe(1);
   });
 
   it('uses the singular for one file', () => {

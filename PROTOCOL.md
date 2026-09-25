@@ -205,6 +205,32 @@ This is what makes the feature usable: the server shows a picker of the checkout
 
 The field is **omitted entirely** when the operator allowed nothing, so "this bridge has no workspaces" and "this bridge predates workspaces" look the same to the server — correctly, because in both cases naming a directory is refused. An older server ignores the field.
 
+#### Additive field: `attachment_limits`
+
+The caps this bridge will enforce on [`attachments`](#additive-field-attachments), so a server can refuse or warn in the composer — with the real number — before anybody waits for an upload, instead of mirroring the bridge's configuration in its own and keeping the two in step by hand:
+
+```json
+{
+  "type": "hello",
+  "version": "0.1",
+  "bridge_version": "0.10.0",
+  "providers": [ "..." ],
+  "attachment_limits": {
+    "max_file_bytes": 26214400,
+    "max_total_bytes": 104857600,
+    "max_count": 50
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `max_file_bytes` | Largest single attachment, in bytes (`--attachment-max-mb`, default 25 MB) |
+| `max_total_bytes` | Largest total across one `ai_request`, in bytes (`--attachment-total-mb`, default 100 MB) |
+| `max_count` | Most attachments one `ai_request` may carry (`--attachment-max-count`, default 50) |
+
+Bytes rather than megabytes, so neither side rounds. A turn over any of them is refused with `attachment_too_large` exactly as before; the field only lets the server know in advance. A bridge that predates the field omits it, and the server should then assume nothing — in particular not today's defaults, which an operator may have changed. An older server ignores it.
+
 ### Bridge → Server: `providers_update`
 
 Sent mid-connection when the bridge's set of available provider CLIs changes after the `hello` — for example, the user installs or removes a CLI while the bridge stays connected.
@@ -734,10 +760,11 @@ So the bridge fetches each one instead:
 1. **The URL must be on the origin this bridge is connected to** (derived from `--server`, or the explicit `--api` override), and it must be HTTPS — the sole exception being a loopback host, where there is no wire to eavesdrop on. Redirects are **not** followed, since an allowed origin answering `302` to anywhere it likes would make the check decorative. Anything else is refused with `attachment_refused`. Without this, a compromised or hostile server turns every connected bridge into a fetcher for arbitrary hosts, with the operator's own connection token attached.
 2. It is streamed to a per-request directory under `~/.cache/ai-bridge/attachments/` — named from the request id plus a short digest of it, since two ids that sanitise alike must not share a directory and delete each other's files. **Never into the working directory**: a checkout must not be dirtied by the transport. If the file belongs in the repo, the developer asks the assistant to copy it there.
 3. `name` is reduced to a single safe path component (separators of both kinds stripped, leading dots removed, length capped, collisions numbered). The server's filename is never trusted to be a path.
-4. Per-file and per-request caps apply (`--attachment-max-mb`, `--attachment-total-mb`; 25 MB and 100 MB by default), enforced against the *declared* size before fetching and against the *actual* bytes while streaming. Over the cap is `attachment_too_large`.
+4. Per-file, per-request and count caps apply (`--attachment-max-mb`, `--attachment-total-mb`, `--attachment-max-count`; 25 MB, 100 MB and 50 files by default, and reported in [`hello`](#additive-field-attachment_limits)), enforced against the *declared* size before fetching and against the *actual* bytes while streaming. Over a cap is `attachment_too_large`. A download that receives nothing for `--attachment-stall-seconds` (60 by default) or runs past `--attachment-timeout-minutes` (60) fails with `attachment_failed`, and the message says which and how many bytes had arrived. There is no fixed per-file duration any more: a large file that keeps moving is not cut off.
 5. `size` and `sha256` are verified afterwards. A mismatch fails the whole request with `attachment_failed` — a half-downloaded PDF is, to the model, indistinguishable from a genuinely corrupt one, so it would confidently report the wrong problem.
 6. A short preamble naming the absolute paths, types and sizes is prepended to `message`, so the model knows the files exist and where they are. In `isolated`, where Claude's tool surface is otherwise restricted to `mcp__bridge__*`, a turn carrying attachments also gets a read rule **scoped to that turn's attachment directory** (`Read(/<dir>/**)`). Without it the preamble would name paths the model is not permitted to open, and the turn would end with it saying it cannot see a file the user had just attached. A bare `Read` would instead grant the whole filesystem — a server controls both the attachments and the message, so that would be arbitrary file read switched on by sending a field.
 7. The request's attachment directory is deleted when the turn terminates — on `done`, `error` and `cancelled` alike. `--keep-attachments` retains it for debugging.
+8. The bytes are also kept, for a while, in a store keyed by `sha256` — one per installed bridge, never shared between bridges pointed at different servers — and a later turn that attaches the same file gets it hard-linked (or copied) into its own directory without a download. The kept copy is re-verified against the checksum in the new turn's reference first; anything wrong with it is a silent re-download, never an error. Unused files expire after 72 hours and the store is capped at 1 GB, least recently used first (`--attachment-cache-ttl-hours`, `--attachment-cache-max-mb`; `0` turns it off). Nothing changes on the wire: the server sends the same reference each time, and the bridge decides whether it needs to fetch it. The preamble tells the model, in one line, that a file from an earlier turn may still be on the machine.
 
 #### Additive fields: `bridge_env` and `bridge_prompt`
 
@@ -1426,8 +1453,8 @@ The server also tracks heartbeats. If no `ping` is received for 2x the heartbeat
 | `working_dir_changed` | A resume named a different directory from the one its CLI session was started in | Server starts a fresh session deliberately. Terminal: `done` follows |
 | `bridge_prompt_invalid` | The `bridge_prompt` contradicts itself — text with a mode that discards it, `append`/`replace` with nothing to add, an unknown mode, or text over the 8 KB cap | Server fixes the field. Terminal: `done` follows |
 | `attachment_refused` | An attachment URL is not on the connected server's origin, or is not HTTPS | Server fixes the URL (or the operator sets `--api`). Terminal: `done` follows |
-| `attachment_too_large` | An attachment exceeds the per-file or per-request cap | Server sends a smaller file, or the operator raises `--attachment-max-mb` / `--attachment-total-mb`. Terminal: `done` follows |
-| `attachment_failed` | An attachment could not be downloaded, or failed its size/checksum verification | Retry. Terminal: `done` follows |
+| `attachment_too_large` | An attachment exceeds the per-file, per-request or count cap (all three are reported in `hello` as `attachment_limits`) | Server sends a smaller file, or the operator raises `--attachment-max-mb` / `--attachment-total-mb` / `--attachment-max-count`. Terminal: `done` follows |
+| `attachment_failed` | An attachment could not be downloaded — including one that stalled or ran past the per-file ceiling — or failed its size/checksum verification | Retry; for a stall or ceiling on a slow link, the operator raises `--attachment-stall-seconds` / `--attachment-timeout-minutes`. Terminal: `done` follows |
 | `gemini_working_dir_unavailable` | Gemini cannot use this working directory: the repository already has a `.gemini/settings.json`, or another Gemini turn is running in it | Move the file aside, use Claude or Codex, or wait for the other turn. Terminal: `done` follows |
 
 All of the above are **refusals**: they carry their own code and are followed by `done`, which ends the turn. They are deliberately not reported as `session_lost` — that code tells the server to wipe the session and silently re-issue the turn, which for a refusal would retry it forever and never surface the reason.
