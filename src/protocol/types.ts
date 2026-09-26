@@ -831,6 +831,7 @@ export type StreamEventType =
   | 'tool_result'
   | 'attachment'
   | 'rate_limit'
+  | 'task'
   | 'done'
   | 'error';
 
@@ -845,6 +846,17 @@ export interface BlockStartData {
   tool_name?: string;
   /** For tool_call blocks only. */
   tool_call_id?: string;
+  /**
+   * The tool call that spawned the helper (sub-agent) this block belongs to.
+   *
+   * ABSENT means the main assistant — which is what every block meant before
+   * this field existed, so a consumer that ignores it sees exactly what it saw
+   * before. Present on text, thinking and tool_call blocks alike: a helper's
+   * own prose is still a helper's, not the main assistant's. Matches the
+   * `tool_call_id` of the spawning `Agent` block and the `tool_use_id` of the
+   * helper's `task` events.
+   */
+  parent_tool_use_id?: string;
 }
 
 /** Data payload for block_delta events. */
@@ -885,6 +897,97 @@ export interface ToolResultData {
    * provider does not report a status.
    */
   is_error?: boolean;
+  /**
+   * The tool call that spawned the helper whose call this result answers.
+   * Absent for the main assistant's own calls. Rides on every chunk of a
+   * chunked result, like `is_error`. See BlockStartData.parent_tool_use_id.
+   */
+  parent_tool_use_id?: string;
+}
+
+/**
+ * Which moment of a helper's life a `task` event reports.
+ *
+ * A string rather than a number on purpose: a wrong string fails loudly at the
+ * consumer, a wrong integer is silently a different valid phase.
+ */
+export type TaskPhase = 'started' | 'progress' | 'updated' | 'finished' | 'heartbeat';
+
+/** What a helper has spent so far, as the CLI counts it. */
+export interface TaskUsage {
+  total_tokens?: number;
+  tool_uses?: number;
+  duration_ms?: number;
+}
+
+/**
+ * Data payload for `task` events — the life of a helper (sub-agent, or
+ * background command) the CLI runs on the main assistant's behalf.
+ *
+ * Informational and non-terminal. Every field but `phase` is optional and
+ * absent means "the CLI did not say", never zero. `tool_use_id` is the key a
+ * consumer groups by: it is the `tool_call_id` of the spawning block and the
+ * `parent_tool_use_id` on the helper's own blocks.
+ *
+ * A helper is finished ONLY when a `finished` event says so. Its spawning
+ * call's `tool_result` is not that signal: a background helper's call returns
+ * at once, while the helper works on — possibly after the main assistant has
+ * written its whole reply.
+ *
+ * And the request's terminal frame — `done`, a stream `error`, or `cancelled` —
+ * ends every task of that request whatever phase it last reported: a turn cut
+ * short (stop, timeout, a crashed CLI) sends no `finished` for its helpers.
+ *
+ * Never carries the helper's instruction text (the CLI's `prompt`): it is the
+ * largest frame in the family, and an oversized non-terminal frame is not
+ * trimmed but replaced by a `frame_too_large` stream error, which ends the
+ * turn. `description` is what a person reads.
+ */
+export interface TaskData {
+  phase: TaskPhase;
+  /**
+   * The CLI's own id for the task. Stable across its events, and always
+   * introduced by a `started`: the bridge forwards nothing about a task it did
+   * not see start in this turn.
+   */
+  task_id: string;
+  /**
+   * The tool call that spawned the helper — the key to group by. Present on
+   * every phase whenever the CLI named it at `started` (it always has, as of
+   * 2.1.280); `updated` and `heartbeat` get it filled in by the bridge, since
+   * the CLI omits it or words it differently there.
+   */
+  tool_use_id?: string;
+  /**
+   * What kind of task: `local_agent` for a helper, `local_bash` for a background
+   * shell command. On every phase when the CLI named it at `started` — the CLI
+   * names it only there, and the bridge repeats it.
+   */
+  task_type?: string;
+  /** The helper's kind, e.g. `Explore`, `general-purpose`. */
+  subagent_type?: string;
+  /** What the helper was asked to do, or on `progress` what it is doing now. */
+  description?: string;
+  /** 1 for a helper of the main assistant, 2 for a helper's helper, and so on. Started only. */
+  spawn_depth?: number;
+  /**
+   * True when the main assistant does NOT wait for this helper — it is free to
+   * reply while the helper works. Started only.
+   */
+  is_backgrounded?: boolean;
+  /** The tool the helper used most recently. Progress only. */
+  last_tool_name?: string;
+  /** Seconds the spawning call has been running, from the CLI's own clock. Heartbeat only. */
+  elapsed_seconds?: number;
+  /** How it went: `completed`, `failed`, `stopped`, `killed`… Updated and finished only. */
+  status?: string;
+  /**
+   * The helper's closing report. Finished only. Bounded to 8 KB, cut on a
+   * character boundary and marked as cut.
+   */
+  summary?: string;
+  /** Running totals. Progress and finished only. */
+  usage?: TaskUsage;
 }
 
 /**
@@ -958,6 +1061,12 @@ export interface DoneData {
    * so the next turn can resume. Null/absent when no session id was produced.
    */
   cli_session_id?: string | null;
+  /**
+   * What the turn spent on helpers, as the CLI reports it: spawned, completed,
+   * failed, max_depth, by_type{} and so on. Passed through unchanged; absent
+   * when the CLI did not report it.
+   */
+  subagent_stats?: Record<string, unknown>;
 }
 
 /** Data payload for error events. */
@@ -997,6 +1106,7 @@ export type StreamEventData =
   | BlockStopData
   | ToolResultData
   | RateLimitData
+  | TaskData
   | AttachmentEventData
   | DoneData
   | StreamErrorData;

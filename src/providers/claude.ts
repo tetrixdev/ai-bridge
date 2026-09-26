@@ -25,16 +25,33 @@
  *
  * A message delivered by the first path ALSO arrives via the second. The
  * duplicate is suppressed by message id — see the `wasStreamed` check below.
+ *
+ * Helpers (sub-agents) are reported alongside, and both of these are
+ * forwarded:
+ *
+ *   - Each helper frame carries `parent_tool_use_id`, naming the tool call
+ *     that spawned it. The whole-message path puts it on the blocks and tool
+ *     results it emits, so a consumer can tell a helper's work from the main
+ *     assistant's. Absent means the main assistant, as it always did.
+ *   - `system` frames `task_started` / `task_progress` / `task_updated` /
+ *     `task_notification`, and a `tool_progress` heartbeat every 30 s while a
+ *     helper runs, become the `task` stream event. See taskEventFrom().
  */
 
 import { createInterface } from 'node:readline';
-import type { ModelInfo } from '../protocol/types.js';
+import type { ModelInfo, TaskData, TaskPhase, TaskUsage } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
 import { startTurnTimeouts, clearRequestTimeout, type TurnTimeouts } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundArguments, replaceLoneSurrogateEscapes, safeStringify, toolResultEventData } from './result-text.js';
+import {
+  boundArguments,
+  boundTaskText,
+  replaceLoneSurrogateEscapes,
+  safeStringify,
+  toolResultEventData,
+} from './result-text.js';
 import { ClaudePartialStreamMapper } from './claude-partial.js';
 import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
@@ -313,6 +330,14 @@ export class ClaudeAdapter extends ProviderAdapter {
       // as whole `assistant` frames and are mapped below.
       const mapper = new ClaudePartialStreamMapper();
 
+      // Every task this turn saw start, and what its `task_started` said.
+      // `task_updated` does not name the spawning call, and a consumer groups a
+      // helper's events by it, so the bridge fills it in from here; it is also
+      // the set of calls a heartbeat may be attributed to. Keyed by task_id,
+      // NOT by the call: a task that started without naming its call is still
+      // a task this turn started, and its later phases must still get through.
+      const startedTasks = new Map<string, StartedTask>();
+
       // Whole-message blocks that arrived while a partial block was still open.
       //
       // Nothing in the protocol forbids overlapping blocks, but every consumer
@@ -464,6 +489,26 @@ export class ClaudeAdapter extends ProviderAdapter {
           return;
         }
 
+        // A helper's life, reported by the CLI beside its work. Through the
+        // deferral queue like the helper's own blocks, so a `finished` can
+        // never overtake the helper's last result, and through `onEvent` — so
+        // it counts as activity for the silence clock. That is what keeps a
+        // helper busy in one long step from getting the turn stopped as
+        // silent: its heartbeat is the only thing the CLI says meanwhile.
+        if (type === 'system' || type === 'tool_progress') {
+          const task = taskEventFrom(parsed, startedTasks);
+          if (task !== null) {
+            if (settled) {
+              droppedAfterSettle++;
+
+              return;
+            }
+            emitWholeMessage({ event: 'task', data: task });
+
+            return;
+          }
+        }
+
         // Tool results. The CLI reports them on `user` frames, and the bridge
         // used to drop them on the floor — so a server could see that a tool
         // ran and never what it returned, while the Codex and Gemini adapters
@@ -493,6 +538,8 @@ export class ClaudeAdapter extends ProviderAdapter {
           const content = message?.['content'];
           if (!Array.isArray(content)) return;
 
+          const parent = parentOf(parsed);
+
           for (const entry of content as Array<Record<string, unknown>>) {
             // Guarded because this runs inside the readline 'line' listener: a
             // throw here is an uncaughtException, and the CLI installs no
@@ -516,7 +563,8 @@ export class ClaudeAdapter extends ProviderAdapter {
               flattenToolResult(entry['content']),
               typeof isError === 'boolean' ? isError : undefined,
             )) {
-              emitWholeMessage({ event: 'tool_result', data });
+              const withParent: Record<string, unknown> = { ...data, ...parent };
+              emitWholeMessage({ event: 'tool_result', data: withParent });
             }
           }
           return;
@@ -570,6 +618,11 @@ export class ClaudeAdapter extends ProviderAdapter {
           const content = message['content'] as Array<Record<string, unknown>> | undefined;
           if (!content || !Array.isArray(content)) return;
 
+          // Which helper wrote this, if any. Only on this path: the streaming
+          // path never sees a helper's frames (see the guard in
+          // ClaudePartialStreamMapper.handle), so this is where they all land.
+          const parent = parentOf(parsed);
+
           for (const block of content) {
             const blockType = block['type'] as string;
 
@@ -585,6 +638,7 @@ export class ClaudeAdapter extends ProviderAdapter {
                 data: {
                   block_index: index,
                   block_type: 'text',
+                  ...parent,
                 },
               });
 
@@ -614,6 +668,7 @@ export class ClaudeAdapter extends ProviderAdapter {
                 data: {
                   block_index: index,
                   block_type: 'thinking',
+                  ...parent,
                 },
               });
 
@@ -648,6 +703,7 @@ export class ClaudeAdapter extends ProviderAdapter {
                   block_type: 'tool_call',
                   tool_name: toolName,
                   tool_call_id: toolId,
+                  ...parent,
                 },
               });
 
@@ -1041,7 +1097,217 @@ function doneDataFrom(
     ...(Array.isArray(result['permission_denials'])
       ? { permission_denials: boundDenials(result['permission_denials']) }
       : {}),
+    // What the turn spent on helpers — spawned, completed, failed, by type.
+    // Passed through as the CLI reports it, and only when it fits comfortably:
+    // it is a handful of counters, and anything bigger is not what this is.
+    ...subagentStatsOf(result['subagent_stats']),
   };
+}
+
+/** Budget for `subagent_stats` on the terminal frame. Measured at ~350 bytes on 2.1.280. */
+const MAX_SUBAGENT_STATS_BYTES = 8 * 1024;
+
+function subagentStatsOf(value: unknown): { subagent_stats?: Record<string, unknown> } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {};
+
+  // Scrubbed and measured for the same reason the denials are: this rides on
+  // the TERMINAL frame, where a lone surrogate or an oversized payload costs
+  // the request its `done`.
+  const encoded = replaceLoneSurrogateEscapes(safeStringify(value, ''));
+  if (encoded === '' || Buffer.byteLength(encoded, 'utf8') > MAX_SUBAGENT_STATS_BYTES) return {};
+
+  try {
+    return { subagent_stats: JSON.parse(encoded) as Record<string, unknown> };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The helper a frame belongs to, spread-ready: `{ parent_tool_use_id }`, or
+ * nothing at all for the main assistant — absent, never null, so a consumer
+ * that predates the field sees exactly the payload it always did.
+ */
+function parentOf(frame: Record<string, unknown>): { parent_tool_use_id?: string } {
+  const parent = frame['parent_tool_use_id'];
+
+  return typeof parent === 'string' && parent !== '' ? { parent_tool_use_id: parent } : {};
+}
+
+/** Read a string field, or undefined. */
+function strOf(source: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = source?.[key];
+
+  return typeof value === 'string' && value !== '' ? value : undefined;
+}
+
+/** Read a finite number field, or undefined. */
+function numOf(source: Record<string, unknown> | undefined, key: string): number | undefined {
+  const value = source?.[key];
+
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/** A helper's running totals, keeping only the counters the protocol names. */
+function usageOf(value: unknown): TaskUsage | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const source = value as Record<string, unknown>;
+  const usage: TaskUsage = {};
+  const total = numOf(source, 'total_tokens');
+  const tools = numOf(source, 'tool_uses');
+  const duration = numOf(source, 'duration_ms');
+  if (total !== undefined) usage.total_tokens = total;
+  if (tools !== undefined) usage.tool_uses = tools;
+  if (duration !== undefined) usage.duration_ms = duration;
+
+  return Object.keys(usage).length > 0 ? usage : undefined;
+}
+
+/** What a turn remembers about a task from its `task_started`. */
+interface StartedTask {
+  /** The spawning call, when the CLI named it (at start, or on a later phase). */
+  toolUseId: string | undefined;
+  /** `local_agent`, `local_bash`… — named by the CLI only at start. */
+  taskType: string | undefined;
+}
+
+/** The CLI's `system` subtypes for a task's life, and the phase each becomes. */
+const TASK_PHASES: ReadonlyMap<string, TaskPhase> = new Map<string, TaskPhase>([
+  ['task_started', 'started'],
+  ['task_progress', 'progress'],
+  ['task_updated', 'updated'],
+  // "Notification" is the CLI's word for the message it hands the main
+  // assistant when a helper ends. For a consumer it is the end of the helper.
+  ['task_notification', 'finished'],
+]);
+
+/**
+ * Map one CLI frame onto a `task` event, or null when it is not one.
+ *
+ * Shapes captured from Claude Code 2.1.280:
+ *
+ *   system/task_started       task_id, tool_use_id, task_type, subagent_type,
+ *                             description, spawn_depth, is_backgrounded, prompt
+ *   system/task_progress      task_id, tool_use_id, description,
+ *                             last_tool_name, usage{total_tokens,tool_uses,duration_ms}
+ *   system/task_updated       task_id, patch{status, end_time}   (no tool_use_id)
+ *   system/task_notification  task_id, tool_use_id, status, summary,
+ *                             output_file, usage
+ *   tool_progress             heartbeat:true, parent_tool_use_id (the spawning
+ *                             call), elapsed_time_seconds — every 30 s
+ *
+ * Deliberately NOT forwarded: `prompt` (the helper's whole instruction — the
+ * largest frame in the family, and a non-terminal frame over the cap is not
+ * trimmed but replaced by a `frame_too_large` stream error, which ends the
+ * turn — so carrying it would put the whole turn at risk) and
+ * `output_file` (a path on this machine, which means nothing to a server).
+ *
+ * @param started every task seen to start in this turn, keyed by task_id —
+ *                filled in here from `task_started`, and read back for the
+ *                frames that omit the spawning call or the task's kind
+ */
+function taskEventFrom(frame: Record<string, unknown>, started: Map<string, StartedTask>): TaskData | null {
+  if (frame['type'] === 'tool_progress') {
+    // A heartbeat is keyed by the call it is waiting on, which for a helper is
+    // the `Agent` call that spawned it. Only those of a task this process saw
+    // start: a heartbeat for some other long-running call is not a helper's,
+    // and a consumer grouping `task` events by `tool_use_id` would otherwise
+    // invent a helper for it.
+    if (frame['heartbeat'] !== true) return null;
+    const parent = strOf(frame, 'parent_tool_use_id');
+    if (parent === undefined) return null;
+    const match = [...started.entries()].find(([, task]) => task.toolUseId === parent);
+    if (match === undefined) return null;
+    const [taskId, task] = match;
+
+    const elapsed = numOf(frame, 'elapsed_time_seconds');
+
+    return {
+      phase: 'heartbeat',
+      task_id: taskId,
+      tool_use_id: parent,
+      ...(task.taskType !== undefined ? { task_type: task.taskType } : {}),
+      ...(elapsed !== undefined ? { elapsed_seconds: elapsed } : {}),
+    };
+  }
+
+  const phase = TASK_PHASES.get(String(frame['subtype']));
+  if (phase === undefined) return null;
+
+  const taskId = strOf(frame, 'task_id');
+  if (taskId === undefined) return null;
+  let toolUseId = strOf(frame, 'tool_use_id');
+
+  let known = started.get(taskId);
+  if (phase === 'started') {
+    // Recorded whether or not the CLI named the spawning call. Recording only
+    // the ones that did made a task started without a `tool_use_id` look, to
+    // every later phase, like one this process never saw start: `started` got
+    // through and its `progress` and `finished` were dropped, so a consumer
+    // drew a helper that ran forever.
+    known = { toolUseId, taskType: strOf(frame, 'task_type') };
+    started.set(taskId, known);
+  } else if (known !== undefined) {
+    // A later phase that names the call teaches it to a task that started
+    // without one, so its heartbeats and `updated` can be keyed from then on.
+    if (known.toolUseId === undefined && toolUseId !== undefined) known.toolUseId = toolUseId;
+    toolUseId = toolUseId ?? known.toolUseId;
+  } else {
+    // A task this process never saw start. The real case is the CLI's own
+    // queued work: on --resume it first reports that a background command an
+    // EARLIER turn left running was stopped, before it reads our prompt. That
+    // is not a helper of this turn, and forwarding it would have a consumer
+    // draw a finished helper nobody started. So every task a consumer sees
+    // was introduced by a `started`.
+    return null;
+  }
+
+  const data: TaskData = { phase, task_id: taskId };
+  if (toolUseId !== undefined) data.tool_use_id = toolUseId;
+  // On every phase, not only `started`: the CLI names the kind only there, and
+  // a consumer that joins late, or keys a row off a `progress`, should not have
+  // to have kept the `started` to tell a helper from a shell command.
+  if (known.taskType !== undefined) data.task_type = known.taskType;
+
+  const subagentType = strOf(frame, 'subagent_type');
+  if (subagentType !== undefined) data.subagent_type = subagentType;
+  const description = strOf(frame, 'description');
+  if (description !== undefined) data.description = boundTaskText(description);
+
+  if (phase === 'started') {
+    const depth = numOf(frame, 'spawn_depth');
+    if (depth !== undefined) data.spawn_depth = depth;
+    if (typeof frame['is_backgrounded'] === 'boolean') data.is_backgrounded = frame['is_backgrounded'];
+  }
+
+  if (phase === 'progress') {
+    const lastTool = strOf(frame, 'last_tool_name');
+    if (lastTool !== undefined) data.last_tool_name = lastTool;
+  }
+
+  if (phase === 'updated') {
+    const patch = frame['patch'];
+    const status = typeof patch === 'object' && patch !== null
+      ? strOf(patch as Record<string, unknown>, 'status')
+      : undefined;
+    // An update that says nothing a consumer can use is not worth a frame.
+    if (status === undefined) return null;
+    data.status = status;
+  }
+
+  if (phase === 'finished') {
+    const status = strOf(frame, 'status');
+    if (status !== undefined) data.status = status;
+    const summary = strOf(frame, 'summary');
+    if (summary !== undefined) data.summary = boundTaskText(summary);
+  }
+
+  if (phase === 'progress' || phase === 'finished') {
+    const usage = usageOf(frame['usage']);
+    if (usage !== undefined) data.usage = usage;
+  }
+
+  return data;
 }
 
 /**

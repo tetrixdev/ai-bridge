@@ -64,6 +64,25 @@ export function boundResult(text: string): string {
   return boundText(text, MAX_RESULT_BYTES, encodedBytes);
 }
 
+/**
+ * Budget for the free text a `task` event carries — a helper's closing summary
+ * and its description — measured as the bytes it costs once JSON-encoded.
+ *
+ * Small on purpose. A `task` frame is not terminal, so the frame guard DROPS
+ * one that is oversized rather than trimming it: a summary that grew past the
+ * cap would cost the whole event, including the status saying the helper
+ * finished. A summary is a line for a person, and 8 KB is pages of it.
+ */
+export const MAX_TASK_TEXT_BYTES = 8 * 1024;
+
+/**
+ * Bound a helper's summary or description, cut on a character boundary and
+ * marked as cut ("…[truncated by the bridge: …]") inside the budget.
+ */
+export function boundTaskText(text: string): string {
+  return boundText(text, MAX_TASK_TEXT_BYTES, encodedBytes);
+}
+
 /** One piece of a tool result, as it goes on the wire. */
 export interface ResultFrame {
   result: string;

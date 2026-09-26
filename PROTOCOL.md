@@ -1013,6 +1013,33 @@ For a server-resolved tool the block is a shadow of the `tool_call` frame; rende
 
 `tool_call_id` pairs the call to its [`tool_result`](#tool_result).
 
+##### Which helper a block belongs to: `parent_tool_use_id`
+
+When the assistant hands work to a **helper** (a sub-agent — Claude's `Agent` tool), the helper's own blocks and results arrive in the same stream, interleaved with the main assistant's. `parent_tool_use_id` says which is which:
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "block_start",
+  "data": {
+    "block_index": 3,
+    "block_type": "tool_call",
+    "tool_name": "Bash",
+    "tool_call_id": "toolu_01Qm…",
+    "parent_tool_use_id": "toolu_01A4…"
+  }
+}
+```
+
+- **Absent means the main assistant** — never `null`, never an empty string. That is what every block meant before the field existed, so a consumer that ignores it sees exactly the stream it always did.
+- **Present** on a helper's `text`, `thinking` and `tool_call` blocks alike, and on the `tool_result` of every call the helper made. Its value is the `tool_call_id` of the `Agent` block that spawned the helper, and the `tool_use_id` of that helper's [`task`](#task) events — so a consumer can nest the helper's calls under it by identity, even when they arrive long after it started or after the main assistant has finished its reply.
+- A helper's text is the helper's, not the main assistant's answer. A consumer that shows only helper summaries (from `task` `finished`) and drops helper prose is using the field as intended.
+- A helper of a helper is marked with **its own** spawning call. Its `task` `started` carries `spawn_depth: 2`.
+- `block_index` stays one sequence across the whole turn, main assistant and helpers together.
+
+Carried by the Claude adapter. The Codex and Gemini adapters have no helper concept to report and never send it.
+
 #### `block_delta`
 
 Incremental content within an open block.
@@ -1117,6 +1144,8 @@ What a tool returned. Emitted for **both** kinds of tool call:
 
 `tool_call_id` is the same id carried on the matching `tool_call` block's `block_start`, so a consumer can pair a result to the call that produced it.
 
+`parent_tool_use_id` is present when the call was a helper's, exactly as on the call's `block_start` (see [Which helper a block belongs to](#which-helper-a-block-belongs-to-parent_tool_use_id)), and rides on every chunk of a chunked result.
+
 `is_error` is the authoritative failure signal, and is **absent when the provider did not report one** — absent never means "succeeded". Do not infer failure from the text: a tool legitimately printing `Error: no matches` is indistinguishable from one that failed. (For historical reasons the Codex and Gemini adapters additionally prefix `Error: ` onto a failed result; that prefix is not a substitute for the field.)
 
 ##### Chunked results
@@ -1200,6 +1229,64 @@ The provider's own rate-limit status, forwarded as the CLI reports it. **Informa
 
 `info` is the provider's own shape, passed through unchanged rather than normalised — its contents differ per provider and are expected to change. Carried so a server can show what the operator's CLI already knows, instead of discovering a limit by hitting it.
 
+#### `task`
+
+The life of a **helper** the CLI runs for the main assistant: a sub-agent, or a background shell command. **Informational and non-terminal**, like `rate_limit`. Blocks say what a helper *did*; this says what it *is* — its kind, whether the main assistant waits for it, what it has spent, whether it is still alive, and how it ended.
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "task",
+  "data": {
+    "phase": "started",
+    "task_id": "af2e05936428f6e8e",
+    "tool_use_id": "toolu_018UGfE8HLBqgFmXMDrzDgD5",
+    "task_type": "local_agent",
+    "subagent_type": "general-purpose",
+    "description": "Run the migration dry-run",
+    "spawn_depth": 1,
+    "is_backgrounded": true
+  }
+}
+```
+
+`phase` is a string, one of:
+
+| Phase | When | Fields beside `task_id`, `tool_use_id` and `task_type` |
+|---|---|---|
+| `started` | The helper was started. | `subagent_type`, `description`, `spawn_depth`, `is_backgrounded` |
+| `progress` | The helper moved on to another step. | `description` (what it is doing now), `subagent_type`, `last_tool_name`, `usage` |
+| `heartbeat` | Every ~30 s while the main assistant is **blocked waiting** on the helper. | `elapsed_seconds` |
+| `updated` | The helper's state changed. | `status` |
+| `finished` | The helper ended. | `status`, `summary`, `usage`, `subagent_type`, `description` |
+
+```json
+{ "phase": "progress",  "task_id": "af2e…", "tool_use_id": "toolu_018U…", "subagent_type": "general-purpose",
+  "description": "Running php artisan migrate --pretend", "last_tool_name": "Bash",
+  "usage": { "total_tokens": 23921, "tool_uses": 1, "duration_ms": 2976 } }
+{ "phase": "heartbeat", "task_id": "ad5d…", "tool_use_id": "toolu_01A4…", "elapsed_seconds": 60 }
+{ "phase": "updated",   "task_id": "af2e…", "tool_use_id": "toolu_018U…", "status": "completed" }
+{ "phase": "finished",  "task_id": "af2e…", "tool_use_id": "toolu_018U…", "status": "completed",
+  "summary": "The dry-run lists 3 pending migrations…",
+  "usage": { "total_tokens": 24742, "tool_uses": 1, "duration_ms": 45887 } }
+```
+
+- **`tool_use_id` is the key to group by.** It is the `tool_call_id` of the block that spawned the helper, and the `parent_tool_use_id` on the helper's own blocks. The CLI omits it on some phases; the bridge fills it in from the task's `started`. `task_id` is the CLI's own id and is present on every phase. `task_type` is repeated on every phase too, though the CLI names it only at `started`.
+- **Every task a consumer sees was introduced by a `started`** in the same turn. On a resumed session the CLI first reports on work an *earlier* turn left running; those reports are not forwarded, because they are not helpers of this turn.
+- **A helper is finished only when `finished` says so.** Not when its spawning call's `tool_result` arrives, and not when the main assistant's reply ends: a background helper's spawning call returns at once ("launched"), and the helper keeps working — and keeps sending `task` events and blocks — after the main assistant has written its whole answer. `done` still comes last.
+- **The end of the request ends every task.** `done`, a stream `error`, or `cancelled` for this `request_id` ends every task of that request, whatever phase it last reported. Most endings that cut a turn short send no `finished` at all — a stop, a silence or request timeout, a CLI that crashed, a `result` while a background shell was still running — so a consumer that waits for `finished` alone keeps a helper spinning forever after a stopped turn. Close them all on the terminal frame; show them as ended with the request, not as `completed`.
+- **`is_backgrounded`** says whether the main assistant waits. `false`: it is blocked inside the spawning call until the helper finishes, and `heartbeat`s arrive meanwhile. `true`: it is free to reply while the helper works; the CLI sends no heartbeat for such a helper, so `progress` and the helper's own blocks are its only signs of life.
+- **`task_type`** is the CLI's word for what the task is: `local_agent` for a helper, `local_bash` for a shell command run as a task — including one a helper runs for itself, whose `tool_use_id` is then the helper's call, not the main assistant's. Show `local_agent` tasks as helpers; do not assume the list is closed.
+- **`elapsed_seconds`** comes from the CLI's own clock, counted from the spawning call. Two buffers can sit between the bridge and a browser, and neither preserves timing, so compute nothing from arrival times.
+- **`status`** is the CLI's own word — `completed`, `failed`, `stopped`, `killed` have been seen.
+- **`usage`** is the helper's running total: `total_tokens`, `tool_uses`, `duration_ms`, each present when the CLI reported it.
+- **`summary`** is the helper's closing report, meant to be shown. It is bounded to **8 KB** (JSON-encoded), cut on a character boundary and ending in a `…[truncated by the bridge: showing N of M characters]` marker when cut. `description` has the same bound.
+- **The helper's instructions are never sent.** The CLI reports the helper's whole prompt at `started`; it is the largest frame in the family, and a non-terminal frame over the frame cap is not trimmed: the bridge sends a `frame_too_large` stream `error` in its place, which ends the turn. Forwarding the prompt would put the whole turn at risk. `description` is what a person reads. Local file paths the CLI reports (the helper's output file) are not forwarded either.
+- A `task` event counts as activity for the bridge's silence bound, like every other event. A helper busy in one long step keeps a turn alive through its heartbeats.
+
+Carried by the Claude adapter; Codex and Gemini never send it. A consumer that does not know the event ignores it.
+
 #### `attachment`
 
 A file the assistant produced and chose to hand back. Emitted when the model calls the bridge-owned `bridge__attach_file` tool and the upload succeeded.
@@ -1271,6 +1358,7 @@ Everything beside `usage` is likewise provider-reported and optional. **Absent m
 | `num_turns` | How many assistant turns the CLI took internally to answer. |
 | `subtype` | How the CLI itself classified the end of the turn — `success`, `error_during_execution`, `error_max_turns`. Worth showing when a turn arrives with no text at all: `stop_reason` is null on several of those paths, so this is the only thing that says what happened. |
 | `permission_denials` | Tool calls the CLI's own permission system refused. In `isolated` this is the record of what the posture actually stopped — an empty answer with three denials reads very differently from an empty answer with none. |
+| `subagent_stats` | What the turn spent on helpers, in the CLI's own shape: `spawned`, `completed`, `failed`, `started_in_background`, `max_depth`, `by_type{}`, `killed{}`, `refused{}` and so on. Passed through unchanged. Tokens per helper come from the [`task`](#task) events. |
 
 `cli_session_id` is the CLI session this turn ran under — the id created on a fresh start, or the id resumed. The server persists it on the conversation so the next turn can resume. Absent/`null` when no session id was produced.
 
@@ -1593,6 +1681,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `stream` (block_delta) | Incremental content within a block |
 | `stream` (block_stop) | Closing a content block |
 | `stream` (tool_result) | Acknowledging tool result received |
+| `stream` (task) | A helper started, progressed, is still alive, or ended |
 | `stream` (done) | Response complete |
 | `stream` (error) | Error during streaming |
 | `tool_call` | CLI invoked a server-side tool (via callback) |
@@ -1654,6 +1743,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 
 - `0.x` — Pre-release, breaking changes allowed between minor versions
 - `1.x` — Stable, semantic versioning applies
+
+**Helper activity does not bump the version either.** `parent_tool_use_id` on `block_start` and `tool_result`, the `task` stream event and `done.subagent_stats` are additive: absent means what it always meant, and a consumer ignores an event it does not know.
 
 **Workspaces, attachments and `workspace` isolation do not bump the version.** They stay on `0.1`, deliberately. Every one of them is optional in both directions — `hello.workspaces`, `ai_request.working_dir`, `ai_request.attachments`, the `attachment` stream event and the `workspace` value of `cli_isolation` are all additive, and both ends already ignore fields they do not recognise. Only the major number is enforced, so a bump would refuse every bridge already installed in exchange for nothing.
 

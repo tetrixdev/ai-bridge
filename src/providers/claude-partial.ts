@@ -170,7 +170,10 @@ export class ClaudePartialStreamMapper {
     // mapping and route its remaining deltas into the wrong block.
     //
     // Skipping them loses nothing: the `assistant` twin still arrives, its id
-    // was never recorded as streamed, and the whole-message path emits it.
+    // was never recorded as streamed, and the whole-message path emits it —
+    // with the frame's `parent_tool_use_id` on every block, so the helper's
+    // work still reaches a consumer attributed to the call that spawned it.
+    // Keep this guard; that attribution does not make it removable.
     if (frame['parent_tool_use_id'] != null) {
       log.debug('Ignoring a streamed sub-agent frame — delivered whole instead');
       return;

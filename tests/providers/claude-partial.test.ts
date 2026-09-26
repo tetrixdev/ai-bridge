@@ -607,6 +607,20 @@ describe('replaying real partial-mode turns through the adapter', () => {
     expect(toolNames).toContain('Read');
   });
 
+  it('marks the sub-agent\'s whole-message blocks with the call that spawned it', async () => {
+    // The streaming-path guard stays: sub-agent frames are still delivered
+    // whole. That path is now where the parent is carried, so the guard costs
+    // a consumer nothing — the helper's calls arrive attributed.
+    const events = await replay('claude-partial-subagent-turn.ndjson');
+    const starts = events.filter((e) => e.event === 'block_start')
+      .map((e) => e.data as { tool_name?: string; tool_call_id?: string; parent_tool_use_id?: string });
+    const agent = starts.find((d) => d.tool_name === 'Agent')!;
+
+    expect(agent.parent_tool_use_id).toBeUndefined();
+    expect(starts.filter((d) => d.parent_tool_use_id === agent.tool_call_id).map((d) => d.tool_name))
+      .toEqual(['Bash', 'Read']);
+  });
+
   it('ends the turn normally', async () => {
     const events = await replay('claude-partial-tool-turn.ndjson');
     expect(events.at(-1)!.event).toBe('done');
