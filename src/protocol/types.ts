@@ -208,6 +208,13 @@ export interface HelloMessage {
   bridge_version: string;
   providers: ProviderCapability[];
   /**
+   * This bridge understands `options.accepts_input` and `turn_input`. Whether a
+   * given turn actually runs with its input open is still confirmed per turn,
+   * by `input_open` on its `ai_request_ack` (Claude only). Absent from a bridge
+   * that predates the feature; an older server ignores it.
+   */
+  turn_input?: true;
+  /**
    * Directories this bridge may be asked to work in. Absent or empty means
    * the operator allowed none, and every `ai_request.working_dir` is refused.
    * An older server ignores the field.
@@ -263,6 +270,17 @@ export interface AiRequestAckMessage {
     /** Keys the request named that the bridge does not allow, and dropped. */
     env_rejected: string[];
   };
+  /**
+   * Present, and `true`, when this turn runs with its input open: the server
+   * asked for it with `options.accepts_input`, and the bridge will take
+   * `turn_input` for it while it runs.
+   *
+   * Absent otherwise, and absent from any bridge that predates the field. A
+   * server must read absence as "input is not open" and hold a message typed
+   * mid-turn as it always did. That is what makes the option safe to send to
+   * every bridge.
+   */
+  input_open?: true;
 }
 
 /**
@@ -299,6 +317,13 @@ export interface BridgeErrorMessage {
   code: string;
   message: string;
   fatal: boolean;
+  /**
+   * On `bridge_disconnected` for a turn that ran with its input open: the
+   * `message_id` of every accepted `turn_input` the assistant never read,
+   * oldest first. An accepted message not listed was read. Always present on
+   * such a turn, empty when nothing was pending; absent otherwise.
+   */
+  pending_inputs?: string[];
 }
 
 /**
@@ -440,7 +465,8 @@ export type BridgeToServerMessage =
   | UsageResultMessage
   | StreamChunkMessage
   | StreamEndMessage
-  | CancelledMessage;
+  | CancelledMessage
+  | TurnInputAckMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Bridge Messages
@@ -612,6 +638,61 @@ export interface CancelMessage {
 export interface CancelledMessage {
   type: 'cancelled';
   request_id: string;
+  /**
+   * On a turn that ran with its input open: the `message_id` of every
+   * `turn_input` the bridge accepted and the assistant never read (no
+   * `user_input` came for it), oldest first. They are dropped with the turn.
+   * Always present on such a turn, empty when nothing was pending; absent on
+   * every other turn.
+   */
+  pending_inputs?: string[];
+}
+
+/**
+ * A message for a turn that is still running (server → bridge).
+ *
+ * Only for a turn whose `ai_request_ack` said `input_open: true`. The bridge
+ * answers every one with a `turn_input_ack`, straight away.
+ */
+export interface TurnInputMessage {
+  type: 'turn_input';
+  request_id: string;
+  /** The server's id for this message, echoed on the ack and on `user_input`. */
+  message_id: string;
+  /** What the person wrote. Text only. */
+  content: string;
+}
+
+/** Why a `turn_input` was not taken. */
+export type TurnInputRejection = 'turn_not_running' | 'turn_ending' | 'input_not_open';
+
+/**
+ * The bridge's answer to a `turn_input` (bridge → server).
+ *
+ * `accepted`: the message was written to the running CLI and is queued there.
+ * The assistant reads it at its next step; `user_input` says when.
+ *
+ * `rejected`: nothing was written.
+ *  - `turn_ending`: the turn is still running but will take nothing more —
+ *    the bridge closed its input, or it is being stopped (a cancel, a bound, a
+ *    dropped connection). Its CLI may still be alive and writing to the
+ *    session, so the server holds the message until this request's terminal
+ *    frame and only then starts a new turn with it. Starting one sooner would
+ *    run a second `--resume` of the session while the first still writes it.
+ *  - `turn_not_running`: no turn by that id is running — it never existed, or
+ *    it has ended and its terminal frame went out ahead of this ack. The
+ *    server starts a normal new turn with it.
+ *  - `input_not_open`: the turn is running but cannot take it (it was not
+ *    started with `accepts_input`, or the CLI has not reached its first
+ *    `system/init` yet), so the server holds it until the turn is over.
+ */
+export interface TurnInputAckMessage {
+  type: 'turn_input_ack';
+  request_id: string;
+  message_id: string;
+  status: 'accepted' | 'rejected';
+  /** Present only when rejected. */
+  reason?: TurnInputRejection;
 }
 
 /** A single prior turn in a conversation's history. */
@@ -712,6 +793,13 @@ export interface AiRequestOptions {
   temperature?: number | null;
   /** Model to use (provider-specific identifier, e.g. "sonnet", "gpt-5.4") */
   model?: string | null;
+  /**
+   * Keep the CLI's input open for the whole turn, so `turn_input` can reach
+   * the assistant while the turn runs. Opt-in, per turn; Claude only. The ack
+   * confirms it with `input_open: true`, and without that confirmation nothing
+   * about the turn differs from one that did not ask.
+   */
+  accepts_input?: boolean | null;
 }
 
 /** Server responds with the result of a tool call. */
@@ -817,7 +905,8 @@ export type ServerToBridgeMessage =
   | UsageRequestMessage
   | AttachmentReadMessage
   | StreamCancelMessage
-  | CancelMessage;
+  | CancelMessage
+  | TurnInputMessage;
 
 // ---------------------------------------------------------------------------
 // Stream Event Types and Data
@@ -832,6 +921,8 @@ export type StreamEventType =
   | 'attachment'
   | 'rate_limit'
   | 'task'
+  | 'user_input'
+  | 'main_state'
   | 'done'
   | 'error';
 
@@ -991,6 +1082,33 @@ export interface TaskData {
 }
 
 /**
+ * Data payload for `user_input` events: the assistant has just taken in a
+ * message the bridge accepted as `turn_input`.
+ *
+ * Emitted when the CLI echoes the message back (`--replay-user-messages`),
+ * which it does at the moment it dequeues it, so everything after this event
+ * in the stream is the assistant's response to it (or later). Messages are
+ * read in the order they were accepted.
+ */
+export interface UserInputData {
+  message_id: string;
+}
+
+/**
+ * Data payload for `main_state` events, on turns that run with their input
+ * open: whether the MAIN assistant (not a helper) is working or free.
+ *
+ * `working` right after the turn starts and whenever the main assistant writes
+ * again after having been free; `idle` when its message ends. Never sent twice
+ * in a row with the same state. A message sent while it is `idle` is read
+ * straight away; one sent while it is `working` is read after its current
+ * step.
+ */
+export interface MainStateData {
+  state: 'working' | 'idle';
+}
+
+/**
  * Data payload for `attachment` events — a file the assistant produced and
  * chose to hand back, already uploaded to the server.
  *
@@ -1067,6 +1185,13 @@ export interface DoneData {
    * when the CLI did not report it.
    */
   subagent_stats?: Record<string, unknown>;
+  /**
+   * On a turn that ran with its input open and ended with accepted
+   * `turn_input` messages the assistant never read (a timeout, a crash): their
+   * `message_id`s, oldest first. Absent when there were none, which is every
+   * turn that ended normally.
+   */
+  pending_inputs?: string[];
 }
 
 /** Data payload for error events. */
@@ -1107,6 +1232,8 @@ export type StreamEventData =
   | ToolResultData
   | RateLimitData
   | TaskData
+  | UserInputData
+  | MainStateData
   | AttachmentEventData
   | DoneData
   | StreamErrorData;

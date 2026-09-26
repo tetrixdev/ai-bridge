@@ -215,15 +215,23 @@ export function joinSystemPrompt(
  */
 export const BRIDGE_ENV_KEYS: Record<string, { default?: string }> = {
   /**
-   * Background shell work is off because it cannot work here, not because
-   * anyone prefers it off. Every bridge consumer gets one process per turn —
-   * that is how the bridge spawns — so a shell that outlives the turn is never
-   * collected: its output reaches nobody and the next turn opens with a notice
-   * that the work was orphaned.
+   * Background tasks are off because they cannot work under one process per
+   * turn with its input closed, not because anyone prefers them off. A shell
+   * that outlives such a turn is never collected: its output reaches nobody
+   * and the next turn opens with a notice that the work was orphaned. And the
+   * variable reaches further than the shell: it also runs every HELPER in the
+   * foreground (captured on 2.1.280 — `run_in_background` is ignored and the
+   * main assistant waits, while still saying it started one "in the
+   * background").
    *
-   * It is a good default because of the SPAWN MODEL, not forever. If the bridge
-   * ever gains a persistent-process mode this must be recomputed rather than
-   * inherited, or it will be disabling something that works again.
+   * Recomputed, as this comment asked, now that the bridge has a mode where
+   * the process stays: a turn with `accepts_input` keeps stdin open until the
+   * main assistant AND everything it started have finished, so a background
+   * task is collected, the assistant is told when one fails or is stopped (with
+   * its output file) and can re-run it, and the person can talk to it
+   * meanwhile. Those turns get this key UNSET (see resolveBridgeEnv()'s
+   * `acceptsInput`); every other turn keeps `'1'`, which is still right for
+   * them. A server's explicit `bridge_env` value wins in both modes.
    */
   CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: { default: '1' },
 
@@ -283,10 +291,18 @@ export interface ResolvedBridgeEnv {
  */
 export function resolveBridgeEnv(
   overrides?: Record<string, string | null> | null,
+  mode: { acceptsInput?: boolean } = {},
 ): ResolvedBridgeEnv {
   const values: Record<string, string | null> = {};
   for (const [key, spec] of Object.entries(BRIDGE_ENV_KEYS)) {
     if (spec.default !== undefined) values[key] = spec.default;
+  }
+  // A turn that keeps its input open collects its background work, so the
+  // reason for switching it off does not apply (see the key's comment). Null,
+  // not absent: an inherited value in the bridge's own environment has to be
+  // removed too, or the turn would run with it anyway.
+  if (mode.acceptsInput === true) {
+    values['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS'] = null;
   }
 
   const overridden: string[] = [];
@@ -342,7 +358,12 @@ export interface BridgePromptSpec {
  * directly — and being contradicted by your own instructions is worse than
  * having none.
  */
-export function buildBridgeAddendum(values: Record<string, string | null>): string {
+export function buildBridgeAddendum(
+  values: Record<string, string | null>,
+  mode: { acceptsInput?: boolean } = {},
+): string {
+  if (mode.acceptsInput === true) return buildInputTurnAddendum(values);
+
   const lines: string[] = [
     "## How this session runs",
     "",
@@ -358,6 +379,9 @@ export function buildBridgeAddendum(values: Record<string, string | null>): stri
       "  this turn.** Nothing on the far side collects a process that outlives the",
       "  turn that started it, so use one only for work you will also finish reading",
       "  before you answer.",
+      "- **Do not detach work from the turn with `&`, `nohup`, `disown` or",
+      "  `setsid`.** The process is re-parented to init, nothing reaps it, and",
+      "  nobody is told it exists.",
     );
   } else {
     lines.push(
@@ -408,6 +432,72 @@ export function buildBridgeAddendum(values: Record<string, string | null>): stri
       "minutes of someone's day.",
     );
   }
+
+  return lines.join('\n');
+}
+
+/**
+ * The addendum for a turn that runs with its input open.
+ *
+ * A different lifecycle, so different words rather than a patched copy: the
+ * process does not exit when the assistant answers, messages arrive in it, and
+ * background work is collected. What does NOT change is the ban on detaching
+ * work from the turn — a detached process is outside everything this mode
+ * tracks, so it is still never collected.
+ */
+function buildInputTurnAddendum(values: Record<string, string | null>): string {
+  const lines: string[] = [
+    "## How this session runs",
+    "",
+    "You are a non-interactive agent. This turn runs in one CLI process that stays",
+    "open until you, and everything you started, are done. The person can send you",
+    "further messages while it runs; they reach you in this same process, after the",
+    "step you are in. When the turn ends the process exits, and nothing you started",
+    "survives into the next turn except the conversation itself.",
+    "",
+  ];
+
+  if (backgroundTasksEnabled(values)) {
+    lines.push(
+      "- **Background tasks are available in this turn.** A background shell command",
+      "  or subagent keeps the turn open until it finishes, and you are told when it",
+      "  does. While it runs you are free to answer the person.",
+      "- **A background task that fails or is stopped is reported to you**, with the",
+      "  file its output was written to. Read that file, and re-run the task if the",
+      "  work still needs doing. Never claim a result a task has not reported yet.",
+      "- **A background command must end.** The turn is stopped after a long",
+      "  stretch with no output at all, so never start one that is meant to run",
+      "  indefinitely, such as a server or a file watcher.",
+    );
+  } else {
+    lines.push(
+      "- **Background shell commands are disabled here.** Run commands in the",
+      "  foreground; subagents run in the foreground too, and the turn waits for them.",
+    );
+  }
+
+  lines.push(
+    "- **Do not detach work from the turn with `&`, `nohup`, `disown` or",
+    "  `setsid`.** Use the tool's own background option instead. A detached",
+    "  process is re-parented to init, nothing reaps it, and nobody is told it",
+    "  exists.",
+    "- **Anything that must outlive the turn has to run as a service managed",
+    "  outside this session**, started so that it does not depend on your process.",
+    "  How to do that is specific to this machine: follow its own instructions, and",
+    "  ask rather than improvise one.",
+    "- **Every command is bounded by its timeout** (2 minutes by default, 10 at",
+    "  most). A command that sits waiting for input burns that whole budget and then",
+    "  fails, so use the non-interactive form of every tool: `-y`, `--force`,",
+    "  `--no-input`.",
+    "",
+    "## Parallel tool calls",
+    "",
+    "Issuing independent calls together is your main throughput lever. Before",
+    "sending a single tool call, ask whether the next two or three depend on its",
+    "result. If they do not, send them in the same block. Three 60-second commands",
+    "sent together cost 60 seconds; sent one at a time they cost three minutes of",
+    "someone's day.",
+  );
 
   return lines.join('\n');
 }
@@ -475,11 +565,12 @@ export interface ResolvedBridgePrompt {
 export function resolveBridgeAddendum(
   spec: BridgePromptSpec | null | undefined,
   values: Record<string, string | null>,
+  turn: { acceptsInput?: boolean } = {},
 ): ResolvedBridgePrompt {
   const mode = spec?.mode ?? 'default';
   const serverTextRaw = spec?.text ?? null;
   const serverText = serverTextRaw !== null && serverTextRaw !== '';
-  const addendum = buildBridgeAddendum(values);
+  const addendum = buildBridgeAddendum(values, turn);
 
   switch (mode) {
     case 'off':

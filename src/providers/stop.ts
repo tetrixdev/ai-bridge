@@ -1,4 +1,4 @@
-import type { ChildProcess } from 'node:child_process';
+import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('StopTurn');
@@ -58,17 +58,121 @@ export function stoppedByUs(signal: AbortSignal, timeouts: { reason(): string | 
   return signal.aborted || (timeouts?.reason() ?? null) !== null;
 }
 
+/**
+ * Signal the CLI's whole process group, or the CLI alone where there is none.
+ *
+ * spawnCli() starts every CLI `detached`, so it leads a group of its own and
+ * `-pid` reaches everything in it. A child that is not a group leader (a test
+ * double, a Windows process) gets the plain signal.
+ */
+function signalTurn(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (process.platform !== 'win32' && child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, signal);
+
+      return;
+    } catch {
+      // Not a group leader, or the group is already gone: fall through.
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Already gone.
+  }
+}
+
+/**
+ * Every process descended from `pid`, as `[pid, pgid]` pairs. Best effort:
+ * empty when `ps` is unavailable or fails.
+ *
+ * Needed because Claude Code runs each shell command in a session of its OWN
+ * (measured on 2.1.280: the Bash tool's shell has pgid = sid = its own pid), so
+ * a background command is NOT in the CLI's group. SIGINT is enough for that:
+ * the CLI stops its own tasks on the way out (measured: nothing survives).
+ * SIGKILL is not: the CLI gets no chance, its commands are re-parented to init
+ * and run on (measured: a background `sleep` survived a group SIGKILL). So the
+ * last step finds them first — while they are still the CLI's descendants —
+ * and kills their groups as well.
+ */
+function descendantsOf(pid: number): Array<[number, number]> {
+  let table: string;
+  try {
+    table = execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], {
+      encoding: 'utf8',
+      timeout: 2_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return [];
+  }
+
+  const children = new Map<number, Array<[number, number]>>();
+  for (const line of table.split('\n')) {
+    const [p, pp, pg] = line.trim().split(/\s+/).map(Number);
+    if (!Number.isInteger(p) || !Number.isInteger(pp) || !Number.isInteger(pg)) continue;
+    const list = children.get(pp) ?? [];
+    list.push([p, pg]);
+    children.set(pp, list);
+  }
+
+  const found: Array<[number, number]> = [];
+  const queue = [pid];
+  while (queue.length > 0) {
+    for (const entry of children.get(queue.shift()!) ?? []) {
+      found.push(entry);
+      queue.push(entry[0]);
+    }
+  }
+
+  return found;
+}
+
+/** SIGKILL the CLI's group and every group its descendants lead. */
+function killTurn(child: ChildProcess): void {
+  const own = process.platform !== 'win32' ? safePgid() : null;
+  const strays = process.platform !== 'win32' && child.pid !== undefined ? descendantsOf(child.pid) : [];
+  signalTurn(child, 'SIGKILL');
+  for (const [pid, pgid] of strays) {
+    try {
+      // Never our own group: that would be the bridge killing itself.
+      if (pgid !== own && pgid > 1) process.kill(-pgid, 'SIGKILL');
+      else process.kill(pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+function safePgid(): number | null {
+  try {
+    const out = execFileSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], {
+      encoding: 'utf8',
+      timeout: 2_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const pgid = Number(out.trim());
+
+    return Number.isInteger(pgid) ? pgid : null;
+  } catch {
+    return null;
+  }
+}
+
 export function stopTurn(child: ChildProcess, why: { requestId: string; provider: string }): void {
   if (child.exitCode !== null || child.signalCode !== null) return;
 
+  // The whole group, not the CLI alone: with background tasks on, a turn owns
+  // more than one process, and stopping the turn must stop what it started.
   log.info('Ending the turn', { ...why, signal: 'SIGINT' });
-  child.kill('SIGINT');
+  signalTurn(child, 'SIGINT');
 
   const escalate = (signal: NodeJS.Signals, after: number): ReturnType<typeof setTimeout> => {
     const timer = setTimeout(() => {
       if (child.exitCode !== null || child.signalCode !== null) return;
       log.warn('The CLI did not stop — escalating', { ...why, signal });
-      child.kill(signal);
+      if (signal === 'SIGKILL') killTurn(child);
+      else signalTurn(child, signal);
     }, after);
     timer.unref?.();
 

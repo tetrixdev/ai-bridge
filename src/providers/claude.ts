@@ -36,6 +36,14 @@
  *   - `system` frames `task_started` / `task_progress` / `task_updated` /
  *     `task_notification`, and a `tool_progress` heartbeat every 30 s while a
  *     helper runs, become the `task` stream event. See taskEventFrom().
+ *
+ * A turn with its input open (`options.accepts_input`, see turn-input.ts) runs
+ * the same parser with three differences: the CLI reads NDJSON messages on a
+ * stdin that stays open (`--input-format stream-json --replay-user-messages`),
+ * its echo of each one becomes `user_input` and the main assistant's state
+ * `main_state`; and no `result` ends the turn. stdin is closed by the terminal
+ * rule in maybeClose() — main assistant idle, no task running, nothing unread —
+ * and `done` follows the process's exit, built from every result.
  */
 
 import { createInterface } from 'node:readline';
@@ -56,6 +64,27 @@ import { ClaudePartialStreamMapper } from './claude-partial.js';
 import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-capabilities.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 import { stopTurn, stoppedByUs } from './stop.js';
+import { userMessageFrame } from './turn-input.js';
+
+/**
+ * How long a turn with its input open waits for the CLI to start the turn it
+ * owes a finished background task, before it stops waiting and closes stdin.
+ *
+ * When a background task ends, the CLI hands the main assistant a
+ * notification and answers it in a turn of its own — captured on 2.1.280, that
+ * turn begins (a fresh `system/init`) within ~50 ms and writes within ~1 s. The
+ * CLI would also run it after stdin closed, so waiting is not needed for the
+ * answer; it is needed so a message sent meanwhile still reaches the assistant,
+ * and so a task the assistant re-runs from that turn is tracked. The bound is
+ * the backstop for a CLI that folds the notification into a turn already
+ * running instead: without it the turn would sit open until the silence limit.
+ */
+const NOTIFICATION_TURN_GRACE_MS = 10_000;
+
+/** A main-assistant `stop_reason` that ends its message rather than pausing it for a tool. */
+function endsMessage(stopReason: unknown): boolean {
+  return typeof stopReason === 'string' && stopReason !== 'tool_use' && stopReason !== 'pause_turn';
+}
 
 /**
  * Known Claude CLI model aliases.
@@ -88,6 +117,11 @@ export class ClaudeAdapter extends ProviderAdapter {
     const { request, signal, cliSessionId } = context;
     const requestId = request.request_id;
     const userMessage = request.message;
+    // A turn that keeps its input open. The bridge creates the port only when
+    // the server asked for it and the ack said so; everything this switches
+    // on is inert without it.
+    const port = context.turnInput ?? null;
+    const acceptsInput = port !== null;
 
     log.info('Executing Claude request', { requestId });
 
@@ -176,6 +210,14 @@ export class ClaudeAdapter extends ProviderAdapter {
     // is retained across --resume.
     if (context.bridgeAddendum !== null) {
       args.push('--append-system-prompt', context.bridgeAddendum);
+    }
+
+    // Messages as NDJSON on stdin, and each one echoed back on stdout at the
+    // moment the CLI takes it in. The echo is what `user_input` is made from:
+    // it is the only signal of WHEN the assistant read a message sent mid-turn.
+    // Both flags are present on 2.1.280.
+    if (acceptsInput) {
+      args.push('--input-format', 'stream-json', '--replay-user-messages');
     }
 
     // Add model if specified in request options
@@ -294,7 +336,8 @@ export class ClaudeAdapter extends ProviderAdapter {
       args.push('--permission-mode', 'bypassPermissions');
     }
 
-    // The user message is delivered via STDIN, not as a positional argument.
+    // The user message is delivered via STDIN, not as a positional argument
+    // (as an NDJSON frame, with stdin left open, on an input-open turn).
     // On a fresh session it carries the full prior conversation, and a large
     // prompt as an argv entry exceeds the OS per-argument size limit — the
     // spawn then dies with `spawn E2BIG`. In `--print` mode Claude reads its
@@ -318,6 +361,25 @@ export class ClaudeAdapter extends ProviderAdapter {
        * other one arrives. See the `origin` handling below.
        */
       let heldResult: Record<string, unknown> | null = null;
+      /**
+       * Input-open turns only: every `result` the CLI wrote, in order. None of
+       * them ends the turn — the process does, once the terminal rule closes
+       * stdin — and `done` is built from all of them. See combineResults().
+       */
+      const results: Array<Record<string, unknown>> = [];
+      /** Input-open turns only: what `main_state` last said. */
+      let mainState: 'working' | 'idle' | null = null;
+      /** Tasks started in this turn that have not ended, any task_type. */
+      const runningTasks = new Set<string>();
+      /** Of those, the background tasks of the main assistant itself. */
+      const mainBackgroundTasks = new Set<string>();
+      /** A main-assistant background task ended; the CLI owes it a turn. */
+      let notificationOwed = false;
+      let graceTimer: ReturnType<typeof setTimeout> | null = null;
+      let stdinClosed = false;
+      /** The CLI has not echoed the opening message yet. */
+      let openingEchoPending = true;
+      let seenInit = false;
       /**
        * Frames that arrived after the turn ended. Zero on a healthy turn, and
        * the one number that says how much of an answer was lost when it is not
@@ -366,7 +428,108 @@ export class ClaudeAdapter extends ProviderAdapter {
       // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
       delete env['CLAUDECODE'];
 
-      const child = this.spawnCli('claude', args, env, userMessage, context.workingDir);
+      // An input-open turn hands over its opening message as the first NDJSON
+      // frame and keeps stdin open; every other turn writes the bare prompt
+      // and closes it, exactly as before.
+      const child = acceptsInput
+        ? this.spawnCli('claude', args, env, userMessageFrame(userMessage), context.workingDir, { keepStdinOpen: true })
+        : this.spawnCli('claude', args, env, userMessage, context.workingDir);
+
+      /**
+       * Say what the main assistant is doing, only when it changes. Through
+       * the deferral queue so it keeps its place among the events around it.
+       */
+      const setMain = (state: 'working' | 'idle'): void => {
+        if (!acceptsInput || settled || mainState === state) return;
+        mainState = state;
+        emitWholeMessage({ event: 'main_state', data: { state } });
+      };
+
+      /**
+       * Keep count of what is still running, for the terminal rule. Only tasks
+       * started in this turn reach here (taskEventFrom() drops the rest).
+       */
+      const trackTask = (task: TaskData, frame: Record<string, unknown>): void => {
+        if (task.phase === 'started') {
+          runningTasks.add(task.task_id);
+          if (frame['is_backgrounded'] === true && frame['owned_by_subagent'] !== true) {
+            mainBackgroundTasks.add(task.task_id);
+          }
+        } else if (task.phase === 'finished'
+          || (task.phase === 'updated' && task.status !== 'running' && task.status !== 'pending')) {
+          runningTasks.delete(task.task_id);
+          // The main assistant is told about its own background tasks in a
+          // turn of the CLI's own, which is still to come. Whichever frame
+          // says the task ended first counts: the CLI writes `updated` just
+          // ahead of `finished`, and the rule is evaluated between the two.
+          if (mainBackgroundTasks.delete(task.task_id)) {
+            notificationOwed = true;
+          }
+        }
+      };
+
+      /** Close stdin: the CLI finishes what it has, then exits, then `done`. */
+      const closeInput = (why: string): void => {
+        if (stdinClosed) return;
+        stdinClosed = true;
+        if (graceTimer !== null) clearTimeout(graceTimer);
+        graceTimer = null;
+        port?.end();
+        log.info('Closing the CLI input — the turn is over', { requestId, why });
+        try {
+          child.stdin?.end();
+        } catch {
+          // Already closed with the process.
+        }
+      };
+
+      /**
+       * The terminal rule, for input-open turns: close stdin only when the main
+       * assistant is idle, NO task it or a helper started is still running
+       * (any task_type), and every accepted message has been read. A `result`
+       * is not the end: with stdin open the CLI writes one each time the main
+       * assistant finishes a message, including while a background task works
+       * on. Runs after every frame and on one event loop with offer(), so a
+       * message accepted can never be lost to a close in between.
+       */
+      const maybeClose = (): void => {
+        if (!acceptsInput || stdinClosed || settled) return;
+        if (mainState !== 'idle' || runningTasks.size > 0 || (port?.pendingCount() ?? 0) > 0) return;
+        if (notificationOwed) {
+          graceTimer ??= setTimeout(() => {
+            graceTimer = null;
+            if (!notificationOwed) return;
+            log.warn('No turn followed a background task ending — closing anyway', { requestId });
+            notificationOwed = false;
+            maybeClose();
+          }, NOTIFICATION_TURN_GRACE_MS);
+          graceTimer.unref?.();
+
+          return;
+        }
+        closeInput('idle, no task running, no message pending');
+      };
+
+      /**
+       * Start taking messages. Called at the CLI's FIRST `system/init`, not at
+       * spawn: until then the CLI may yet fail before it has a session — a
+       * resumed session it cannot find ends the process there — and a message
+       * accepted into that process vanishes, because the bridge re-issues the
+       * turn as a fresh one without it. Before init an offer is answered
+       * `input_not_open`, and the server holds the message.
+       */
+      const openInput = (): void => {
+        if (!acceptsInput || !child.stdin || stdinClosed) return;
+        const stdin = child.stdin;
+        port!.open(
+          (frame) => { stdin.write(frame); },
+          // An accepted message is activity: the person is talking to the
+          // turn, whatever the CLI is doing.
+          () => { timeouts?.notice(); },
+        );
+      };
+
+      if (acceptsInput) setMain('working');
 
       // Two clocks: silence, which kills, and a wall-clock backstop. Without
       // either a wedged CLI would run forever.
@@ -386,6 +549,7 @@ export class ClaudeAdapter extends ProviderAdapter {
           // output. What cannot be recovered is whatever the CLI had buffered
           // internally and not yet written, and no amount of flushing on this
           // side reaches that.
+          port?.end();
           stopTurn(child, { requestId, provider: 'claude' });
         },
       });
@@ -395,6 +559,9 @@ export class ClaudeAdapter extends ProviderAdapter {
       const onAbort = () => {
         clearRequestTimeout(timeoutTimer);
         log.info('Request aborted — killing claude process', { requestId });
+        // Nothing more reaches a turn being stopped; what was accepted and not
+        // read is reported by the bridge as `cancelled.pending_inputs`.
+        port?.end();
         stopTurn(child, { requestId, provider: 'claude' });
       };
       signal.addEventListener('abort', onAbort, { once: true });
@@ -405,6 +572,26 @@ export class ClaudeAdapter extends ProviderAdapter {
       // buffer every later chunk still matches it. Latch, or one turn invalidates
       // the probe cache once per stderr chunk.
       let noticedFlagRejection = false;
+
+      /**
+       * End an input-open turn from the one result standing for all it wrote:
+       * an error first when that result failed — `session_lost` when a resumed
+       * session was missing, so the server re-issues it fresh — then a `done`
+       * carrying what the turn spent either way.
+       */
+      const settleFromResults = (combined: Record<string, unknown>): void => {
+        if (combined['is_error'] === true) {
+          const errs = Array.isArray(combined['errors']) ? combined['errors'] : [];
+          const errText = errs.length > 0
+            ? errs.join('; ')
+            : String(combined['subtype'] ?? 'Claude reported an error');
+          onEvent({
+            event: 'error',
+            data: { code: resumeAwareErrorCode(context.cliSessionId, errText), message: errText },
+          });
+        }
+        onEvent({ event: 'done', data: doneDataFrom(combined, model, providerVersion) });
+      };
 
       const finalizer = createFinalizer({
         providerName: 'claude',
@@ -433,7 +620,39 @@ export class ClaudeAdapter extends ProviderAdapter {
         // its own queued work. That judgement was wrong, or the CLI changed:
         // report the last one rather than "the AI returned no response", which
         // would throw away a turn we have in hand.
+        // An input-open turn ends HERE on the ordinary path: no result settles
+        // it, and the process exiting is the end. Settled from every result it
+        // wrote, whatever the exit code, when that exit is explained: we closed
+        // stdin (the turn was over by the terminal rule), or the last result
+        // is an error — after which the CLI exits 1 (2.1.283). Only an
+        // unexplained non-zero exit — the CLI died while the turn was still
+        // open, on a result that said all was well — is left to the finalizer
+        // to report as the crash it is.
+        // A stopped or crashed input turn still says what it spent: its
+        // results arrived long before the process ended.
+        doneDataOnStop: acceptsInput
+          ? () => (results.length > 0 ? doneDataFrom(combineResults(results), model, providerVersion) : {})
+          : undefined,
+        settleFromExit: acceptsInput
+          ? (exitCode) => {
+            if (results.length === 0) return false;
+            const combined = combineResults(results);
+            if (exitCode !== 0 && !stdinClosed && combined['is_error'] !== true) return false;
+            settleFromResults(combined);
+
+            return true;
+          }
+          : undefined,
         recoverTerminal: () => {
+          // An input-open turn whose CLI died of a signal nobody sent: what it
+          // reported is still the best account of the turn.
+          if (acceptsInput) {
+            if (results.length === 0) return false;
+            settleFromResults(combineResults(results));
+
+            return true;
+          }
+
           if (heldResult === null) return false;
 
           log.warn('No result answered our prompt — settling from the last held one', {
@@ -463,7 +682,7 @@ export class ClaudeAdapter extends ProviderAdapter {
       // Parse NDJSON from stdout line by line
       const rl = createInterface({ input: child.stdout });
 
-      rl.on('line', (line) => {
+      const handleLine = (line: string): void => {
         if (!line.trim()) return;
 
         let parsed: Record<string, unknown>;
@@ -486,6 +705,15 @@ export class ClaudeAdapter extends ProviderAdapter {
             ? parsed['claude_code_version']
             : null;
           log.debug('Session init', { sessionId, model, providerVersion });
+          // Every init after the first starts a turn the CLI queued — a
+          // message we wrote, or its answer to a finished background task. The
+          // main assistant is working again from here.
+          if (acceptsInput && seenInit) {
+            notificationOwed = false;
+            setMain('working');
+          }
+          if (!seenInit) openInput();
+          seenInit = true;
           return;
         }
 
@@ -504,6 +732,7 @@ export class ClaudeAdapter extends ProviderAdapter {
               return;
             }
             emitWholeMessage({ event: 'task', data: task });
+            trackTask(task, parsed);
 
             return;
           }
@@ -536,6 +765,56 @@ export class ClaudeAdapter extends ProviderAdapter {
           }
 
           const content = message?.['content'];
+
+          // The CLI taking in a message from stdin (--replay-user-messages):
+          // no parent, no tool result. The opening message first, then each
+          // accepted `turn_input` in the order it was written.
+          if (acceptsInput && isInputEcho(parsed, content)) {
+            const text = echoText(content);
+            // The opening is echoed first. Matched on content as well as order,
+            // so a CLI that ever echoed it late could not shift a message
+            // written after it into its place.
+            const isOpening = openingEchoPending
+              && (text === userMessage || port?.pendingCount() === 0 || text !== port?.peekContent());
+            if (isOpening) {
+              openingEchoPending = false;
+
+              return;
+            }
+            // Matched on text, not taken on order alone: the CLI writes user
+            // frames of its own too (after a compaction, say), and taking one
+            // for the head message's echo would report a message read that
+            // the assistant has not seen — and then the real echo would be
+            // credited to the NEXT message. Every pending message whose text
+            // the echo contains, in order, is read, so a CLI that ever folds
+            // two queued messages into one frame still accounts for both.
+            // Trimmed, so a CLI that tidies whitespace still matches.
+            const read: string[] = [];
+            let rest = text;
+            for (let head = port?.peekContent(); head !== undefined; head = port?.peekContent()) {
+              const at = rest.indexOf(head.trim());
+              if (at < 0) break;
+              rest = rest.slice(at + head.trim().length);
+              read.push(port!.shiftRead()!);
+            }
+            if (read.length === 0) {
+              log.debug('A replayed user frame matched no pending message — not an echo of ours', {
+                requestId,
+                pending: port?.pendingCount() ?? 0,
+              });
+
+              return;
+            }
+            for (const messageId of read) {
+              emitWholeMessage({ event: 'user_input', data: { message_id: messageId } });
+            }
+            // Read means about to be answered: working from here, so the
+            // close decision cannot slip in before its first word.
+            setMain('working');
+
+            return;
+          }
+
           if (!Array.isArray(content)) return;
 
           const parent = parentOf(parsed);
@@ -582,8 +861,18 @@ export class ClaudeAdapter extends ProviderAdapter {
 
             return;
           }
+          const mainEvent = acceptsInput && parentOf(parsed).parent_tool_use_id === undefined
+            ? parsed['event'] as Record<string, unknown> | undefined
+            : undefined;
+          if (mainEvent !== undefined && mainEvent['type'] !== 'message_delta' && mainEvent['type'] !== 'message_stop') {
+            setMain('working');
+          }
           mapper.handle(parsed, onEvent);
           if (!mapper.hasOpenBlock()) flushDeferred();
+          if (mainEvent?.['type'] === 'message_delta') {
+            const delta = mainEvent['delta'] as Record<string, unknown> | undefined;
+            if (endsMessage(delta?.['stop_reason'])) setMain('idle');
+          }
           return;
         }
 
@@ -622,6 +911,8 @@ export class ClaudeAdapter extends ProviderAdapter {
           // path never sees a helper's frames (see the guard in
           // ClaudePartialStreamMapper.handle), so this is where they all land.
           const parent = parentOf(parsed);
+          const fromMain = parent.parent_tool_use_id === undefined;
+          if (fromMain) setMain('working');
 
           for (const block of content) {
             const blockType = block['type'] as string;
@@ -734,6 +1025,10 @@ export class ClaudeAdapter extends ProviderAdapter {
               });
             }
           }
+          // Without partial messages this frame is the only sign the main
+          // assistant's message ended (on 2.1.280 it is usually null here, and
+          // the `result` that follows says it instead).
+          if (fromMain && endsMessage(message['stop_reason'])) setMain('idle');
           return;
         }
 
@@ -760,6 +1055,33 @@ export class ClaudeAdapter extends ProviderAdapter {
             origin,
             endsTurn: origin === null,
           });
+
+          if (acceptsInput) {
+            // Not the end of an input-open turn, whatever it says: the main
+            // assistant has finished a message, and that is all. Captured on
+            // 2.1.280 with stdin open: a background command yields an early
+            // unstamped result as the reply ends, and a stamped one
+            // (`task-notification`) later, when the CLI answers the task's end.
+            // The turn ends when the terminal rule closes stdin and the CLI
+            // exits; `done` is then built from every result kept here.
+            if (parsed['is_error'] === true && stoppedByUs(signal, timeouts)) {
+              log.info('Ignoring an error result written on the way out', {
+                requestId,
+                subtype: parsed['subtype'],
+                because: signal.aborted ? 'cancelled' : timeouts?.reason(),
+              });
+
+              return;
+            }
+            results.push(parsed);
+            // The CLI's answer to a finished task is stamped; an unstamped
+            // result is the main assistant's own reply and settles nothing
+            // owed (captured: a task stopped mid-reply is answered after it).
+            if (origin !== null) notificationOwed = false;
+            setMain('idle');
+
+            return;
+          }
 
           if (origin !== null) {
             // Not our prompt. One `claude -p` invocation can run more than one
@@ -877,6 +1199,11 @@ export class ClaudeAdapter extends ProviderAdapter {
         }
 
         log.debug('Unhandled Claude event type', { type });
+      };
+
+      rl.on('line', (line) => {
+        handleLine(line);
+        maybeClose();
       });
 
       rl.on('close', finalizer.onRlClose);
@@ -900,6 +1227,8 @@ export class ClaudeAdapter extends ProviderAdapter {
           : `Failed to spawn claude: ${err.message}`;
         signal.removeEventListener('abort', onAbort);
         clearRequestTimeout(timeoutTimer);
+        port?.end();
+        if (graceTimer !== null) clearTimeout(graceTimer);
 
         if (!settled) {
           settled = true;
@@ -930,6 +1259,10 @@ export class ClaudeAdapter extends ProviderAdapter {
           });
         }
         clearRequestTimeout(timeoutTimer);
+        // The CLI is gone, whether or not we closed its input: nothing more
+        // can reach it.
+        port?.end();
+        if (graceTimer !== null) clearTimeout(graceTimer);
         finalizer.onChildClose(code);
       });
     });
@@ -1056,6 +1389,71 @@ function queuedWorkOrigin(result: Record<string, unknown>): string | null {
   // An origin we cannot name is still an origin, and the frame is still not
   // ours. `recoverTerminal` is what makes that safe to act on.
   return typeof kind === 'string' && kind !== '' ? kind : 'unknown';
+}
+
+/**
+ * Could this `user` frame be the CLI echoing a message it took from stdin?
+ *
+ * `--replay-user-messages` echoes each one with no `parent_tool_use_id`, no
+ * tool result, and `isReplay: true` (2.1.280). A helper's prompt and every tool
+ * result carry one or the other, so they never match. `isReplay` must be
+ * present and true: a user frame the CLI writes on its own account does not
+ * carry it, and must not be taken for an echo. The caller still matches the
+ * text against what was written.
+ */
+function isInputEcho(frame: Record<string, unknown>, content: unknown): boolean {
+  if (parentOf(frame).parent_tool_use_id !== undefined) return false;
+  if (frame['isReplay'] !== true) return false;
+  if (Array.isArray(content)) {
+    return !content.some((e) => typeof e === 'object' && e !== null
+      && (e as Record<string, unknown>)['type'] === 'tool_result');
+  }
+
+  return typeof content === 'string';
+}
+
+/** The text of an echoed message, to match it against what was written. */
+function echoText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+
+  return content
+    .map((e) => (typeof e === 'object' && e !== null && typeof (e as Record<string, unknown>)['text'] === 'string'
+      ? (e as Record<string, unknown>)['text'] as string
+      : ''))
+    .join('');
+}
+
+/**
+ * One `result` standing for every result an input-open turn wrote.
+ *
+ * The last one's fields — it is the latest answer, and the CLI's cost,
+ * API time and helper counts are already running totals across the process
+ * (captured on 2.1.280: every result in a process carries the same
+ * `total_cost_usd`) — with `usage` and `num_turns` summed, which the CLI
+ * reports per result.
+ */
+function combineResults(results: Array<Record<string, unknown>>): Record<string, unknown> {
+  const last = results[results.length - 1];
+  if (results.length === 1) return last;
+
+  const keys = ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'];
+  const usage: Record<string, number | null> = {};
+  for (const key of keys) {
+    let sum: number | null = null;
+    for (const result of results) {
+      const value = num((result['usage'] as Record<string, unknown> | undefined)?.[key]);
+      if (value !== null) sum = (sum ?? 0) + value;
+    }
+    usage[key] = sum;
+  }
+  let turns: number | null = null;
+  for (const result of results) {
+    const value = num(result['num_turns']);
+    if (value !== null) turns = (turns ?? 0) + value;
+  }
+
+  return { ...last, usage, num_turns: turns };
 }
 
 /**

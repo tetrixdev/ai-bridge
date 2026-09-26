@@ -17,6 +17,7 @@ import type {
   StreamEventData,
 } from '../protocol/types.js';
 import type { McpConnection } from '../mcp/cli-config.js';
+import type { TurnInputPort } from './turn-input.js';
 import { formatStderrMessage, getBridgeWorkingDir } from './env.js';
 
 /** A stream event emitted by the adapter. */
@@ -96,6 +97,24 @@ export interface ExecutionContext {
    * append flag pass it there; the rest concatenate it.
    */
   bridgeAddendum: string | null;
+  /**
+   * Present when this turn runs with its input open (`options.accepts_input`,
+   * confirmed by the ack's `input_open`). The adapter keeps the CLI's stdin
+   * open, opens the port once the CLI has started its session, and ends it
+   * when it closes stdin. Absent or null: the turn runs exactly as it always did.
+   */
+  turnInput?: TurnInputPort | null;
+}
+
+/** How spawnCli() treats the child's stdin. */
+export interface SpawnOptions {
+  /**
+   * Write `stdinInput` and leave stdin OPEN, returning the writable. Only for
+   * a CLI told to read a stream of messages there (Claude's
+   * `--input-format stream-json`): every CLI in its default mode hangs on a
+   * live stdin pipe.
+   */
+  keepStdinOpen?: boolean;
 }
 
 /**
@@ -147,10 +166,33 @@ export function createFinalizer(opts: {
    * telling the server the turn produced nothing.
    */
   recoverTerminal?: () => boolean;
+  /**
+   * For a turn that no terminal frame ends — the process exiting is the end —
+   * settle it from what the CLI reported, BEFORE the exit code is judged.
+   *
+   * Returns true if it emitted the terminal events itself. Consulted after a
+   * timeout and a cancel (those are ours, and say so) and ahead of the
+   * non-zero-exit branch, because such a CLI exits non-zero exactly when it
+   * has something to say: Claude Code exits 1 after writing an error `result`
+   * (checked on 2.1.283). Judged by the exit code first, that result — a lost
+   * session the server would silently recover from, a max-turns or overload
+   * with the usage it spent — was reported as a bare `provider_error` and an
+   * empty `done`.
+   */
+  settleFromExit?: (exitCode: number | null) => boolean;
+  /**
+   * The `done` data for a turn ended by a bound, a cancel or a crash, which
+   * otherwise carries `{}`. For an adapter that has already been told what the
+   * turn spent — an input-open turn has results in hand long before its
+   * process ends — so a stopped turn still reports its usage.
+   */
+  doneDataOnStop?: () => Record<string, unknown>;
 }): { onRlClose: () => void; onChildClose: (code: number | null) => void } {
   let rlClosed = false;
   let childExitCode: number | null = null;
   let childExited = false;
+
+  const stopData = (): Record<string, unknown> => opts.doneDataOnStop?.() ?? {};
 
   const tryFinalize = () => {
     if (!rlClosed || !childExited) return;
@@ -184,7 +226,7 @@ export function createFinalizer(opts: {
           limit_seconds: timedOut.limitSeconds,
         },
       });
-      opts.onEvent({ event: 'done', data: {} });
+      opts.onEvent({ event: 'done', data: stopData() });
     } else if (aborted) {
       // AHEAD OF `recoverTerminal` ON PURPOSE, and not only for tidiness. A
       // cancel that lands when the only result so far belonged to the CLI's own
@@ -200,7 +242,9 @@ export function createFinalizer(opts: {
       // "claude CLI exited with code 143" alongside the answer it had written.
       // A person who pressed stop then sees an error they caused and cannot
       // act on. What the turn produced has already been sent; this ends it.
-      opts.onEvent({ event: 'done', data: {} });
+      opts.onEvent({ event: 'done', data: stopData() });
+    } else if (opts.settleFromExit?.(childExitCode) === true) {
+      // Settled from the CLI's own report; see settleFromExit.
     } else if (childExitCode !== 0 && childExitCode !== null) {
       opts.onEvent({
         event: 'error',
@@ -209,7 +253,7 @@ export function createFinalizer(opts: {
           message: formatStderrMessage(opts.providerName, opts.getStderr(), childExitCode),
         },
       });
-      opts.onEvent({ event: 'done', data: {} });
+      opts.onEvent({ event: 'done', data: stopData() });
     } else if (opts.recoverTerminal?.() !== true) {
       // Clean exit but no terminal event — emit a non-fatal error.
       opts.onEvent({
@@ -284,8 +328,12 @@ export abstract class ProviderAdapter {
    *     the safe directory rather than the bridge's own cwd.
    *   - `stdio` keeps stdin closed by default — every CLI hangs if stdin is a
    *     live pipe — unless `stdinInput` is given, in which case stdin is piped,
-   *     the input written, and the pipe immediately closed. stdout/stderr stay
-   *     piped for streaming.
+   *     the input written, and the pipe immediately closed (or, with
+   *     `keepStdinOpen`, left open for the adapter to write more and close).
+   *     stdout/stderr stay piped for streaming.
+   *   - The CLI is spawned `detached` (outside Windows), so it leads its own
+   *     process group and stopTurn() can signal the group — everything the CLI
+   *     started in it goes with the turn.
    *
    * The caller still builds its own `env` (provider-specific quirks like
    * Claude's CLAUDECODE deletion or Codex's conditional PATH belong with the
@@ -297,6 +345,7 @@ export abstract class ProviderAdapter {
    * @param env      Fully-built environment for the child process.
    * @param stdinInput  Prompt to write to stdin, when the CLI reads it there.
    * @param cwd      Directory to spawn in. Defaults to the empty scratch dir.
+   * @param options  See SpawnOptions.
    * @returns The spawned ChildProcess.
    */
   protected spawnCli(
@@ -305,6 +354,7 @@ export abstract class ProviderAdapter {
     env: NodeJS.ProcessEnv,
     stdinInput?: string,
     cwd?: string,
+    options: SpawnOptions = {},
   ): ChildProcessByStdio<Writable | null, Readable, Readable> {
     // stdin defaults to 'ignore' (null) — a live stdin pipe hangs most CLIs.
     // When stdinInput is given we pipe it, write it, and immediately end() so
@@ -312,10 +362,17 @@ export abstract class ProviderAdapter {
     // how Claude is fed: a large prompt as a positional argv entry exceeds the
     // OS per-argument size limit and the spawn dies with `spawn E2BIG`.
     // stdout/stderr stay piped for streaming.
+    //
+    // Detached, so the CLI leads its own process group and stopping the turn
+    // can signal the group rather than the CLI alone (see stopTurn()). Not on
+    // Windows, where `detached` means a new console window instead and there
+    // is no group to signal. The child is not unref'd: the bridge still waits
+    // on it and reads its pipes exactly as before.
     const child = spawn(command, args, {
       env,
       cwd: cwd ?? getBridgeWorkingDir(),
       stdio: [stdinInput !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
 
     if (stdinInput !== undefined && child.stdin) {
@@ -326,9 +383,14 @@ export abstract class ProviderAdapter {
       // bridge — the very crash class this stdin path exists to avoid. Swallow
       // it here; the child's own exit/close is handled by the caller.
       child.stdin.on('error', () => {});
-      // write + close in one call — also respects backpressure better than a
-      // bare write() followed by end().
-      child.stdin.end(stdinInput);
+      if (options.keepStdinOpen === true) {
+        // The adapter writes further messages and decides when to close.
+        child.stdin.write(stdinInput);
+      } else {
+        // write + close in one call — also respects backpressure better than
+        // a bare write() followed by end().
+        child.stdin.end(stdinInput);
+      }
     }
 
     return child;

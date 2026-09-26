@@ -36,7 +36,9 @@ import type {
   DoneData,
   LocalCallMessage,
   UsageRequestMessage,
+  TurnInputMessage,
 } from './protocol/types.js';
+import { TurnInputPort } from './providers/turn-input.js';
 import { PROTOCOL_VERSION, BRIDGE_VERSION } from './protocol/version.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './providers/base.js';
 import { detectProviders } from './providers/detector.js';
@@ -187,6 +189,17 @@ const TOOL_RESOLVE_TIMEOUT_MAX_S = 3600;
 
 // Large-but-finite cap (~24 min of retries with backoff); infinite retry could
 // mask configuration errors.
+/** A request a WebSocket disconnect aborted, waiting to be reported as over. */
+interface DisconnectedTurn {
+  requestId: string;
+  /** Its input port, on a turn that kept its input open. */
+  turnInput: TurnInputPort | null;
+  /** The turn has finished running (its CLI is gone). */
+  ended: boolean;
+  /** The server is back and waiting to hear about it. */
+  due: boolean;
+}
+
 const MAX_RECONNECT_ATTEMPTS = 100;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 15_000; // Cap at 15s per PROTOCOL.md
@@ -404,12 +417,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    */
   private readonly cancelledRequests = new Set<string>();
   /**
-   * Request IDs aborted because the WebSocket dropped while they were in
-   * flight. No terminal event could be sent over the closed socket, so on the
-   * next welcome these are replayed as terminal errors to release the
-   * browser's loading state.
+   * The input port of each running turn that keeps its input open, keyed by
+   * request id. See TurnInputPort and handleTurnInput().
    */
-  private abortedRequestIds: string[] = [];
+  private readonly turnInputs = new Map<string, TurnInputPort>();
+  /**
+   * Requests aborted because the WebSocket dropped while they were in flight.
+   * No terminal event could be sent over the closed socket, so on the next
+   * welcome these are replayed as terminal errors to release the browser's
+   * loading state. See replayDisconnectedTurn().
+   */
+  private disconnectedTurns: DisconnectedTurn[] = [];
   /** Monotonic counter for synthesizing tool_call_ids for MCP-originated calls. */
   private mcpToolCallSeq = 0;
 
@@ -1041,9 +1059,70 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       case 'cancel':
         this.cancelRequest((message as unknown as { request_id: string }).request_id);
         break;
+      case 'turn_input':
+        this.handleTurnInput(message);
+        break;
       default:
         log.warn('Unknown message type received', { type: (message as { type: string }).type });
     }
+  }
+
+  /**
+   * A message for a turn that is still running.
+   *
+   * Answered at once, always: `accepted` when it was written to the running
+   * CLI, `rejected` with the reason otherwise, so the server never has to
+   * guess whether a message reached the assistant. The server acts on the
+   * reason: `turn_not_running` starts a new turn with it; `turn_ending` and
+   * `input_not_open` hold it until this request's terminal frame. The line
+   * between the first two is whether this request's CLI can still be alive:
+   * a server told `turn_not_running` resumes the session straight away.
+   *
+   * A frame without a usable request_id, message_id or text is dropped with a
+   * warning rather than answered: there is no message to account for, and a
+   * server that waits for the ack treats silence as a refusal.
+   */
+  private handleTurnInput(message: TurnInputMessage): void {
+    const { request_id: requestId, message_id: messageId, content } = message as Partial<TurnInputMessage>;
+    if (typeof requestId !== 'string' || typeof messageId !== 'string'
+      || typeof content !== 'string' || content === '') {
+      log.warn('Dropping a malformed turn_input', {
+        requestId: typeof requestId === 'string' ? requestId : undefined,
+        messageId: typeof messageId === 'string' ? messageId : undefined,
+      });
+
+      return;
+    }
+
+    const port = this.turnInputs.get(requestId);
+    // A turn a dropped connection aborted is no longer "active", but its CLI
+    // may still be stopping (see replayDisconnectedTurn): ending, not over.
+    const stillStopping = this.disconnectedTurns.some((t) => t.requestId === requestId && !t.ended);
+    const outcome = !this.activeRequests.has(requestId)
+      ? { status: 'rejected' as const, reason: stillStopping ? 'turn_ending' as const : 'turn_not_running' as const }
+      : port === undefined
+        ? { status: 'rejected' as const, reason: 'input_not_open' as const }
+        : port.offer(messageId, content);
+
+    log.info('Message for a running turn', {
+      requestId,
+      messageId,
+      status: outcome.status,
+      ...(outcome.status === 'rejected' ? { reason: outcome.reason } : {}),
+    });
+    this.send({ type: 'turn_input_ack', request_id: requestId, message_id: messageId, ...outcome });
+  }
+
+  /**
+   * Will this request run with its input open? The server asks with
+   * `options.accepts_input`; only the Claude adapter can do it, and not in
+   * test mode, where no CLI runs.
+   */
+  private acceptsInput(message: AiRequestMessage): boolean {
+    return message.options?.accepts_input === true
+      && message.provider === 'claude'
+      && this.adapters.has('claude')
+      && !this.testMode;
   }
 
   /**
@@ -1101,8 +1180,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       for (const [id, controller] of this.activeRequests) {
         controller.abort();
         // Record the aborted request so it can be replayed as a
-        // terminal error after reconnect.
-        this.abortedRequestIds.push(id);
+        // terminal error after reconnect — with its input port, if it had
+        // one, so the replay can say which accepted messages were never read.
+        this.disconnectedTurns.push({ requestId: id, turnInput: this.turnInputs.get(id) ?? null, ended: false, due: false });
         log.debug('Aborted active request on disconnect', { requestId: id });
       }
       this.activeRequests.clear();
@@ -1156,6 +1236,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       version: PROTOCOL_VERSION,
       bridge_version: BRIDGE_VERSION,
       providers: availableProviders,
+      // Messages for a running turn are understood. Per turn, the ack's
+      // `input_open` is still what says a turn takes them.
+      turn_input: true,
       // Advertise the operator's allow-list so the server can offer a picker
       // rather than asking a developer to type an absolute path into a chat
       // box. Omitted entirely when empty: "no workspaces" and "this bridge
@@ -1480,20 +1563,36 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // Replay any requests aborted by a previous disconnect as terminal errors
     // now that the connection is back, so the browser exits its loading state
     // instead of waiting for the server's own timeout.
-    if (this.abortedRequestIds.length > 0) {
-      const replayed = this.abortedRequestIds;
-      this.abortedRequestIds = [];
-      for (const requestId of replayed) {
-        log.info('Replaying aborted request as a terminal error', { requestId });
-        this.send({
-          type: 'error',
-          request_id: requestId,
-          code: 'bridge_disconnected',
-          message: 'Request aborted: the bridge connection dropped while the response was streaming.',
-          fatal: false,
-        });
-      }
+    for (const turn of [...this.disconnectedTurns]) {
+      turn.due = true;
+      // An input turn is replayed once it has ENDED, not before: its CLI may
+      // still read a queued message on its way out, and the replay's
+      // `pending_inputs` has to be the final word on which ones it did not.
+      if (turn.turnInput === null || turn.ended) this.replayDisconnectedTurn(turn);
     }
+  }
+
+  /**
+   * Tell the server a request aborted by a disconnect is over.
+   *
+   * On a turn with its input open, `pending_inputs` names every accepted
+   * `turn_input` the assistant never read. A message accepted and read while
+   * the socket was down has no `user_input` the server ever saw; without this
+   * list it could neither resend (the assistant would read it twice) nor not
+   * resend (it might be lost). With it the accounting is exact: accepted and
+   * not listed means read.
+   */
+  private replayDisconnectedTurn(turn: DisconnectedTurn): void {
+    this.disconnectedTurns = this.disconnectedTurns.filter((t) => t !== turn);
+    log.info('Replaying aborted request as a terminal error', { requestId: turn.requestId });
+    this.send({
+      type: 'error',
+      request_id: turn.requestId,
+      code: 'bridge_disconnected',
+      message: 'Request aborted: the bridge connection dropped while the response was streaming.',
+      fatal: false,
+      ...(turn.turnInput !== null ? { pending_inputs: turn.turnInput.pending() } : {}),
+    });
   }
 
   /**
@@ -1607,7 +1706,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // couple the ack path to the execution path for no benefit, and the
     // execution path must resolve it anyway on the `session_lost` re-issue,
     // which does not come back through here.
-    const envResolution = resolveBridgeEnv(message.bridge_env);
+    const acceptsInput = this.acceptsInput(message);
+    const envResolution = resolveBridgeEnv(message.bridge_env, { acceptsInput });
     this.send({
       type: 'ai_request_ack',
       request_id,
@@ -1618,6 +1718,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         env_overridden: envResolution.overridden,
         env_rejected: envResolution.rejected,
       },
+      // Only when it is true. Absent is how every older bridge answers, and a
+      // server reads it as "hold messages as before".
+      ...(acceptsInput ? { input_open: true as const } : {}),
     });
 
     // Fresh session: seed the new CLI session with any prior history the
@@ -1706,8 +1809,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // Execute asynchronously
     const controller = new AbortController();
     this.activeRequests.set(request_id, controller);
+    // Created before the turn runs, so a `turn_input` that arrives before the
+    // CLI is up is answered `input_not_open` rather than `turn_not_running`.
+    const turnInput = this.acceptsInput(message) ? new TurnInputPort() : null;
+    if (turnInput !== null) this.turnInputs.set(request_id, turnInput);
 
-    this.executeRequest(adapter, message, cliSessionId, controller.signal)
+    this.executeRequest(adapter, message, cliSessionId, controller.signal, turnInput)
       .catch((err) => {
         const errMessage = err instanceof Error ? err.message : String(err);
         const wasResumeAttempt = cliSessionId !== null;
@@ -1795,11 +1902,31 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       })
       .finally(() => {
         this.activeRequests.delete(request_id);
+        turnInput?.end();
+        // An input turn a disconnect aborted is replayed only once it has
+        // ended (see handleWelcome). If the server is back already, that is now.
+        const disconnected = turnInput !== null
+          ? this.disconnectedTurns.find((t) => t.turnInput === turnInput)
+          : undefined;
+        if (disconnected !== undefined) {
+          disconnected.ended = true;
+          if (disconnected.due && this.sessionId !== null) this.replayDisconnectedTurn(disconnected);
+        }
+        // Only our own entry: a re-issue under the same id may own it by now.
+        if (turnInput !== null && this.turnInputs.get(request_id) === turnInput) {
+          this.turnInputs.delete(request_id);
+        }
         // Last, and only if the server asked for it: everything the turn
         // produced has been sent by now, and this is the frame the server
-        // treats as the end of a cancelled turn.
+        // treats as the end of a cancelled turn. Messages accepted into it and
+        // never read are dropped with it, and named, so the server can offer
+        // them again.
         if (this.cancelledRequests.delete(request_id)) {
-          this.send({ type: 'cancelled', request_id });
+          this.send({
+            type: 'cancelled',
+            request_id,
+            ...(turnInput !== null ? { pending_inputs: turnInput.pending() } : {}),
+          });
         }
         this.emit('request_end', request_id);
       });
@@ -1810,8 +1937,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     request: AiRequestMessage,
     cliSessionId: string | null,
     signal: AbortSignal,
+    turnInput: TurnInputPort | null = null,
   ): Promise<void> {
     const { request_id } = request;
+    const acceptsInput = turnInput !== null;
 
     // Issue a per-spawn MCP bearer token if the MCP server is running. The
     // token is mapped to this request_id so the MCP server can route
@@ -1932,10 +2061,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // the addendum is generated from the environment the turn ACTUALLY gets
       // — an addendum that describes a different configuration than the one
       // running is worse than none at all.
-      const bridgeEnvResolution = resolveBridgeEnv(request.bridge_env);
+      const bridgeEnvResolution = resolveBridgeEnv(request.bridge_env, { acceptsInput });
       const bridgePrompt = resolveBridgeAddendum(
         request.bridge_prompt,
         bridgeEnvResolution.values,
+        { acceptsInput },
       );
       if (bridgeEnvResolution.rejected.length > 0) {
         log.warn('Dropping env keys the bridge does not allow', {
@@ -1965,6 +2095,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         attachmentDir: saved.length > 0 ? attachmentDirFor(request_id) : null,
         bridgeEnv: bridgeEnvResolution.values,
         bridgeAddendum: bridgePrompt.text,
+        turnInput,
       };
 
       // The adapter emits its own `done`, but the CLI session id is only known
@@ -2006,9 +2137,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         this.sessionWorkingDirs.remember(newCliSessionId, workingDir);
       }
 
+      // A turn that ended with accepted messages the assistant never read (a
+      // timeout, a crash) names them, so the server does not wait for a
+      // `user_input` that is not coming. A turn that ends normally has none.
+      const unread = turnInput?.pending() ?? [];
       this.sendStreamEvent(request_id, 'done', {
         ...doneData,
         cli_session_id: newCliSessionId,
+        ...(unread.length > 0 ? { pending_inputs: unread } : {}),
       });
     } finally {
       if (turnDeadline !== null && this.turnDeadlines.get(request_id) === turnDeadline) {

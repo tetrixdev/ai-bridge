@@ -12,7 +12,7 @@
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import type { ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { stopTurn } from '../../src/providers/stop.js';
 
 /** A child that records what it was sent and exits only when told to. */
@@ -80,5 +80,96 @@ describe('ending a turn', () => {
     stopTurn(child, { requestId: 'req_4', provider: 'claude' });
 
     expect(child.signals).toEqual([]);
+  });
+});
+
+/**
+ * The whole turn goes, not just the CLI. With background tasks on, a turn owns
+ * more than one process: spawnCli() starts the CLI as the leader of its own
+ * group, and stopTurn() signals the group. Claude Code puts each shell command
+ * in a session of its own, where a group signal cannot reach it; the CLI stops
+ * those itself on SIGINT, and for a CLI that ignores everything the last step
+ * finds its descendants and kills their groups too.
+ */
+describe.skipIf(process.platform === 'win32')('ending a turn that started other processes', () => {
+  /** Alive and not a zombie waiting for a parent that will never reap it. */
+  function alive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return false;
+    }
+    try {
+      const stat = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim();
+
+      return stat !== '' && !stat.startsWith('Z');
+    } catch {
+      return false;
+    }
+  }
+
+  async function eventually(check: () => boolean, ms = 4000): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (check()) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    return check();
+  }
+
+  /** Spawn like spawnCli() does, and wait for the child to report its child's pid. */
+  async function spawnTurn(script: string): Promise<{ child: ChildProcess; grandchild: number }> {
+    const child = spawn(process.execPath, ['-e', script], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    const grandchild = await new Promise<number>((resolve, reject) => {
+      child.stdout!.once('data', (c: Buffer) => resolve(Number(c.toString().trim())));
+      child.once('error', reject);
+    });
+
+    return { child, grandchild };
+  }
+
+  const strays: number[] = [];
+  afterEach(() => {
+    for (const pid of strays.splice(0)) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+    }
+  });
+
+  it('signals the group, so what the CLI started in it stops with the turn', async () => {
+    const { child, grandchild } = await spawnTurn(`
+      const g = require('child_process').spawn(process.execPath, ['-e', "console.log('up'); setInterval(() => {}, 1000)"], { stdio: ['ignore', 'pipe', 'ignore'] });
+      g.stdout.once('data', () => console.log(String(g.pid)));
+      setInterval(() => {}, 1000);
+    `);
+    strays.push(grandchild, child.pid!);
+    expect(alive(grandchild)).toBe(true);
+
+    stopTurn(child, { requestId: 'req_group', provider: 'claude' });
+
+    expect(await eventually(() => !alive(grandchild))).toBe(true);
+    expect(await eventually(() => child.exitCode !== null || child.signalCode !== null)).toBe(true);
+  });
+
+  it('kills a command in a session of its own when the CLI ignores every signal', async () => {
+    const { child, grandchild } = await spawnTurn(`
+      process.on('SIGINT', () => {}); process.on('SIGTERM', () => {});
+      const g = require('child_process').spawn(process.execPath, ['-e',
+        "process.on('SIGINT', () => {}); process.on('SIGTERM', () => {}); console.log('up'); setInterval(() => {}, 1000)"],
+        { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+      g.stdout.once('data', () => console.log(String(g.pid)));
+      setInterval(() => {}, 1000);
+    `);
+    strays.push(grandchild, child.pid!);
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    stopTurn(child, { requestId: 'req_session', provider: 'claude' });
+    // SIGINT and SIGTERM are both ignored; the SIGKILL step is what ends it.
+    vi.advanceTimersByTime(10_100);
+    vi.useRealTimers();
+
+    expect(await eventually(() => child.exitCode !== null || child.signalCode !== null)).toBe(true);
+    // Re-parented by now, and out of the CLI's group — yet gone.
+    expect(await eventually(() => !alive(grandchild))).toBe(true);
   });
 });

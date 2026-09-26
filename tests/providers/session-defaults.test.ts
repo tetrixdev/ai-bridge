@@ -136,6 +136,85 @@ describe('buildBridgeAddendum()', () => {
   });
 });
 
+describe('a turn that keeps its input open (accepts_input)', () => {
+  it('drops the background-tasks default for that turn only', () => {
+    // Unset (null), not merely absent: an inherited value in the bridge's own
+    // environment has to be removed too, or the turn would still run with it.
+    expect(resolveBridgeEnv(undefined, { acceptsInput: true }).values[BACKGROUND]).toBeNull();
+    expect(resolveBridgeEnv(undefined, { acceptsInput: false }).values[BACKGROUND]).toBe('1');
+    expect(resolveBridgeEnv().values[BACKGROUND]).toBe('1');
+  });
+
+  it('keeps every other default', () => {
+    expect(resolveBridgeEnv(undefined, { acceptsInput: true }).values['CLAUDE_CODE_DISABLE_AUTO_MEMORY']).toBe('1');
+  });
+
+  it("still lets the server's explicit value win", () => {
+    const { values, overridden } = resolveBridgeEnv({ [BACKGROUND]: '1' }, { acceptsInput: true });
+
+    expect(values[BACKGROUND]).toBe('1');
+    expect(overridden).toEqual([BACKGROUND]);
+  });
+
+  it('removes an inherited value from the spawned environment', () => {
+    process.env[BACKGROUND] = '1';
+    try {
+      const env = buildSpawnEnv(undefined, resolveBridgeEnv(undefined, { acceptsInput: true }).values);
+      expect(BACKGROUND in env).toBe(false);
+    } finally {
+      delete process.env[BACKGROUND];
+    }
+  });
+
+  it('tells the model background tasks are available, reported when they fail, and can be re-run', () => {
+    const values = resolveBridgeEnv(undefined, { acceptsInput: true }).values;
+    const text = buildBridgeAddendum(values, { acceptsInput: true });
+
+    expect(text).toContain('Background tasks are available in this turn');
+    expect(text).toContain('fails or is stopped is reported to you');
+    expect(text).toContain('re-run the task');
+    // No longer claims one process per message: messages arrive in this one.
+    expect(text).not.toContain('separate CLI process');
+    expect(text).toContain('further messages while it runs');
+    expect(text).not.toContain('Background shell commands are disabled');
+  });
+
+  it('still forbids detaching work from the turn, in every mode', () => {
+    const modes: Array<[Record<string, string | null> | undefined, boolean]> = [
+      [undefined, true], [undefined, false], [{ [BACKGROUND]: '0' }, false], [{ [BACKGROUND]: '1' }, true],
+    ];
+    for (const [overrides, acceptsInput] of modes) {
+      const text = buildBridgeAddendum(resolveBridgeEnv(overrides, { acceptsInput }).values, { acceptsInput });
+      for (const word of ['nohup', '`&`', 'disown', 'setsid']) {
+        expect(text).toContain(word);
+      }
+    }
+  });
+
+  it('does not claim background tasks are on when the server turned them off for the turn', () => {
+    const values = resolveBridgeEnv({ [BACKGROUND]: '1' }, { acceptsInput: true }).values;
+    const text = buildBridgeAddendum(values, { acceptsInput: true });
+
+    expect(text).not.toContain('Background tasks are available');
+    expect(text).toContain('Background shell commands are disabled here');
+  });
+
+  it('leaves the addendum of every other turn exactly as it was', () => {
+    const values = resolveBridgeEnv().values;
+
+    expect(buildBridgeAddendum(values, { acceptsInput: false })).toBe(buildBridgeAddendum(values));
+    expect(resolveBridgeAddendum(undefined, values, {}).text).toBe(buildBridgeAddendum(values));
+  });
+
+  it('carries the input-turn addendum through resolveBridgeAddendum', () => {
+    const values = resolveBridgeEnv(undefined, { acceptsInput: true }).values;
+    const resolved = resolveBridgeAddendum({ mode: 'append', text: 'Answer in Dutch.' }, values, { acceptsInput: true });
+
+    expect(resolved.text).toContain('Background tasks are available in this turn');
+    expect(resolved.text!.endsWith('Answer in Dutch.')).toBe(true);
+  });
+});
+
 describe('validateBridgePrompt()', () => {
   it('accepts an absent spec — the common case needs no field at all', () => {
     expect(validateBridgePrompt(undefined)).toBeNull();
