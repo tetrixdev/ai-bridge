@@ -188,22 +188,18 @@ export class ClaudeAdapter extends ProviderAdapter {
     // (Anthropic CLI docs) — a resumed turn that omits it runs with no system
     // prompt, so the model loses its instructions after the first turn. We
     // therefore re-send it each turn (matching the working pocket-dev pattern).
-    // resolveSystemPrompt() returns the server-supplied prompt when present, the
-    // neutral isolated fallback when missing-and-isolated, or null when
-    // missing-and-native (let Claude use its own default).
+    // resolveSystemPrompt() returns the server-supplied prompt, or null when
+    // there is none, and then Claude keeps its own default prompt.
     const systemPrompt = resolveSystemPrompt(request.system_prompt, context.cliIsolation);
     if (systemPrompt !== null) {
       args.push('--system-prompt', systemPrompt);
     }
 
     // The bridge's lifecycle addendum rides BESIDE the server's prompt, never
-    // instead of it. Switching `--system-prompt` to `--append-system-prompt`
-    // would look equivalent and is not: without replacement the CLI falls back
-    // to its built-in coding-agent persona, which leaks command-line-tool
-    // conventions into a chat whose prompt the server owns (the same argument
-    // resolveSystemPrompt() and ISOLATED_FALLBACK_SYSTEM_PROMPT make). It would
-    // also turn `native` isolation into replacement mode by accident, since
-    // appending onto a null prompt is the CLI's own substitute for one.
+    // instead of it. Putting the server's prompt on `--append-system-prompt`
+    // too would look equivalent and is not: it would keep the CLI's built-in
+    // coding-agent persona in front of a prompt the server meant to replace it.
+    // With no server prompt, the addendum is appended to the CLI's own default.
     //
     // Both flags in one invocation is verified to work — the model obeys both.
     // Re-sent every turn for the same reason as --system-prompt above: neither

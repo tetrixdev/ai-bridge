@@ -101,9 +101,8 @@ export class GeminiAdapter extends ProviderAdapter {
     log.info('Executing Gemini request', { requestId });
 
     // Build the prompt — prepend system prompt if provided (Gemini CLI has no
-    // dedicated --system-instruction flag, so we concatenate). In isolated
-    // mode resolveSystemPrompt() returns a neutral default when the server
-    // didn't send one, so Gemini's own built-in default never seeps through.
+    // dedicated --system-instruction flag, so we concatenate). With no server
+    // prompt, Gemini keeps its own built-in default.
     // No tool manifest is appended — Gemini discovers server-declared tools
     // through the MCP server registered in .gemini/settings.json (see below).
     // The bridge's lifecycle addendum has no flag of its own here either, so it

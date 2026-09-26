@@ -497,8 +497,8 @@ export type BridgeToServerMessage =
  *       (`cwd` is already pinned to an empty temp dir by the bridge; Claude
  *       additionally runs with `--bare` so hooks, auto-memory, keychain
  *       reads, and the user-level `CLAUDE.md` are also off).
- *     • A neutral fallback system prompt is injected when the server didn't
- *       send one, so the CLI's built-in default never seeps through.
+ *     • The system prompt is the server's; with none, the CLI keeps its own
+ *       default (the bridge writes no system prompt of its own).
  *   This is the right posture when the bridge is reachable by end users.
  *
  * - `native`: the legacy posture, kept as an operator opt-in for the
@@ -513,8 +513,8 @@ export type BridgeToServerMessage =
  *   server-named `working_dir` with its built-in file and shell tools
  *   ENABLED, while the operator's own MCP servers, hooks, plugins, skills and
  *   user-level instruction files stay out (`--strict-mcp-config` and friends
- *   are kept exactly as in `isolated`), and the neutral fallback system prompt
- *   still applies.
+ *   are kept exactly as in `isolated`), and the system prompt is handled as
+ *   in every mode: the server's, or the CLI's own default.
  *
  *   This is NOT a sandbox, and the README says so in as many words: once the
  *   CLI has a shell, `cd ..` and `~/.ssh` are one command away. What bounds it

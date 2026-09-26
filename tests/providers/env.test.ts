@@ -5,7 +5,6 @@ import {
   appendStderr,
   formatStderrMessage,
   resolveSystemPrompt,
-  ISOLATED_FALLBACK_SYSTEM_PROMPT,
 } from '../../src/providers/env.js';
 
 describe('Environment Utilities', () => {
@@ -78,18 +77,17 @@ describe('Environment Utilities', () => {
       expect(resolveSystemPrompt('be helpful', 'native')).toBe('be helpful');
     });
 
-    it('returns the neutral fallback in isolated mode when the server did not send one', () => {
-      expect(resolveSystemPrompt(null, 'isolated')).toBe(ISOLATED_FALLBACK_SYSTEM_PROMPT);
-    });
-
-    it('returns null in native mode when the server did not send one (CLI uses its own default)', () => {
+    it('returns null when the server did not send one, in every mode (the CLI keeps its own default)', () => {
+      // The bridge used to substitute a one-sentence stand-in in isolated and
+      // workspace. It does not write a system prompt of its own any more.
+      expect(resolveSystemPrompt(null, 'isolated')).toBeNull();
+      expect(resolveSystemPrompt(null, 'workspace')).toBeNull();
       expect(resolveSystemPrompt(null, 'native')).toBeNull();
     });
 
-    it('treats empty string the same as null (falsy → fallback)', () => {
-      // The bridge gets the server-side string verbatim — an empty value means
-      // "nothing supplied" from the model's point of view, so fall through.
-      expect(resolveSystemPrompt('', 'isolated')).toBe(ISOLATED_FALLBACK_SYSTEM_PROMPT);
+    it('treats empty string the same as null', () => {
+      // An empty value means "nothing supplied" from the model's point of view.
+      expect(resolveSystemPrompt('', 'isolated')).toBeNull();
       expect(resolveSystemPrompt('', 'native')).toBeNull();
     });
   });
@@ -257,16 +255,11 @@ describe('resolveSystemPrompt() in workspace mode', () => {
     expect(resolveSystemPrompt('be helpful', 'workspace')).toBe('be helpful');
   });
 
-  it('falls back to the neutral prompt, exactly as isolated does', () => {
-    // `workspace` widens what the CLI may DO. It does not hand the CLI's own
-    // coding-agent persona to a product whose prompt the server owns.
-    expect(resolveSystemPrompt(null, 'workspace')).toBe(ISOLATED_FALLBACK_SYSTEM_PROMPT);
-    expect(resolveSystemPrompt('', 'workspace')).toBe(ISOLATED_FALLBACK_SYSTEM_PROMPT);
+  it('passes nothing when the server sent nothing, exactly as the other modes do', () => {
+    expect(resolveSystemPrompt(null, 'workspace')).toBeNull();
+    expect(resolveSystemPrompt('', 'workspace')).toBeNull();
   });
 
-  it('leaves only native to the CLI own default', () => {
-    expect(resolveSystemPrompt(null, 'native')).toBeNull();
-  });
 });
 
 
