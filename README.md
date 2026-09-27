@@ -256,37 +256,42 @@ inherited, so:
 - a server cannot turn it on by sending a field
 - an absent `execute` field means `server`, so existing servers are unchanged
 
-### Every credential belongs to one space
+### A sealed value is read through the space that sealed it
 
-A local tool is defined in a space, and it can reach that space's credentials
-and nothing else. That is enforced at the lookup, not by convention: the bridge
-keeps decrypted secrets space by space, and every resolution names the space it
-is allowed to look in. A tool from a shared space asking for a credential that
-lives in your private space is refused, whether it asks by name or by resolved
-id, and whether or not the name happens to be unique.
+A local tool fills its roles with vault items a person chose for it, and an
+item may live in a different space from the tool: a tool in a shared space can
+run with a login from your private space, because you picked it for that tool.
+Engram decides whether you may (it records your choice against a hash of the
+tool's whole definition, so a changed tool asks again). What the bridge holds
+to is narrower and mechanical: it keeps decrypted values space by space, and a
+sealed value is opened only through the space the call names for it, and only
+as the field of the item the call says it belongs to. Anything else reads as a
+value this device does not hold, and the call fails rather than running without
+it.
 
-This is worth stating plainly because the earlier design got it wrong in a way
+This is worth stating plainly because an earlier design got it wrong in a way
 that looked fine: everything the device could decrypt went into one flat map,
-names were exposed bare, and a bare name resolved against all of it. The only
-thing standing between a shared tool and a private credential was a name
-collision, and colliding names were dropped, so the reachable credentials were
-exactly the uniquely named ones.
+names were exposed bare, and a bare name resolved against all of it.
 
-### Roles, not credential names
+### Roles and fields, not item names
 
-A tool does not name credentials. It declares roles:
+A tool does not name items. It declares roles, each with the label of the item
+that fits and the fields it reads:
 
 ```json
 {
   "name": "fetch_mail",
-  "needs": [{ "role": "mailbox", "kind": "azure-app" }]
+  "needs": [{ "role": "mailbox", "kind": "azure_app",
+              "fields": ["tenant_id", "client_id", "client_secret"] }]
 }
 ```
 
-and the caller says which credential fills each role. The tool reads
-`ENGRAM_SECRET_MAILBOX` and never learns what the credential is called, so one
-`fetch_mail` serves three Azure app registrations instead of being written three
-times. The bridge receives resolved secret IDs, never names.
+and a person chooses which item fills each role. The tool reads
+`ENGRAM_MAILBOX_TENANT_ID`, `ENGRAM_MAILBOX_CLIENT_ID` and
+`ENGRAM_MAILBOX_CLIENT_SECRET` (`ENGRAM_<ROLE>_<FIELD>`, plain and sealed alike)
+and never learns what the item is called, so one `fetch_mail` serves three Azure
+app registrations instead of being written three times. The bridge receives
+plain fields as values and sealed ones as ids, never a sealed value.
 
 ### Why the secret never reaches the server
 
@@ -375,10 +380,11 @@ thing with a delay.
 
 ### What redaction does and does not do
 
-Secrets reach a tool as environment variables, and the bridge removes those
-exact values from stdout and stderr before the model sees them. That turns an
-accidental `echo $ENGRAM_SECRET_MAILBOX` from a leak into
-`[redacted: ENGRAM_SECRET_MAILBOX]`, and catches the likelier accident, which is
+Sealed values reach a tool as environment variables, and the bridge removes those
+exact values from stdout and stderr before the model sees them. Plain fields are
+not scrubbed: they are not secret. That turns an
+accidental `echo $ENGRAM_MAILBOX_CLIENT_SECRET` from a leak into
+`[redacted: ENGRAM_MAILBOX_CLIENT_SECRET]`, and catches the likelier accident, which is
 a tool printing a connection string in an error message.
 
 Scrubbing happens **before** the output is parsed, so a credential cannot

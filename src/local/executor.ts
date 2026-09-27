@@ -59,6 +59,11 @@ export interface LocalRun {
   input?: unknown;
   /** Resolved secrets, injected as environment and redacted from the output. */
   secrets: Redaction[];
+  /**
+   * The plain fields of the items filling a tool's roles, as ENGRAM_<ROLE>_<FIELD>.
+   * Injected and not redacted: plain means not secret.
+   */
+  plain?: Record<string, string>;
   cwd?: string;
   timeoutMs?: number;
   /** What the tool declared it needs, so the sandbox can confine the rest. */
@@ -128,7 +133,20 @@ function composeEnv(run: LocalRun): NodeJS.ProcessEnv {
     env[variable] = typeof value === 'string' ? value : JSON.stringify(value);
   }
 
+  for (const [variable, value] of Object.entries(run.plain ?? {})) {
+    // Never over something the bridge set itself: a role called `package`
+    // with a field `dir` would otherwise replace ENGRAM_PACKAGE_DIR.
+    if (PROTECTED.has(variable) || (run.extraEnv && variable in run.extraEnv)) {
+      throw new Error(`the field variable ${variable} would replace one the bridge sets itself; rename the role or the field`);
+    }
+    claim(variable, `plain field ${variable}`);
+    env[variable] = value;
+  }
+
   for (const s of run.secrets) {
+    if (run.extraEnv && s.name in run.extraEnv) {
+      throw new Error(`the field variable ${s.name} would replace one the bridge sets itself; rename the role or the field`);
+    }
     if (PROTECTED.has(s.name)) {
       // A space member choosing a secret's name must not get to decide which
       // binary the child actually runs.

@@ -24,13 +24,20 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-/** A device holding one secret in the shared space and one in a private space. */
+/** A device holding one sealed value in the shared space and one in a private space. */
 function store(): SecretStore {
   const s = new SecretStore();
-  s.add({ id: 'sec_shared', spaceId: SPACE, name: 'mail-app', value: 'shared-value-4321' });
-  s.add({ id: 'sec_private', spaceId: OTHER, name: 'personal', value: 'private-value-8765' });
+  s.add({ id: 'sec_shared', spaceId: SPACE, itemId: 'item_shared', field: 'client_secret', value: 'shared-value-4321' });
+  s.add({ id: 'sec_private', spaceId: OTHER, itemId: 'item_private', field: 'client_secret', value: 'private-value-8765' });
   return s;
 }
+
+/** The fill Engram sends for the role `mailbox`: plain values, and a sealed id with its space. */
+const fillWith = (itemId: string, secretId: string, space: string): LocalCallMessage['fill'] => [{
+  role: 'mailbox', item_id: itemId, space_id: space, kind: 'azure_app',
+  fields: { client_id: 'c-123' },
+  sealed: [{ field: 'client_secret', secret_id: secretId, space_id: space }],
+}]
 
 /** Write a tool that runs under node, and return the args that run it. */
 function tool(body: string): { dir: string; args: string[] } {
@@ -67,8 +74,9 @@ const ECHO = `
   process.stdin.on('end', () => {
     console.log(JSON.stringify({
       input: JSON.parse(raw || '{}'),
-      mailbox: process.env.ENGRAM_SECRET_MAILBOX ?? null,
-      leaked: process.env.ENGRAM_SECRET_PERSONAL ?? null,
+      mailbox: process.env.ENGRAM_MAILBOX_CLIENT_SECRET ?? null,
+      client: process.env.ENGRAM_MAILBOX_CLIENT_ID ?? null,
+      leaked: process.env.ENGRAM_PERSONAL_CLIENT_SECRET ?? null,
     }));
   });
 `;
@@ -100,58 +108,74 @@ describe('the gate, on the local_call path', () => {
   });
 });
 
-describe('a call reaching for another space', () => {
-  it('is refused, and the tool never runs', async () => {
-    // The same leak the flat secret map allowed, arriving by id instead of by
-    // name. A caller that knows an id must not be able to spend it in a space
-    // that does not hold that secret.
+describe('a sealed value, read only through the space and item it belongs to', () => {
+  it('is refused when the call names it under a space that does not hold it, and the tool never runs', async () => {
+    // The same leak the flat secret map allowed, arriving by id. A caller that
+    // knows an id must not be able to spend it through a space that did not
+    // seal it.
     const { dir, args } = tool(ECHO);
     const ctx = context({ config: { enabled: true, workdir: dir } });
 
     const result = await handleLocalCall(ctx, call({
       tool: { name: 'fetch_mail', command: process.execPath, args },
-      fill: [{ role: 'mailbox', secret_id: 'sec_private' }],
+      fill: fillWith('item_private', 'sec_private', SPACE),
     }));
 
     expect(result.ok).toBe(false);
-    expect(result.error).toMatch(/cannot reach across spaces/);
+    expect(result.error).toMatch(/cannot be filled/);
     expect(result.result).toBeUndefined();
   }, 20_000);
 
-  it('serves the same id from the space that actually holds it', async () => {
+  it('is refused when the call names it as a field of another item', async () => {
+    const { dir, args } = tool(ECHO);
+    const ctx = context({ config: { enabled: true, workdir: dir } });
+    const result = await handleLocalCall(ctx, call({
+      tool: { name: 'fetch_mail', command: process.execPath, args },
+      fill: fillWith('item_shared', 'sec_private', OTHER),
+    }));
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/cannot be filled/);
+  }, 20_000);
+
+  it('is served from the space that sealed it, even when the tool lives in another', async () => {
+    // A tool in a shared space, run with an item from the person's private
+    // space: Engram decided the person chose it; the bridge opens it where it
+    // is sealed.
     const { dir, args } = tool(ECHO);
     const ctx = context({ config: { enabled: true, workdir: dir } });
 
     const result = await handleLocalCall(ctx, call({
-      space_id: OTHER,
+      space_id: SPACE,
       tool: { name: 'fetch_mail', command: process.execPath, args },
-      fill: [{ role: 'mailbox', secret_id: 'sec_private' }],
+      fill: fillWith('item_private', 'sec_private', OTHER),
     }));
 
     expect(result.ok).toBe(true);
     // Redacted on the way out, which is the point: the tool had the value and
     // what comes back does not.
-    expect((result.result as { mailbox: string }).mailbox).toBe('[redacted: ENGRAM_SECRET_MAILBOX]');
+    expect((result.result as { mailbox: string }).mailbox).toBe('[redacted: ENGRAM_MAILBOX_CLIENT_SECRET]');
   }, 20_000);
 });
 
 describe('what the tool receives', () => {
-  it('gets its input as one JSON document on stdin, and its credential by role', async () => {
+  it('gets its input as one JSON document on stdin, and each field by role and name', async () => {
     const { dir, args } = tool(ECHO);
     const ctx = context({ config: { enabled: true, workdir: dir } });
 
     const result = await handleLocalCall(ctx, call({
       tool: { name: 'fetch_mail', command: process.execPath, args },
-      fill: [{ role: 'mailbox', secret_id: 'sec_shared' }],
+      fill: fillWith('item_shared', 'sec_shared', SPACE),
       input: { since: '2026-08-01' },
     }));
 
     expect(result.ok).toBe(true);
-    const body = result.result as { input: { since: string }; mailbox: string; leaked: string | null };
+    const body = result.result as { input: { since: string }; mailbox: string; client: string; leaked: string | null };
     expect(body.input).toEqual({ since: '2026-08-01' });
-    // The tool read the ROLE it declared. It was never told what the
-    // credential is called, which is what lets one tool serve three of them.
-    expect(body.mailbox).toBe('[redacted: ENGRAM_SECRET_MAILBOX]');
+    // The tool read the ROLE and FIELD it declared. It was never told what the
+    // item is called, which is what lets one tool serve three of them.
+    expect(body.mailbox).toBe('[redacted: ENGRAM_MAILBOX_CLIENT_SECRET]');
+    // A plain field arrives as itself: plain means not secret.
+    expect(body.client).toBe('c-123');
     // And it holds nothing it did not ask for.
     expect(body.leaked).toBeNull();
   }, 20_000);
@@ -179,20 +203,20 @@ describe('what comes back', () => {
       let raw = '';
       process.stdin.on('data', (c) => { raw += c; });
       process.stdin.on('end', () => {
-        console.log(JSON.stringify({ deep: { nested: ['token ' + process.env.ENGRAM_SECRET_MAILBOX] } }));
+        console.log(JSON.stringify({ deep: { nested: ['token ' + process.env.ENGRAM_MAILBOX_CLIENT_SECRET] } }));
       });
     `);
     const ctx = context({ config: { enabled: true, workdir: dir } });
 
     const result = await handleLocalCall(ctx, call({
       tool: { name: 'fetch_mail', command: process.execPath, args },
-      fill: [{ role: 'mailbox', secret_id: 'sec_shared' }],
+      fill: fillWith('item_shared', 'sec_shared', SPACE),
     }));
 
     expect(result.ok).toBe(true);
     expect(JSON.stringify(result.result)).not.toContain('shared-value-4321');
     expect((result.result as { deep: { nested: string[] } }).deep.nested[0])
-      .toBe('token [redacted: ENGRAM_SECRET_MAILBOX]');
+      .toBe('token [redacted: ENGRAM_MAILBOX_CLIENT_SECRET]');
   }, 20_000);
 
   it('fails loudly when stdout is not one JSON document, and passes no text through', async () => {
@@ -246,19 +270,19 @@ describe('what comes back', () => {
     // A failure path is exactly where a credential ends up in a message by
     // accident: the tool prints the connection string it could not use.
     const { dir, args } = tool(`
-      console.error('auth failed for ' + process.env.ENGRAM_SECRET_MAILBOX);
+      console.error('auth failed for ' + process.env.ENGRAM_MAILBOX_CLIENT_SECRET);
       process.exit(1);
     `);
     const ctx = context({ config: { enabled: true, workdir: dir } });
 
     const result = await handleLocalCall(ctx, call({
       tool: { name: 'failing', command: process.execPath, args },
-      fill: [{ role: 'mailbox', secret_id: 'sec_shared' }],
+      fill: fillWith('item_shared', 'sec_shared', SPACE),
     }));
 
     expect(result.ok).toBe(false);
     expect(result.error).not.toContain('shared-value-4321');
-    expect(result.error).toContain('[redacted: ENGRAM_SECRET_MAILBOX]');
+    expect(result.error).toContain('[redacted: ENGRAM_MAILBOX_CLIENT_SECRET]');
   }, 20_000);
 
   it('says what the sandbox actually did, rather than what was asked for', async () => {
@@ -288,7 +312,8 @@ describe('a call that cannot be run at all', () => {
       call({ tool: undefined as unknown as LocalCallMessage['tool'] }),
       call({ tool: { name: 't', command: '' } }),
       call({ tool: { name: 't', command: 'x', args: [42 as unknown as string] } }),
-      call({ fill: [{ role: 'mailbox' } as unknown as { role: string; secret_id: string }] }),
+      call({ fill: [{ role: 'mailbox' } as unknown as NonNullable<LocalCallMessage['fill']>[number]] }),
+      call({ fill: [{ role: 'mailbox', item_id: 'i', space_id: SPACE, sealed: [{ field: 'x' }] } as never] }),
     ];
 
     for (const frame of broken) {

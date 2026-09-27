@@ -1,4 +1,4 @@
-import type { SecretFill } from '../protocol/types.js';
+import type { ItemFill } from '../protocol/types.js';
 import { createLogger } from '../utils/logger.js';
 import { fingerprint, openEnvelope, unwrapToDevice, type Identity } from './identity.js';
 import type { Redaction } from './scrub.js';
@@ -70,79 +70,55 @@ export async function enrol(
   return { deviceId: device.id, fingerprint: local };
 }
 
-const envName = (name: string): string => name.toUpperCase().replace(/[^A-Z0-9]/g, '_');
-
-/** One decrypted secret, and the space it came from. */
+/** One decrypted sealed value, and where it belongs. */
 export interface HeldSecret {
-  /** Engram's id for it. Absent on an older Engram that does not send one. */
-  id?: string;
+  /** Engram's id for the sealed value, which is what a call names. */
+  id: string;
+  /** The space it is sealed in, which is the key that opened it. */
   spaceId: string;
-  /** The name in the vault. For logs and for the legacy name lookup. */
-  name: string;
+  /** The vault item it is one sealed field of, and which field. */
+  itemId: string;
+  field: string;
   value: string;
 }
 
 /**
- * Every secret this device can open, kept space by space.
+ * Every sealed value this device can open, kept space by space.
  *
- * This used to be one flat map keyed by `space/name` AND by bare `name`, and
- * that flat map was a live cross-space leak. A tool defined in a shared space
- * could name a credential that exists only in the user's private space and be
- * handed it, because a bare name resolved against everything the device held.
- * The only thing in the way was a name collision, and colliding names were
- * deleted, so the reachable ones were exactly the uniquely named ones: the
- * opposite of a boundary.
- *
- * So there is no flat map and no bare form. Every lookup names a space, and a
- * lookup that cannot name one has nowhere to go.
+ * Every lookup names a space as well as an id, and a value found under
+ * another space reads exactly as one that does not exist. A call carries, for
+ * each sealed field, the space the value is sealed in, which may differ from
+ * the tool's own: a tool in a shared space may run with an item from the
+ * person's private space when that person chose it. Deciding THAT is Engram's
+ * (a person's consent, recorded against the tool's definition); what the
+ * bridge holds to is that a value is only ever read through the space that
+ * sealed it, and only when it is the field of the item the call says it is.
  */
 export class SecretStore {
-  private readonly spaces = new Map<string, {
-    byId: Map<string, HeldSecret>;
-    /** null marks a name two secrets in this space share: reachable by id only. */
-    byName: Map<string, HeldSecret | null>;
-  }>();
-
-  private space(spaceId: string): { byId: Map<string, HeldSecret>; byName: Map<string, HeldSecret | null> } {
-    let bucket = this.spaces.get(spaceId);
-    if (!bucket) {
-      bucket = { byId: new Map(), byName: new Map() };
-      this.spaces.set(spaceId, bucket);
-    }
-    return bucket;
-  }
+  private readonly spaces = new Map<string, Map<string, HeldSecret>>();
 
   add(secret: HeldSecret): void {
-    const bucket = this.space(secret.spaceId);
-    if (secret.id !== undefined) bucket.byId.set(secret.id, secret);
-    // Two secrets in one space sharing a name: neither is served by guess,
-    // for the same reason two spaces sharing one never were. An id still
-    // reaches both, because an id is unambiguous.
-    bucket.byName.set(secret.name, bucket.byName.has(secret.name) ? null : secret);
+    let bucket = this.spaces.get(secret.spaceId);
+    if (!bucket) {
+      bucket = new Map();
+      this.spaces.set(secret.spaceId, bucket);
+    }
+    bucket.set(secret.id, secret);
   }
 
-  /** The secret with this id, IF it lives in this space. Otherwise nothing. */
+  /** The value with this id, IF it is sealed in this space. Otherwise nothing. */
   byId(spaceId: string, id: string): HeldSecret | undefined {
-    return this.spaces.get(spaceId)?.byId.get(id);
-  }
-
-  /** The secret with this name in this space, unless the name is ambiguous there. */
-  byName(spaceId: string, name: string): HeldSecret | undefined {
-    return this.spaces.get(spaceId)?.byName.get(name) ?? undefined;
+    return this.spaces.get(spaceId)?.get(id);
   }
 
   hasId(spaceId: string, id: string): boolean {
     return this.byId(spaceId, id) !== undefined;
   }
 
-  hasName(spaceId: string, name: string): boolean {
-    return this.byName(spaceId, name) !== undefined;
-  }
-
-  /** How many secrets are held, across every space. For logging only. */
+  /** How many values are held, across every space. For logging only. */
   get size(): number {
     let n = 0;
-    for (const bucket of this.spaces.values()) n += bucket.byName.size;
+    for (const bucket of this.spaces.values()) n += bucket.size;
     return n;
   }
 
@@ -153,20 +129,19 @@ export class SecretStore {
 }
 
 /**
- * Fetch and open every secret this device is allowed to use.
+ * Fetch and open every sealed value this device is allowed to use.
  *
- * The space a secret came from is kept with it and is not decoration: it is
- * what every later lookup is checked against. A secret is never reachable
- * except through the space that holds it.
+ * The space a value came from is kept with it and is not decoration: it is
+ * what every later lookup is checked against.
  */
 export async function loadSecrets(
   cfg: EngramConfig,
   identity: Identity,
   deviceId: string,
 ): Promise<SecretStore> {
-  const { keys } = await call<{ keys: { space_id: string; wrapped_key: string }[] }>(
-    cfg, `/devices/${deviceId}/keys`,
-  );
+  const { keys } = await call<{
+    keys: { space_id: string; wrapped_key: string; granted_by_signing_key?: string | null }[];
+  }>(cfg, `/devices/${deviceId}/keys`);
   const store = new SecretStore();
   if (keys.length === 0) {
     log.info('device holds no space keys yet; approve it in the browser and give it one');
@@ -176,15 +151,21 @@ export async function loadSecrets(
   const spaceKeys = new Map<string, Uint8Array>();
   for (const k of keys) {
     try {
-      spaceKeys.set(k.space_id, await unwrapToDevice(identity.privateKey, k.wrapped_key));
-    } catch {
-      // A key wrapped for a different device, or for a key we no longer hold.
-      log.warn('could not open a space key; ignoring it', { space: k.space_id });
+      spaceKeys.set(k.space_id, await unwrapToDevice(
+        identity, k.wrapped_key, { space: k.space_id }, k.granted_by_signing_key));
+    } catch (err) {
+      // A key wrapped for a different device, for a key we no longer hold, in
+      // the format before wraps were bound to their space, or not signed by
+      // whoever granted it. Said, because "no secrets" with nothing in the log
+      // is the failure this used to be.
+      log.warn('could not open a space key; ignoring it', {
+        space: k.space_id, reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
   const { secrets } = await call<{
-    secrets: { id?: string; space_id: string; name: string; envelope: { iv: string; ct: string } }[];
+    secrets: { id: string; space_id: string; item_id: string; field: string; envelope: { iv: string; ct: string } }[];
   }>(cfg, `/devices/${deviceId}/secrets`);
 
   for (const s of secrets) {
@@ -194,131 +175,118 @@ export async function loadSecrets(
     try {
       value = await openEnvelope(key, s.envelope);
     } catch {
-      log.warn('could not open a secret; ignoring it', { space: s.space_id, name: s.name });
+      log.warn('could not open a sealed value; ignoring it', { space: s.space_id, field: s.field });
       continue;
     }
-    store.add({ id: s.id, spaceId: s.space_id, name: s.name, value });
+    store.add({ id: s.id, spaceId: s.space_id, itemId: s.item_id, field: s.field, value });
   }
 
-  log.info('secrets available to local tools', {
+  log.info('sealed values available to local tools', {
     count: store.size,
     spaces: store.spaceIds().length,
   });
   return store;
 }
 
-/**
- * The secrets a tool declared BY NAME, from its own space and nowhere else.
- *
- * Two refusals here, and both used to be silent successes:
- *
- * 1. A tool that cannot name a space is refused outright. There is no bare
- *    lookup to fall back to any more, and falling back was the leak.
- * 2. A name that does not exist IN THAT SPACE fails the call rather than
- *    warning and running on. A tool that declared a credential and runs
- *    without it does not fail cleanly: it connects as nobody, writes an empty
- *    value into whatever it configures, or acts on the wrong target, and the
- *    model reads whatever comes back as the tool having worked.
- *
- * Missing means not granted, not yet approved, ambiguous within the space, or
- * held by a DIFFERENT space, and every one of those is for a person to fix in
- * the vault rather than for the bridge to paper over.
- */
-export function grantedTo(
-  store: SecretStore,
-  spaceId: string | undefined,
-  wanted: string[] | undefined,
-): Redaction[] {
-  if (!wanted || wanted.length === 0) return [];
-  if (!spaceId) {
-    log.warn('a local tool declared secrets without saying which space it belongs to');
-    throw new Error(
-      `this tool declared secrets but no space_id, so there is no space to resolve them in. ` +
-      `A secret is only ever reachable through the space that holds it.`,
-    );
-  }
+/** A role or a field may only become part of an environment variable if it says so plainly. */
+const ROLE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+const FIELD = /^[a-z][a-z0-9_]*$/;
 
-  const out: Redaction[] = [];
-  for (const name of wanted) {
-    const found = store.byName(spaceId, name);
-    if (!found) {
-      log.warn('a tool asked for a secret its space does not hold', { space: spaceId, name });
+/**
+ * ENGRAM_MAILBOX_CLIENT_SECRET, from the role `mailbox` and the field
+ * `client_secret`. Upper case, `-` to `_`. The same scheme for plain and
+ * sealed fields, so a tool reads every field of its item the same way and
+ * never learns which were secret.
+ */
+export function fieldEnvName(role: string, field: string): string {
+  return `ENGRAM_${role}_${field}`.toUpperCase().replace(/-/g, '_');
+}
+
+/** What filling a call's roles produces: plain values, and sealed ones to inject AND scrub. */
+export interface Filled {
+  /** Plain fields. Not secret, so injected and not scrubbed. */
+  env: Record<string, string>;
+  /** Sealed fields, opened here. Injected, and scrubbed from everything the tool says. */
+  sealed: Redaction[];
+}
+
+/**
+ * Turn each role's item into environment variables, one per field the need
+ * named: plain fields as the values the call carries, sealed fields opened
+ * from the space they are sealed in.
+ *
+ * The tool reads the ROLE and the FIELD it declared, so one `fetch_mail` serves
+ * three Azure app registrations instead of being written three times, and a
+ * tool never learns what an item is called.
+ *
+ * Each sealed field is checked three ways before it is opened: the value is
+ * held under the space the call names for it, it is a field of the item the
+ * call names, and it is the field the call says it is. A server naming a value
+ * from one item under another's role reads exactly as one naming a value that
+ * does not exist.
+ */
+export function fillRoles(store: SecretStore, fill: ItemFill[] | undefined): Filled {
+  const out: Filled = { env: {}, sealed: [] };
+  const seen = new Map<string, string>();
+  const claim = (variable: string, by: string): void => {
+    const collides = seen.get(variable);
+    if (collides !== undefined) {
+      // `mail-box` and `mail_box` are two roles and one variable. Picking one
+      // would hand the tool a value under a name it did not ask for.
       throw new Error(
-        `the space this tool belongs to does not hold a secret named "${name}". ` +
-        `Approve the device in the vault and grant it that space's key, or check ` +
-        `the secret lives in this space: one space cannot borrow another's credentials.`,
+        `${collides} and ${by} both become ${variable}, so one would silently overwrite ` +
+        `the other. Rename one of them in the tool definition.`,
       );
     }
-    out.push({ name: envName(found.name), value: found.value });
-  }
-  return out;
-}
-
-/**
- * A role a tool declared may only become an environment variable if it says
- * so plainly. Anything else is a tool definition to fix, not a name to mangle.
- */
-const ROLE = /^[A-Za-z][A-Za-z0-9_-]*$/;
-
-/** ENGRAM_SECRET_MAILBOX, from the role `mailbox`. */
-export function roleEnvName(role: string): string {
-  return `ENGRAM_SECRET_${role.toUpperCase().replace(/-/g, '_')}`;
-}
-
-/**
- * Bind each role to the credential the caller chose for it.
- *
- * The tool reads the ROLE it declared, so one `fetch_mail` serves three Azure
- * app registrations instead of being written three times, and a tool never
- * learns what a credential is called.
- *
- * The space check is the whole security property: an id is a bearer-ish token
- * that a caller might hold for any number of reasons, and resolving it outside
- * the call's space would let a shared space's tool reach a private space's
- * credential by id rather than by name. Same leak, different key. So a secret
- * found in another space reads here exactly like one that does not exist.
- */
-export function fillRoles(
-  store: SecretStore,
-  spaceId: string,
-  fill: SecretFill[] | undefined,
-): Redaction[] {
-  const out: Redaction[] = [];
-  const seen = new Map<string, string>();
+    seen.set(variable, by);
+  };
 
   for (const entry of fill ?? []) {
     if (!ROLE.test(entry.role)) {
       throw new Error(
-        `"${entry.role}" is not a usable role name. A role becomes an environment ` +
-        `variable, so it must start with a letter and hold only letters, digits, ` +
-        `"-" and "_".`,
+        `"${entry.role}" is not a usable role name. A role becomes part of an environment ` +
+        `variable, so it must start with a letter and hold only letters, digits, "-" and "_".`,
       );
     }
-    const variable = roleEnvName(entry.role);
-    const collides = seen.get(variable);
-    if (collides !== undefined) {
-      // `mail-box` and `mail_box` are two roles and one variable. Picking one
-      // would hand the tool a credential under a role it did not ask for.
-      throw new Error(
-        `the roles "${collides}" and "${entry.role}" both become ${variable}, ` +
-        `so one would silently overwrite the other. Rename one of them.`,
-      );
+    for (const [field, value] of Object.entries(entry.fields ?? {})) {
+      if (!FIELD.test(field) || typeof value !== 'string') {
+        throw new Error(`the plain field "${field}" of role "${entry.role}" is not a lowercase name with a string value`);
+      }
+      const variable = fieldEnvName(entry.role, field);
+      claim(variable, `role "${entry.role}" field "${field}"`);
+      out.env[variable] = value;
     }
-    seen.set(variable, entry.role);
-
-    const found = store.byId(spaceId, entry.secret_id);
-    if (!found) {
-      log.warn('a local call named a secret this space does not hold', {
-        space: spaceId, role: entry.role,
-      });
-      throw new Error(
-        `no secret with that id exists in the space this call names, so the role ` +
-        `"${entry.role}" cannot be filled. Either this device has not been granted ` +
-        `that space's key, or the secret belongs to a different space: a call ` +
-        `cannot reach across spaces, by name or by id.`,
-      );
+    for (const ref of entry.sealed ?? []) {
+      if (!FIELD.test(ref.field)) {
+        throw new Error(`the sealed field "${ref.field}" of role "${entry.role}" is not a lowercase name`);
+      }
+      const variable = fieldEnvName(entry.role, ref.field);
+      claim(variable, `role "${entry.role}" field "${ref.field}"`);
+      const found = store.byId(ref.space_id, ref.secret_id);
+      if (!found || found.itemId !== entry.item_id || found.field !== ref.field) {
+        log.warn('a local call named a sealed value this device cannot match', {
+          space: ref.space_id, role: entry.role, field: ref.field,
+        });
+        throw new Error(
+          `the sealed field "${ref.field}" for the role "${entry.role}" cannot be filled: this ` +
+          `device holds no such value, sealed in the space the call names, as that field of that ` +
+          `item. Either this device has not been handed that space's key (the Vault page lists ` +
+          `it under your devices), or the field was filled after the device last looked.`,
+        );
+      }
+      out.sealed.push({ name: variable, value: found.value });
     }
-    out.push({ name: variable, value: found.value });
   }
   return out;
+}
+
+/** A sealed value a call needs: its id and the space it is sealed in. */
+export interface SealedRef {
+  space_id: string;
+  secret_id: string;
+}
+
+/** Every sealed value a fill names, for the cache to check before a call runs. */
+export function sealedRefs(fill: ItemFill[] | undefined): SealedRef[] {
+  return (fill ?? []).flatMap((f) => (f.sealed ?? []).map((r) => ({ space_id: r.space_id, secret_id: r.secret_id })));
 }

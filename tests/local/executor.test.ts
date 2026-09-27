@@ -55,6 +55,25 @@ describe('running a tool locally', () => {
   });
 });
 
+describe('an item\'s plain fields', () => {
+  it('arrive as themselves and are not redacted, because plain means not secret', async () => {
+    const res = await runLocalTool({
+      ...base, command: 'sh', args: ['-c', 'printf "%s %s" "$ENGRAM_MAILBOX_CLIENT_ID" "$ENGRAM_MAILBOX_CLIENT_SECRET"'],
+      plain: { ENGRAM_MAILBOX_CLIENT_ID: 'c-123' },
+      secrets: [{ name: 'ENGRAM_MAILBOX_CLIENT_SECRET', value: 'sealed-value-99' }],
+    });
+    expect(res.stdout).toBe('c-123 [redacted: ENGRAM_MAILBOX_CLIENT_SECRET]');
+  });
+
+  it('cannot replace a variable the bridge sets itself', async () => {
+    // A role called `package` with a field `dir` is ENGRAM_PACKAGE_DIR.
+    await expect(runLocalTool({
+      ...base, command: 'true', args: [],
+      extraEnv: { ENGRAM_PACKAGE_DIR: '/pkg' }, plain: { ENGRAM_PACKAGE_DIR: '/elsewhere' },
+    })).rejects.toThrow(/replace one the bridge sets itself/);
+  });
+});
+
 describe('what a tool inherits', () => {
   it('does not hand the bridge its own credentials', async () => {
     // The bridge's environment holds ENGRAM_TOKEN and AI_BRIDGE_TOKEN, and

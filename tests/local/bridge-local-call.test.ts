@@ -125,7 +125,7 @@ describe('a local_call on a bridge whose operator turned local execution on', ()
       id: 'call_11',
       space_id: 'space_1',
       tool: { name: 'needs-a-secret', command: process.execPath, args: [join(dir, 'tool.js')] },
-      fill: [{ role: 'mailbox', secret_id: 'sec_1' }],
+      fill: [{ role: 'mailbox', item_id: 'item_1', space_id: 'space_1', sealed: [{ field: 'token', secret_id: 'sec_1', space_id: 'space_1' }] }],
       input: {},
     });
 

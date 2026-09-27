@@ -26,13 +26,13 @@ const fetched = vi.mocked(loadSecrets);
 const tool: ToolDefinition = {
   name: 'deploy', description: '', parameters: {}, execute: 'local',
   space_id: 'space_1',
-  secrets: ['api-key'],
-  run: { command: 'sh', args: ['-c', 'printf %s "${#API_KEY}"'] },
+  fill: [{ role: 'deploy', item_id: 'item_1', space_id: 'space_1', sealed: [{ field: 'api_key', secret_id: 'sec_1', space_id: 'space_1' }] }],
+  run: { command: 'sh', args: ['-c', 'printf %s "${#ENGRAM_DEPLOY_API_KEY}"'] },
 };
 
 const held = (value: string): SecretStore => {
   const store = new SecretStore();
-  store.add({ id: 'sec_1', spaceId: 'space_1', name: 'api-key', value });
+  store.add({ id: 'sec_1', spaceId: 'space_1', itemId: 'item_1', field: 'api_key', value });
   return store;
 };
 
@@ -65,7 +65,7 @@ describe('secrets the bridge fetched once', () => {
     // watches the same tool keep failing, and only a restart fixes it.
     const bridge = enrolled();
     fetched.mockResolvedValueOnce(new SecretStore());
-    await expect(run(bridge)).rejects.toThrow(/does not hold a secret named/);
+    await expect(run(bridge)).rejects.toThrow(/cannot be filled/);
 
     fetched.mockResolvedValueOnce(held('granted-value'));
     expect((await run(bridge)).stdout).toBe('13');

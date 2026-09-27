@@ -46,7 +46,7 @@ import { readClaudeUsage } from './providers/usage.js';
 import { ToolResolver } from './tools/resolver.js';
 import { LOCAL_EXECUTION_OFF, refusalReason, runsLocally, type LocalExecutionConfig } from './local/gate.js';
 import { runLocalTool } from './local/executor.js';
-import { fillRoles, grantedTo, loadSecrets, SecretStore, type EngramConfig } from './local/engram.js';
+import { fillRoles, loadSecrets, sealedRefs, SecretStore, type EngramConfig, type SealedRef } from './local/engram.js';
 import { handleLocalCall, stagePackage } from './local/call.js';
 import { SpaceLimiter } from './local/limits.js';
 import type { Identity } from './local/identity.js';
@@ -802,25 +802,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       throw new Error(`local tool "${tool.name}" has no command to run`);
     }
 
-    // Both bindings, resolved in the tool's own space and nowhere else. A tool
-    // that names neither resolves nothing and never asks Engram for anything.
-    const names = tool.secrets ?? [];
+    // Each role's item, as the server resolved it: plain fields as values, and
+    // sealed ones opened here from the space each names. A tool that fills no
+    // role resolves nothing and never asks Engram for anything.
     const fill = tool.fill ?? [];
-    const store = await this.secretsFor(tool.space_id, {
-      names,
-      ids: fill.map((f) => f.secret_id),
-    });
-
-    const granted: Redaction[] = [...grantedTo(store, tool.space_id, tool.secrets)];
-    if (fill.length > 0) {
-      if (!tool.space_id) {
-        throw new Error(
-          `local tool "${tool.name}" fills roles but names no space, so there is no ` +
-          `space to resolve those secret ids in.`,
-        );
-      }
-      granted.push(...fillRoles(store, tool.space_id, fill));
-    }
+    const store = await this.secretsFor(sealedRefs(fill));
+    const filled = fillRoles(store, fill);
+    const granted: Redaction[] = filled.sealed;
 
     const staged = await stagePackage(tool.package, {
       ...(this.localExecution.dataDir ? { dataDir: this.localExecution.dataDir } : {}),
@@ -834,6 +822,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       args: tool.run.args ?? [],
       toolArgs: args,
       secrets: granted,
+      plain: filled.env,
       ...(staged.cwd ? { cwd: staged.cwd } : {}),
       extraEnv: staged.extraEnv,
       sandbox: {
@@ -918,7 +907,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       {
         config: this.localExecution,
         limiter: this.localLimiter,
-        secrets: (spaceId, ids) => this.secretsFor(spaceId, { ids }),
+        secrets: (refs) => this.secretsFor(refs),
         ...(this.localExecution.dataDir ? { dataDir: this.localExecution.dataDir } : {}),
       },
       message,
@@ -959,23 +948,15 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * cache. From here an unreachable Engram and a revoked device look the same,
    * and the one that must not run is the revoked one.
    */
-  private async secretsFor(
-    spaceId: string | undefined,
-    wanted: { names?: string[]; ids?: string[] },
-  ): Promise<SecretStore> {
-    const names = wanted.names ?? [];
-    const ids = wanted.ids ?? [];
-    if (names.length === 0 && ids.length === 0) return new SecretStore();
+  private async secretsFor(refs: SealedRef[]): Promise<SecretStore> {
+    if (refs.length === 0) return new SecretStore();
     if (!this.engram || !this.identity?.deviceId) return this.secrets ?? new SecretStore();
 
     const fresh = this.secrets !== undefined && Date.now() - this.secretsFetchedAt < SECRETS_TTL_MS;
-    // "Complete" is asked space by space, because that is the only question
-    // worth asking: a secret of this name held by some OTHER space does not
-    // make this call resolvable, and treating it as if it did is the bug the
-    // store was rebuilt to remove.
-    const complete = spaceId !== undefined
-      && names.every((name) => this.secrets?.hasName(spaceId, name))
-      && ids.every((id) => this.secrets?.hasId(spaceId, id));
+    // "Complete" is asked value by value, each in the space the call names for
+    // it: a value of that id held under some OTHER space does not make this
+    // call resolvable.
+    const complete = refs.every((r) => this.secrets?.hasId(r.space_id, r.secret_id));
     if (fresh && complete) return this.secrets!;
 
     this.secrets = await loadSecrets(this.engram, this.identity, this.identity.deviceId);
