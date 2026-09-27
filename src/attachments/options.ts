@@ -129,6 +129,9 @@ export interface ResolvedAttachmentSettings {
   limits: AttachmentLimits;
   timeouts: AttachmentTimeouts;
   cache: AttachmentCacheSettings & { dir: string };
+  /** Where the record of files this bridge will hand back lives (attachments/served.ts).
+   *  Scoped like the cache: per installation and server, never shared. */
+  servedFilesPath: string;
 }
 
 /**
@@ -171,5 +174,6 @@ export function resolveAttachmentSettings(
       ttlMs: read('attachmentCacheTtlHours', 'hours', 3_600_000, DEFAULT_ATTACHMENT_CACHE.ttlMs, { zeroAllowed: true }),
       maxBytes: read('attachmentCacheMaxMb', 'megabytes', MB, DEFAULT_ATTACHMENT_CACHE.maxBytes, { zeroAllowed: true }),
     },
+    servedFilesPath: join(attachmentCacheRoot(), '..', 'served-files', `${attachmentCacheScope(serverUrl, installName)}.json`),
   };
 }

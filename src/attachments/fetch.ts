@@ -103,7 +103,7 @@ export interface SavedAttachment {
   size: number;
 }
 
-function humanBytes(bytes: number): string {
+export function humanBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -119,7 +119,7 @@ function humanBytes(bytes: number): string {
  * Built by hand rather than with `AbortSignal.any`, which landed in Node 20.3
  * while this package supports Node 20.0.
  */
-function downloadClock(
+export function downloadClock(
   signal: AbortSignal,
   timeouts: AttachmentTimeouts,
 ): { signal: AbortSignal; progress: () => void; expired: () => string | null; done: () => void } {
@@ -159,7 +159,7 @@ function downloadClock(
   };
 }
 
-function formatDuration(ms: number): string {
+export function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 120_000) return `${Math.round(ms / 1000)}s`;
   return `${Math.round(ms / 60_000)} min`;

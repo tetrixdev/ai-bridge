@@ -220,6 +220,20 @@ It is a cache, and behaves like one:
 
 The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. That tool is offered in `workspace` and `native` only. In `isolated`, Claude reaches server-declared tools plus — on a turn that has attachments — permission to read that turn's attachment directory, and nothing else. Codex and Gemini have no equivalent per-path grant: Codex sits at its own read-only sandbox and Gemini at its own defaults, both of which are broader than that. See the posture table in [PROTOCOL.md](PROTOCOL.md). It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
 
+### Files a person sends straight to this machine
+
+A server can also stream a file somebody picks in its chat composer **through** itself and into this machine, keeping no copy of its own (`upload_offer` in [PROTOCOL.md](PROTOCOL.md#person-uploads)). That file is not an attachment in the sense above: it is the only copy, so it is not a cache entry and it is not deleted when a turn ends. It lands in **`<working folder>/file-uploads/`** — the folder the chat works in, one you allowed with `--allow-dir` — and stays there like anything else you put in that folder. Delete it when you are done with it.
+
+- A bridge started without `--allow-dir` has no folder anybody chose, so it refuses the upload rather than inventing one.
+- The file is written as a hidden `.part` and only given its real name once the SHA-256 the server computed from the browser's bytes matches the one computed here. A cancelled, stalled, oversized or mismatched upload leaves nothing behind.
+- An existing file is never replaced: a second `report.pdf` becomes `report-2.pdf`. The name is reduced to its last path component, so it cannot leave `file-uploads/`, and a `file-uploads` that is a symlink is refused rather than written through.
+- When the bridge creates `file-uploads/` it puts a `.gitignore` (`*`) in it, so files a client sent do not show up in `git status` or get committed by accident. Delete the ignore file if you want them tracked.
+- The per-file cap is `--attachment-max-mb`, the same one reported in `hello`.
+
+### Handing files back
+
+The person can open or download a file that lives on this machine — one they sent into `file-uploads/`, or one the assistant handed back — without the server keeping a copy: the bridge POSTs the bytes to a one-time server URL and the server pipes them to the browser ([`file_read`](PROTOCOL.md#handing-files-back)). The bridge serves **only files it recorded itself, by an id it minted**, never a path the server names, so a compromised server cannot use this to read anything else on the machine. The record lives in `~/.cache/ai-bridge/served-files/`. At serve time the file must still be a regular file (no symlink) of the recorded size, or the person is told it was changed or removed.
+
 ## Local tools
 
 By default every tool call round-trips to the server, and the server runs it.
