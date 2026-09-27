@@ -135,7 +135,9 @@ export function resolveRange(header: string | undefined | null, size: number): R
   if (!m || (m[1] === '' && m[2] === '')) return whole;
   if (m[1] === '') {
     const n = Number(m[2]);
-    if (n === 0) return { status: 416, start: 0, end: -1 };
+    // An empty file has no last N bytes to give, and a 206 with nothing in it
+    // is not a valid answer: RFC 9110 says 416 when no range can be satisfied.
+    if (n === 0 || size === 0) return { status: 416, start: 0, end: -1 };
     return { status: 206, start: Math.max(0, size - n), end: size - 1 };
   }
   const start = Number(m[1]);

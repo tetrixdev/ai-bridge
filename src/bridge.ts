@@ -1061,6 +1061,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.clearReconnectTimer();
     this.toolResolver.cancelAll();
     for (const upload of this.incomingUploads.values()) upload.abort.abort(new Error('the bridge is shutting down'));
+    // A file being handed back streams over its own HTTP request, which would
+    // otherwise keep going after the socket that asked for it is gone.
+    for (const read of this.fileReads.values()) read.abort();
     await this.mcpServer.stop();
 
     // Cancel active requests
@@ -1294,6 +1297,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // An upload cannot be confirmed over a socket that is gone, so its partial
     // file is removed now rather than when a stall timer notices.
     for (const upload of this.incomingUploads.values()) upload.abort.abort(new Error('the connection to the server dropped'));
+    for (const read of this.fileReads.values()) read.abort();
 
     // Abort all active AI requests on unexpected disconnect so their CLI
     // subprocesses are terminated; otherwise the server never receives a done

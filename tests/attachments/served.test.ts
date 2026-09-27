@@ -93,6 +93,8 @@ describe('ranges', () => {
   it('one range is honoured, anything else is the whole file, past the end is 416', () => {
     expect(resolveRange(undefined, 1000)).toEqual({ status: 200, start: 0, end: 999 });
     expect(resolveRange('bytes=100-199', 1000)).toEqual({ status: 206, start: 100, end: 199 });
+    // An empty file has no last N bytes: 416, not an empty 206.
+    expect(resolveRange('bytes=-10', 0)).toEqual({ status: 416, start: 0, end: -1 });
     expect(resolveRange('bytes=900-', 1000)).toEqual({ status: 206, start: 900, end: 999 });
     expect(resolveRange('bytes=-10', 1000)).toEqual({ status: 206, start: 990, end: 999 });
     expect(resolveRange('bytes=0-5000', 1000)).toEqual({ status: 206, start: 0, end: 999 });
