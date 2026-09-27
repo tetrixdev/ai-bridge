@@ -226,6 +226,14 @@ export interface HelloMessage {
    * Omitted by a bridge that predates the field; an older server ignores it.
    */
   attachment_limits?: AttachmentLimitsRef;
+  /**
+   * This bridge accepts `upload_offer`: a file a person picked in a chat,
+   * streamed through the server into `<working folder>/file-uploads/` and not
+   * kept by the server. Absent from a bridge that predates it, and a server
+   * must then refuse the upload rather than keep the file itself. Whether the
+   * machine has a folder at all is `workspaces`, not this.
+   */
+  file_uploads?: true;
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -466,7 +474,8 @@ export type BridgeToServerMessage =
   | StreamChunkMessage
   | StreamEndMessage
   | CancelledMessage
-  | TurnInputAckMessage;
+  | TurnInputAckMessage
+  | UploadDoneMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Bridge Messages
@@ -571,6 +580,41 @@ export interface ServerConfig {
    */
   attachments?: 'server' | 'device';
 }
+
+/**
+ * A person's file is on its way to this machine. The bridge GETs `url` (same
+ * origin rules as attachments), writes it to a hidden partial file in
+ * `<working_dir>/file-uploads/`, and answers with `upload_done`.
+ */
+export interface UploadOfferMessage {
+  type: 'upload_offer';
+  id: string;
+  url: string;
+  working_dir: string;
+  name: string;
+  mime_type?: string;
+  size: number;
+}
+
+/** The server has passed on every byte: what it counted and hashed. */
+export interface UploadSentMessage {
+  type: 'upload_sent';
+  id: string;
+  size: number;
+  sha256: string;
+}
+
+/** Stop receiving `id` and remove whatever arrived. */
+export interface UploadAbortMessage {
+  type: 'upload_abort';
+  id: string;
+  reason?: string;
+}
+
+/** The answer to `upload_offer`, sent exactly once per offer. */
+export type UploadDoneMessage =
+  | { type: 'upload_done'; id: string; ok: true; path: string; name: string; size: number; sha256: string }
+  | { type: 'upload_done'; id: string; ok: false; code: string; error: string };
 
 /** Data payload for `attachment_read` — the server asking for a file this
  *  machine kept. `id` names the TRANSFER, not the file. */
@@ -904,6 +948,9 @@ export type ServerToBridgeMessage =
   | LocalCallMessage
   | UsageRequestMessage
   | AttachmentReadMessage
+  | UploadOfferMessage
+  | UploadSentMessage
+  | UploadAbortMessage
   | StreamCancelMessage
   | CancelMessage
   | TurnInputMessage;

@@ -12,6 +12,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Local Calls](#local-calls)
 - [Subscription Usage](#subscription-usage)
 - [AI Requests](#ai-requests)
+- [Person uploads](#person-uploads)
 - [Conversation Continuity](#conversation-continuity)
 - [Streaming Events](#streaming-events)
 - [Tool Calls](#tool-calls)
@@ -230,6 +231,16 @@ The caps this bridge will enforce on [`attachments`](#additive-field-attachments
 | `max_count` | Most attachments one `ai_request` may carry (`--attachment-max-count`, default 50) |
 
 Bytes rather than megabytes, so neither side rounds. A turn over any of them is refused with `attachment_too_large` exactly as before; the field only lets the server know in advance. A bridge that predates the field omits it, and the server should then assume nothing — in particular not today's defaults, which an operator may have changed. An older server ignores it.
+
+#### Additive field: `file_uploads`
+
+```json
+{ "type": "hello", "...": "...", "file_uploads": true }
+```
+
+This bridge understands [`upload_offer`](#person-uploads): a file a person picked in the server's chat, streamed through the server into `<working folder>/file-uploads/` on this machine and not kept by the server. Advertised whatever the allow-list says — whether the machine has a folder at all is `workspaces`, and a bridge with none refuses every offer with `upload_refused`.
+
+A bridge that predates it omits the field. A server that no longer stores uploads itself **must refuse** the upload for such a bridge, saying the bridge needs updating, rather than quietly falling back to holding the file. An older server ignores the field.
 
 ### Bridge → Server: `providers_update`
 
@@ -955,6 +966,95 @@ A `reason` the server does not know is to be treated like `turn_ending`: hold th
 Nothing promises the assistant will change course. A message is read **after the step the assistant is in**: straight away when it is idle (for example while only background tasks run), otherwise when its current tool call returns — captured on 2.1.280, a message sent 15 s into a 40 s foreground command was read when the command finished, and then answered.
 
 ---
+
+## Person uploads
+
+A file somebody picks in the server's chat composer, sent to this machine **at the moment it is picked** and not kept by the server. The server is a pipe: the browser's upload body is streamed into an HTTP response the bridge is reading, and nothing is written to the server's disk. So the machine has to be connected when the file is picked, and the file then exists on exactly one machine.
+
+The bytes do not travel over the WebSocket, for the reasons given under [`attachments`](#additive-field-attachments). The socket carries three small frames from the server and one answer; the bytes come over one authenticated HTTP GET.
+
+```
+browser ──POST (body)──▶ server ──upload_offer──▶ bridge
+                          server ◀──GET url────── bridge      (Bearer token, same origin rules as attachments)
+         body bytes ────▶ server ──response body─▶ bridge     (piped, hashed and counted on the way through)
+                          server ──upload_sent──▶ bridge      (size + sha256 of what passed)
+                          server ◀─upload_done─── bridge      (committed path, or a refusal)
+browser ◀──JSON────────── server
+```
+
+### Server → Bridge: `upload_offer`
+
+```json
+{
+  "type": "upload_offer",
+  "id": "5f1c…",
+  "url": "https://studio.example.com/ai-bridge/uploads/5f1c…",
+  "working_dir": "/Users/jasper/zp-studio/ZeroPlex_Studio__D09042",
+  "name": "contract.pdf",
+  "mime_type": "application/pdf",
+  "size": 482113
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | Names this upload. Unguessable; the URL is single-use. |
+| `url` | Where to GET the bytes. Checked exactly as an attachment URL: same origin as the connection (or `--api`), HTTPS unless loopback, redirects not followed. Otherwise `upload_refused`. |
+| `working_dir` | The chat's working folder. Checked by the same rules as `ai_request.working_dir`, with the same refusal codes (`working_dir_not_allowed`, `working_dir_not_found`). |
+| `name` | Reduced to one safe path component, as attachment names are. |
+| `size` | Exact byte count. More is cut off, fewer is a failure. Over `--attachment-max-mb` is `upload_too_large`, before anything is fetched. |
+
+The bridge:
+
+1. Refuses with `upload_refused` when it has no allowed folder.
+2. Creates `<working_dir>/file-uploads/` if it is missing (with a `.gitignore` of `*` inside, on creation only), and refuses if it is a symlink or not a directory.
+3. Opens a hidden `.<id>.part` exclusively, GETs `url` with `Authorization: Bearer <token>`, and writes, counts and hashes what arrives. The stall and ceiling clocks are the attachment ones (`--attachment-stall-seconds`, `--attachment-timeout-minutes`).
+4. Waits (up to 60 s after its body ended) for `upload_sent`, and requires its `size`, the declared `size` and the bytes received to agree and its `sha256` to match the digest computed here. Otherwise `upload_failed`.
+5. Gives the file its real name with an operation that cannot replace an existing file (`link`, falling back to an exclusive copy); a name that is taken is numbered (`report-2.pdf`).
+6. Removes the `.part` on every path.
+
+### Server → Bridge: `upload_sent`
+
+```json
+{ "type": "upload_sent", "id": "5f1c…", "size": 482113, "sha256": "9f3c…" }
+```
+
+Sent when the last byte has passed through the server. May overtake the end of the HTTP body; the bridge waits for both.
+
+### Server → Bridge: `upload_abort`
+
+```json
+{ "type": "upload_abort", "id": "5f1c…", "reason": "the person removed the file" }
+```
+
+The browser went away, the server gave up, or anything else ended the upload early. The bridge stops, deletes the partial file and still answers with `upload_done` (`upload_cancelled`). A bridge also abandons every upload in progress when its socket drops.
+
+### Bridge → Server: `upload_done`
+
+Exactly one per offer, on every path.
+
+```json
+{ "type": "upload_done", "id": "5f1c…", "ok": true,
+  "path": "/Users/jasper/zp-studio/ZeroPlex_Studio__D09042/file-uploads/contract.pdf",
+  "name": "contract.pdf", "size": 482113, "sha256": "9f3c…" }
+```
+
+```json
+{ "type": "upload_done", "id": "5f1c…", "ok": false, "code": "upload_too_large",
+  "error": "\"holiday.mov\" is 3.1 GB, over this machine's 25.0 MB per-file limit." }
+```
+
+| `code` | Meaning |
+|---|---|
+| `upload_refused` | No allowed folder, a URL on another host, or a `file-uploads` that is not a plain folder. |
+| `working_dir_not_allowed` / `working_dir_not_found` | As for `ai_request.working_dir`. |
+| `upload_too_large` | Declared size over `--attachment-max-mb`. |
+| `upload_failed` | The download failed or stalled, the sizes or digests disagree, or the file could not be written. |
+| `upload_cancelled` | `upload_abort`, or the socket dropped. |
+
+`error` is written for a person and may be shown as it is.
+
+**What this is not.** The file is not referenced by later `ai_request`s as an attachment, and the bridge does not fetch it again or cache it: it is already where the chat works. A server tells the model about it in the message text, by the `path` it was given.
 
 ## Conversation Continuity
 
@@ -1798,6 +1898,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `stream` (user_input) | The assistant took in a `turn_input` message |
 | `stream` (main_state) | The main assistant became working or idle (input-open turns) |
 | `turn_input_ack` | Answering a `turn_input`, accepted or rejected |
+| `upload_done` | Answering an `upload_offer`: where the file is, or why not |
 | `stream` (done) | Response complete |
 | `stream` (error) | Error during streaming |
 | `tool_call` | CLI invoked a server-side tool (via callback) |
@@ -1817,6 +1918,9 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `tool_resolve` | Returning tool execution result |
 | `tool_error` | Tool execution failed |
 | `local_call` | Asking the bridge to run one tool on this machine |
+| `upload_offer` | A person's file is coming: fetch it into `file-uploads/` |
+| `upload_sent` | Every byte of an upload has passed through; its size and digest |
+| `upload_abort` | Stop receiving an upload and remove what arrived |
 
 ---
 
@@ -1862,6 +1966,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 - `1.x` — Stable, semantic versioning applies
 
 **Helper activity does not bump the version either.** `parent_tool_use_id` on `block_start` and `tool_result`, the `task` stream event and `done.subagent_stats` are additive: absent means what it always meant, and a consumer ignores an event it does not know.
+
+**Person uploads do not bump the version.** `hello.file_uploads` and the four `upload_*` frames are additive; a server must not send `upload_offer` to a bridge that did not advertise `file_uploads`.
 
 **Workspaces, attachments and `workspace` isolation do not bump the version.** They stay on `0.1`, deliberately. Every one of them is optional in both directions — `hello.workspaces`, `ai_request.working_dir`, `ai_request.attachments`, the `attachment` stream event and the `workspace` value of `cli_isolation` are all additive, and both ends already ignore fields they do not recognise. Only the major number is enforced, so a bump would refuse every bridge already installed in exchange for nothing.
 

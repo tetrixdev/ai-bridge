@@ -81,6 +81,7 @@ import {
   type UploadContext,
 } from './attachments/upload.js';
 import { resolveApiOrigin } from './attachments/origin.js';
+import { receiveUpload, type UploadOffer, type UploadSent } from './attachments/receive.js';
 import { createLogger } from './utils/logger.js';
 import { clampRequestTimeout, clampSilenceTimeout, clampHeartbeat, toSeconds } from './utils/clamp.js';
 import { FatalBridgeError, RequestRefusal } from './errors.js';
@@ -384,6 +385,16 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private sessionId: string | null = null;
   /** Files going out right now, so a cancel can stop one. */
   private readonly transfers = new Map<string, () => void>();
+  /**
+   * Person uploads arriving right now, by upload id: how to stop one, and the
+   * server's `upload_sent` it is waiting for. The waiter is made when the offer
+   * arrives rather than when the download finishes, because that frame can
+   * overtake the last bytes of the HTTP body.
+   */
+  private readonly incomingUploads = new Map<string, {
+    abort: AbortController;
+    sent: (value: UploadSent) => void;
+  }>();
 
   /**
    * When each running turn's wall clock runs out, by request id (ms epoch).
@@ -676,6 +687,43 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
   }
 
+  /**
+   * A person's file, on its way into this machine's working folder.
+   *
+   * Answered with exactly one `upload_done`, on every path: the server holds
+   * the person's browser request open until it hears, so silence here is a
+   * spinner on somebody's screen. See attachments/receive.ts for the rules.
+   */
+  private async handleUploadOffer(message: UploadOffer & { type: 'upload_offer' }): Promise<void> {
+    const id = typeof message.id === 'string' ? message.id : '';
+    if (!id || this.incomingUploads.has(id)) return;
+    const abort = new AbortController();
+    let sent!: (value: UploadSent) => void;
+    const sentPromise = new Promise<UploadSent>((resolve) => { sent = resolve; });
+    this.incomingUploads.set(id, { abort, sent });
+    try {
+      const got = await receiveUpload({
+        offer: message,
+        allowedRoots: this.allowedRootPaths,
+        token: () => this.token,
+        expectedOrigin: this.apiOrigin,
+        maxFileBytes: this.attachmentLimits.maxFileBytes,
+        timeouts: this.attachmentTimeouts,
+        sent: sentPromise,
+        signal: abort.signal,
+      });
+      log.info('Upload received', { id, path: got.path, size: got.size });
+      this.send({ type: 'upload_done', id, ok: true, ...got });
+    } catch (error) {
+      const code = error instanceof RequestRefusal ? error.code : 'upload_failed';
+      const text = error instanceof Error ? error.message : String(error);
+      log.warn('Upload not received', { id, code, error: text });
+      this.send({ type: 'upload_done', id, ok: false, code, error: text });
+    } finally {
+      this.incomingUploads.delete(id);
+    }
+  }
+
   /** The reader went away. Stop reading: otherwise this machine works through a
    *  file for somebody who closed the tab. */
   private cancelTransfer(id: string): void {
@@ -958,6 +1006,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.stopHeartbeat();
     this.clearReconnectTimer();
     this.toolResolver.cancelAll();
+    for (const upload of this.incomingUploads.values()) upload.abort.abort(new Error('the bridge is shutting down'));
     await this.mcpServer.stop();
 
     // Cancel active requests
@@ -1055,6 +1104,15 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         break;
       case 'stream_cancel':
         this.cancelTransfer((message as unknown as { id: string }).id);
+        break;
+      case 'upload_offer':
+        void this.handleUploadOffer(message);
+        break;
+      case 'upload_sent':
+        this.incomingUploads.get(message.id)?.sent({ size: message.size, sha256: String(message.sha256 ?? '') });
+        break;
+      case 'upload_abort':
+        this.incomingUploads.get(message.id)?.abort.abort(new Error(message.reason ?? 'the server stopped the upload'));
         break;
       case 'cancel':
         this.cancelRequest((message as unknown as { request_id: string }).request_id);
@@ -1173,6 +1231,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // in-flight tool calls instead of letting them stall.
     this.toolResolver.cancelAll();
 
+    // An upload cannot be confirmed over a socket that is gone, so its partial
+    // file is removed now rather than when a stall timer notices.
+    for (const upload of this.incomingUploads.values()) upload.abort.abort(new Error('the connection to the server dropped'));
+
     // Abort all active AI requests on unexpected disconnect so their CLI
     // subprocesses are terminated; otherwise the server never receives a done
     // event and the conversation slot stays blocked until its timeout fires.
@@ -1239,6 +1301,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // Messages for a running turn are understood. Per turn, the ack's
       // `input_open` is still what says a turn takes them.
       turn_input: true,
+      // Person uploads stream straight into the working folder. Advertised
+      // whatever the allow-list says: `workspaces` is what tells the server
+      // whether there is a folder, and this is only whether the frames are
+      // understood.
+      file_uploads: true,
       // Advertise the operator's allow-list so the server can offer a picker
       // rather than asking a developer to type an absolute path into a chat
       // box. Omitted entirely when empty: "no workspaces" and "this bridge
