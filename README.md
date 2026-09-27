@@ -398,6 +398,31 @@ writing the value to a file. A tool you approved can always use a secret it was
 given; what redaction buys is that the value stays out of a transcript that gets
 logged, cached and stored elsewhere.
 
+## App backends
+
+With `--local-tools`, this bridge also runs the backends of Engram apps: code
+an agent wrote into an app, run on YOUR machine because it uses your logins and
+your files. Engram asks you once per version of an app, showing what its
+manifest lets it use (endpoints, your data, folders, programs, hosts, vault
+roles), before the bridge is ever asked to run it.
+
+- **One process per app version**, started on the first request, stopped after
+  10 minutes idle or when the bridge stops, started again by the next request
+  after a crash (and not for 30 seconds after three crashes in a minute).
+- **Its files** are fetched from Engram by content hash, checked, and cached in
+  `<local data dir>/apps/` (`~/.ai-bridge/apps` by default).
+- **What confines it:** Node's permission model. It reads its own files and the
+  folders its manifest lists, writes only where the manifest says, and starts
+  other programs only if the manifest says it runs a shell or programs, and a
+  program it starts is NOT confined. The network is not confined at all (Node
+  22 cannot); the hosts it declares are shown to you, not enforced.
+- **Vault values** reach it as `ENGRAM_<ROLE>_<FIELD>`, like local tools, and
+  are scrubbed from what it answers.
+
+It talks to the bridge over stdin and stdout, one JSON line per request and
+per response, so nothing listens on your machine. See PROTOCOL.md "App
+backends".
+
 ## Supported Providers
 
 | Provider | CLI Binary | Session Resume | Streaming | Thinking | Server Tools |

@@ -10,6 +10,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Connection](#connection)
 - [Handshake](#handshake)
 - [Local Calls](#local-calls)
+- [App backends](#app-backends)
 - [Subscription Usage](#subscription-usage)
 - [AI Requests](#ai-requests)
 - [Person uploads](#person-uploads)
@@ -250,6 +251,14 @@ A bridge that predates it omits the field. A server that no longer stores upload
 ```
 
 This bridge answers [`file_read`](#handing-files-back): it hands back a file it recorded itself, by the id it minted, and it refuses the older path-based `attachment_read`. A bridge without it cannot be asked for a file at all; a server says so ("update the bridge") rather than falling back to asking by path.
+
+#### Additive field: `app_backends`
+
+```json
+{ "type": "hello", "...": "...", "app_backends": true }
+```
+
+This bridge understands [`app_call`](#app-backends). Sent whatever `--local-tools` says, like the flags above: it says the frame is understood, and a bridge that did not opt in answers every `app_call` with a refusal. A server must not send `app_call` to a bridge that did not advertise it; it would be logged as an unknown frame and never answered.
 
 ### Bridge → Server: `providers_update`
 
@@ -625,6 +634,45 @@ Per space: at most **2** local calls in flight, and starts spaced at least
 delay. A caller that sees this is usually re-rendering or retrying in a loop.
 
 ---
+
+## App backends
+
+An Engram app may have a backend: code in the app's versioned files, run on the machine of the person using the app, as a long-running process this bridge supervises (Engram `docs/22-apps`). Behind the same gate as local tools: without `--local-tools` every `app_call` is refused. Whether the person approved this version, and whether the endpoint is one the app declares, is the server's to check before it sends the frame.
+
+### Server → Bridge: `app_call`
+
+```json
+{
+  "type": "app_call",
+  "id": "4c0e…",
+  "app": { "space_id": "…", "name": "todo", "version": 4, "hash": "<sha256 of the version>" },
+  "files": { "base": "https://engram.example/app-blobs/<token>/", "tree": { "server.js": "<sha256>", "engram.json": "<sha256>" } },
+  "backend": { "main": "server.js", "folders": [{ "path": "~/Documents/x", "write": false }], "shell": false, "programs": [], "network": false },
+  "fill": [ { "role": "mailbox", "item_id": "…", "space_id": "…", "fields": { "tenant_id": "…" }, "sealed": [{ "field": "client_secret", "secret_id": "…", "space_id": "…" }] } ],
+  "request": { "method": "POST", "path": "/todos", "headers": { "content-type": "application/json" }, "body": "{\"label\":\"milk\"}" },
+  "engram": { "api": "https://engram.example/app-api", "token": "<5-minute token for this request>" }
+}
+```
+
+What the bridge does with it (`src/apps/supervisor.ts`):
+
+1. **Working copy.** Keyed on `app.hash`. Each file is fetched as `files.base + sha256`, checked against that hash, and cached by hash under `<local data dir>/apps/blobs/`, so a file unchanged across versions is fetched once. The copy is built beside its final folder and renamed into place. `files.base` and `engram.api` must be on the origin of the server this bridge is connected to (or `--api`), https unless loopback; a path in `tree` is plain segments, never `..`.
+2. **The process.** One per app version on this machine: `node --permission --allow-fs-read=<copy> [--allow-fs-read=<folder>] [--allow-fs-write=<folder with write>] [--allow-child-process when shell or programs] <copy>/<main>`, cwd the copy. Its environment is the same short allowlist local tools get (never the bridge's tokens), the vault roles as `ENGRAM_<ROLE>_<FIELD>` exactly as for [`local_call`](#local-calls), and `ENGRAM_APP_DIR`, `ENGRAM_APP_NAME`, `ENGRAM_APP_VERSION`. A different item chosen for a role restarts the process.
+3. **Lifetime.** Started by the first request, kept while used, stopped after 10 minutes with no request, stopped with the bridge. A crash fails the requests in flight with the exit status and the tail of its stderr; the next request starts a fresh process. Three crashes within a minute refuse starts for 30 seconds.
+4. **The request.** One JSON line on the process's stdin: `{ "id", "method", "path", "headers", "body", "engram": { "api", "token" } }`. The process answers with one JSON line on stdout: `{ "id", "status", "headers", "body" }` (body a string, at most 256 KB). Requests may overlap; ids match them. A stdout line that is not a response is ignored (logs belong on stderr). No answer in 55 seconds fails the request, not the process.
+
+JSON lines over a pipe rather than a local port or socket, because nothing listens: a localhost port is reachable by every program and user on the machine, and by web pages through DNS rebinding, so it would need an authentication story of its own; a pipe belongs to the one process that was handed it.
+
+### Bridge → Server: `app_result`
+
+```json
+{ "type": "app_result", "id": "4c0e…", "ok": true, "response": { "status": 200, "headers": { "content-type": "application/json" }, "body": "[…]" } }
+{ "type": "app_result", "id": "4c0e…", "ok": false, "error": "the backend of \"todo\" stopped before answering: it exited 3. …" }
+```
+
+Exactly one per `app_call`, whatever happens. Every sealed value the process was given is scrubbed from the body, the header values and the error, as for local tools: hygiene, not containment.
+
+**Node only, and what is not confined.** The permission model covers the filesystem and child processes, not the network (Node 22), so `network` is recorded, not enforced; and a child process runs outside the model, so `shell`/`programs` is where the fence ends. Engram's approval prompt says both.
 
 ## Subscription Usage
 
@@ -2082,6 +2130,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Helper activity does not bump the version either.** `parent_tool_use_id` on `block_start` and `tool_result`, the `task` stream event and `done.subagent_stats` are additive: absent means what it always meant, and a consumer ignores an event it does not know.
 
 **Person uploads and handing files back do not bump the version.** `hello.file_uploads`, `hello.file_downloads`, the four `upload_*` frames and the three `file_read*` frames are additive; a server must not send `upload_offer` to a bridge that did not advertise `file_uploads`.
+
+**App backends do not bump the version.** `hello.app_backends`, `app_call` and `app_result` are additive; a server must not send `app_call` to a bridge that did not advertise `app_backends`.
 
 **Workspaces, attachments and `workspace` isolation do not bump the version.** They stay on `0.1`, deliberately. Every one of them is optional in both directions — `hello.workspaces`, `ai_request.working_dir`, `ai_request.attachments`, the `attachment` stream event and the `workspace` value of `cli_isolation` are all additive, and both ends already ignore fields they do not recognise. Only the major number is enforced, so a bump would refuse every bridge already installed in exchange for nothing.
 
