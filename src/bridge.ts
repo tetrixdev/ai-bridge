@@ -80,7 +80,9 @@ import {
   uploadAttachment,
   type UploadContext,
 } from './attachments/upload.js';
-import { resolveApiOrigin } from './attachments/origin.js';
+import { assertAllowedAttachmentUrl, resolveApiOrigin } from './attachments/origin.js';
+import { FileReadRefusal, openRecorded, resolveRange, ServedFiles } from './attachments/served.js';
+import { Readable } from 'node:stream';
 import { receiveUpload, type UploadOffer, type UploadSent } from './attachments/receive.js';
 import { createLogger } from './utils/logger.js';
 import { clampRequestTimeout, clampSilenceTimeout, clampHeartbeat, toSeconds } from './utils/clamp.js';
@@ -153,6 +155,12 @@ export interface BridgeOptions {
    * temp paths from the suite.
    */
   sessionStorePath?: string | null;
+  /**
+   * Where the record of files this bridge will hand back is persisted (see
+   * attachments/served.ts). Absent or `null` keeps it in memory only, which is
+   * what tests want; the CLI always sets it, per installation and server.
+   */
+  servedFilesPath?: string | null;
   /**
    * Permit the server to select `native` isolation.
    *
@@ -391,6 +399,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * arrives rather than when the download finishes, because that frame can
    * overtake the last bytes of the HTTP body.
    */
+  /** The files this bridge will hand back, by the id it minted. */
+  private readonly servedFiles: ServedFiles;
+  /** Files going to the server right now, by transfer id, so a cancel can stop one. */
+  private readonly fileReads = new Map<string, AbortController>();
   private readonly incomingUploads = new Map<string, {
     abort: AbortController;
     sent: (value: UploadSent) => void;
@@ -500,6 +512,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       ? new AttachmentCache(options.attachmentCache.dir, options.attachmentCache)
       : AttachmentCache.disabled();
     this.keepAttachments = options.keepAttachments ?? false;
+    this.servedFiles = new ServedFiles(options.servedFilesPath ?? null);
     this.allowNative = options.allowNative ?? false;
     this.sessionWorkingDirs = new SessionWorkingDirs(
       undefined,
@@ -615,6 +628,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         mime_type: mimeTypeFor(path),
         size: stat.size,
         path,
+        // What the server asks for it by. The path above is for showing.
+        file_id: this.servedFiles.record(path, stat.size, 'handed_back'),
         ...(description ? { description } : {}),
       });
 
@@ -655,35 +670,71 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * clicked that whole window before their download gives up.
    */
   private async handleAttachmentRead(message: { id: string; path: string }): Promise<void> {
+    // Refused, always. This frame named a PATH, and a server that can name a
+    // path can name ~/.ssh: the working-directory check narrowed that, it did
+    // not close it. Files are handed back by `file_read` now, by an id this
+    // bridge minted when it recorded the file (attachments/served.ts).
+    this.send({
+      type: 'stream_end',
+      id: message.id,
+      error: 'This bridge hands files back only by the id it recorded them under (file_read), never by path. '
+        + 'The server needs updating.',
+    });
+  }
+
+  /**
+   * Hand a recorded file to the server, which pipes it to the person's browser.
+   *
+   * Answered first with `file_read_result` -- found and unchanged (with the
+   * size and the range that will be sent) or refused with a sentence -- and
+   * then, unless it was a HEAD or an empty range, the bytes are POSTed to the
+   * one-time URL on the connected origin. Never over the socket.
+   */
+  private async handleFileRead(message: {
+    id: string; file_id: string; url: string; range?: string; head?: boolean;
+  }): Promise<void> {
     const { id } = message;
+    if (typeof id !== 'string' || !id || this.fileReads.has(id)) return;
+    const abort = new AbortController();
+    this.fileReads.set(id, abort);
+    let answered = false;
     try {
-      // Any turn's context will do for the guard: the working directory is the
-      // machine's, not the request's. Without one there is nothing to resolve
-      // against and refusing is the only safe answer.
-      const ctx = [...this.uploadContexts.values()][0];
-      if (!ctx) throw new Error('no working directory is established on this machine');
-
-      const path = resolveUploadPath(message.path, ctx);
-      const stream = createReadStream(path, { highWaterMark: 64 * 1024 });
-      this.transfers.set(id, () => stream.destroy());
-
-      for await (const chunk of stream) {
-        // Stopped while we were reading. Silence is not enough: the loop would
-        // run to the end of the file first.
-        if (!this.transfers.has(id)) return;
-        this.send({ type: 'stream_chunk', id, data: (chunk as Buffer).toString('base64') });
+      let url: URL;
+      try {
+        url = assertAllowedAttachmentUrl(message.url, this.apiOrigin);
+      } catch (err) {
+        throw new FileReadRefusal('file_refused', err instanceof Error ? err.message : String(err));
       }
-      this.send({ type: 'stream_end', id });
+      const { handle, file } = await openRecorded(this.servedFiles, message.file_id);
+      try {
+        const r = resolveRange(message.range, file.size);
+        this.send({ type: 'file_read_result', id, ok: true, size: file.size, status: r.status, start: r.start, end: r.end });
+        answered = true;
+        if (message.head || r.status === 416 || r.end < r.start) return;
+        const body = Readable.toWeb(handle.createReadStream({ start: r.start, end: r.end, autoClose: false }));
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/octet-stream' },
+          body: body as unknown as ReadableStream<Uint8Array>,
+          duplex: 'half',
+          redirect: 'error',
+          signal: abort.signal,
+        } as RequestInit);
+        if (!res.ok) log.warn('The server did not take a file being handed back', { id, status: res.status });
+        await res.body?.cancel().catch(() => undefined);
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
     } catch (error) {
-      // The message reaches a person: it is shown where their download should
-      // have been, so "ENOENT" alone would be no use to them.
-      this.send({
-        type: 'stream_end',
-        id,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      const text = error instanceof Error ? error.message : String(error);
+      if (!answered) {
+        const code = error instanceof FileReadRefusal ? error.code : 'file_failed';
+        this.send({ type: 'file_read_result', id, ok: false, code, error: text });
+      } else if (!abort.signal.aborted) {
+        log.warn('Handing a file back failed part way', { id, error: text });
+      }
     } finally {
-      this.transfers.delete(id);
+      this.fileReads.delete(id);
     }
   }
 
@@ -712,8 +763,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         sent: sentPromise,
         signal: abort.signal,
       });
+      // Recorded, so the person can fetch it back later by this id -- and only
+      // by this id: see attachments/served.ts.
+      const fileId = this.servedFiles.record(got.path, got.size, 'upload');
       log.info('Upload received', { id, path: got.path, size: got.size });
-      this.send({ type: 'upload_done', id, ok: true, ...got });
+      this.send({ type: 'upload_done', id, ok: true, ...got, file_id: fileId });
     } catch (error) {
       const code = error instanceof RequestRefusal ? error.code : 'upload_failed';
       const text = error instanceof Error ? error.message : String(error);
@@ -1105,6 +1159,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       case 'stream_cancel':
         this.cancelTransfer((message as unknown as { id: string }).id);
         break;
+      case 'file_read':
+        void this.handleFileRead(message);
+        break;
+      case 'file_read_cancel':
+        this.fileReads.get(message.id)?.abort();
+        break;
       case 'upload_offer':
         void this.handleUploadOffer(message);
         break;
@@ -1306,6 +1366,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // whether there is a folder, and this is only whether the frames are
       // understood.
       file_uploads: true,
+      // Recorded files are handed back by id (`file_read`), never by path.
+      file_downloads: true,
       // Advertise the operator's allow-list so the server can offer a picker
       // rather than asking a developer to type an absolute path into a chat
       // box. Omitted entirely when empty: "no workspaces" and "this bridge

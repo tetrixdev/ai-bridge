@@ -234,6 +234,13 @@ export interface HelloMessage {
    * machine has a folder at all is `workspaces`, not this.
    */
   file_uploads?: true;
+  /**
+   * This bridge answers `file_read`: a file it recorded itself (received into
+   * file-uploads/, or handed back by the assistant), fetched by the id it
+   * minted and POSTed to a one-time server URL. It no longer serves
+   * `attachment_read`, which named a path.
+   */
+  file_downloads?: true;
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -475,7 +482,8 @@ export type BridgeToServerMessage =
   | StreamEndMessage
   | CancelledMessage
   | TurnInputAckMessage
-  | UploadDoneMessage;
+  | UploadDoneMessage
+  | FileReadResultMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Bridge Messages
@@ -611,10 +619,35 @@ export interface UploadAbortMessage {
   reason?: string;
 }
 
-/** The answer to `upload_offer`, sent exactly once per offer. */
+/** The answer to `upload_offer`, sent exactly once per offer. `file_id` is
+ *  what the server asks for the file by later (`file_read`). */
 export type UploadDoneMessage =
-  | { type: 'upload_done'; id: string; ok: true; path: string; name: string; size: number; sha256: string }
+  | { type: 'upload_done'; id: string; ok: true; path: string; name: string; size: number; sha256: string; file_id: string }
   | { type: 'upload_done'; id: string; ok: false; code: string; error: string };
+
+/** The server asking for a recorded file, to pipe to a browser. */
+export interface FileReadMessage {
+  type: 'file_read';
+  /** Names the TRANSFER. */
+  id: string;
+  /** The id this bridge minted when it recorded the file. Never a path. */
+  file_id: string;
+  /** One-time URL on the connected origin to POST the bytes to. */
+  url: string;
+  /** The browser's `Range` header, passed through. */
+  range?: string;
+  /** Only say whether it is there and how big; send no bytes. */
+  head?: boolean;
+}
+
+export interface FileReadCancelMessage {
+  type: 'file_read_cancel';
+  id: string;
+}
+
+export type FileReadResultMessage =
+  | { type: 'file_read_result'; id: string; ok: true; size: number; status: 200 | 206 | 416; start: number; end: number }
+  | { type: 'file_read_result'; id: string; ok: false; code: string; error: string };
 
 /** Data payload for `attachment_read` — the server asking for a file this
  *  machine kept. `id` names the TRANSFER, not the file. */
@@ -951,6 +984,8 @@ export type ServerToBridgeMessage =
   | UploadOfferMessage
   | UploadSentMessage
   | UploadAbortMessage
+  | FileReadMessage
+  | FileReadCancelMessage
   | StreamCancelMessage
   | CancelMessage
   | TurnInputMessage;
@@ -1179,11 +1214,12 @@ export interface AttachmentEventData {
    * Where the file is on this machine, when it stayed here.
    *
    * Present only in `device` mode, and it is what tells the server the bytes
-   * have not been sent. It comes back later in an `attachment_read`, and is
-   * re-resolved against the working directory then: it left this machine, so
-   * it is input on the way back however it started.
+   * have not been sent. For showing only: the server asks for the file back
+   * by `file_id`, never by this path.
    */
   path?: string;
+  /** The id this bridge recorded the file under, for `file_read`. `device` mode only. */
+  file_id?: string;
   /** Whatever the model said the file is, when it said anything. */
   description?: string;
 }

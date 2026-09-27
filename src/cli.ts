@@ -48,6 +48,7 @@ export interface OperatorPosture {
   attachmentCache: ResolvedAttachmentSettings['cache'];
   allowNative: boolean;
   keepAttachments: boolean;
+  servedFilesPath: string;
 }
 
 /** Just the option fields this mapping reads. */
@@ -88,6 +89,7 @@ export function resolveOperatorPosture(
     attachmentCache: attachments.cache,
     allowNative: opts.allowNative,
     keepAttachments: opts.keepAttachments,
+    servedFilesPath: attachments.servedFilesPath,
   };
 }
 
@@ -440,6 +442,7 @@ program
       attachmentTimeouts: operatorPosture.attachmentTimeouts,
       attachmentCache: operatorPosture.attachmentCache,
       keepAttachments: operatorPosture.keepAttachments,
+      servedFilesPath: operatorPosture.servedFilesPath,
       allowNative: operatorPosture.allowNative,
     });
 

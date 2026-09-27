@@ -98,6 +98,7 @@ afterEach(async () => {
 async function runTurn(
   duringTurn: (requestId: string) => Promise<void>,
   isolation: 'workspace' | 'isolated' = 'workspace',
+  attachments?: 'device',
 ): Promise<string> {
   const adapter = new DuringTurnAdapter(duringTurn);
   bridge = new Bridge({
@@ -117,7 +118,7 @@ async function runTurn(
     type: 'welcome',
     session_id: 'conn-1',
     tools: [],
-    config: { heartbeat_interval: 30, request_timeout: 30 },
+    config: { heartbeat_interval: 30, request_timeout: 30, ...(attachments ? { attachments } : {}) },
     cli_isolation: isolation,
   } satisfies Partial<WelcomeMessage> as unknown as WelcomeMessage));
   await new Promise((r) => setTimeout(r, 50));
@@ -256,5 +257,20 @@ describe('the model sending a file back', () => {
       await attachFile(id, {}).catch((e: Error) => { error = e.message; });
     });
     expect(error).toContain('path is required');
+  });
+});
+
+describe('a file kept on this machine', () => {
+  it('is announced with a path to show and an id to ask for it by, and nothing is uploaded', async () => {
+    const requestId = await runTurn(async (id) => {
+      await attachFile(id, { path: join(checkout, 'report.md') });
+    }, 'workspace', 'device');
+    const event = frames.find((f) => f['type'] === 'stream' && f['request_id'] === requestId && f['event'] === 'attachment');
+    const data = event?.['data'] as Record<string, unknown>;
+    expect(data['path']).toBe(join(checkout, 'report.md'));
+    expect(typeof data['file_id']).toBe('string');
+    expect(uploads).toEqual([]);
+    const served = (bridge as unknown as { servedFiles: { get(id: string): unknown } }).servedFiles;
+    expect(served.get(String(data['file_id']))).toMatchObject({ path: join(checkout, 'report.md'), source: 'handed_back' });
   });
 });

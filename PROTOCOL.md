@@ -13,6 +13,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Subscription Usage](#subscription-usage)
 - [AI Requests](#ai-requests)
 - [Person uploads](#person-uploads)
+- [Handing files back](#handing-files-back)
 - [Conversation Continuity](#conversation-continuity)
 - [Streaming Events](#streaming-events)
 - [Tool Calls](#tool-calls)
@@ -241,6 +242,14 @@ Bytes rather than megabytes, so neither side rounds. A turn over any of them is 
 This bridge understands [`upload_offer`](#person-uploads): a file a person picked in the server's chat, streamed through the server into `<working folder>/file-uploads/` on this machine and not kept by the server. Advertised whatever the allow-list says — whether the machine has a folder at all is `workspaces`, and a bridge with none refuses every offer with `upload_refused`.
 
 A bridge that predates it omits the field. A server that no longer stores uploads itself **must refuse** the upload for such a bridge, saying the bridge needs updating, rather than quietly falling back to holding the file. An older server ignores the field.
+
+#### Additive field: `file_downloads`
+
+```json
+{ "type": "hello", "...": "...", "file_downloads": true }
+```
+
+This bridge answers [`file_read`](#handing-files-back): it hands back a file it recorded itself, by the id it minted, and it refuses the older path-based `attachment_read`. A bridge without it cannot be asked for a file at all; a server says so ("update the bridge") rather than falling back to asking by path.
 
 ### Bridge → Server: `providers_update`
 
@@ -1036,8 +1045,11 @@ Exactly one per offer, on every path.
 ```json
 { "type": "upload_done", "id": "5f1c…", "ok": true,
   "path": "/Users/jasper/zp-studio/ZeroPlex_Studio__D09042/file-uploads/contract.pdf",
-  "name": "contract.pdf", "size": 482113, "sha256": "9f3c…" }
+  "name": "contract.pdf", "size": 482113, "sha256": "9f3c…",
+  "file_id": "b7e2…" }
 ```
+
+`file_id` is the id this bridge recorded the file under, and the only thing a server can later ask for it by ([`file_read`](#handing-files-back)). `path` is for showing to the person.
 
 ```json
 { "type": "upload_done", "id": "5f1c…", "ok": false, "code": "upload_too_large",
@@ -1055,6 +1067,69 @@ Exactly one per offer, on every path.
 `error` is written for a person and may be shown as it is.
 
 **What this is not.** The file is not referenced by later `ai_request`s as an attachment, and the bridge does not fetch it again or cache it: it is already where the chat works. A server tells the model about it in the message text, by the `path` it was given.
+
+## Handing files back
+
+The reverse of [person uploads](#person-uploads): a file that lives on this machine, fetched for the person's browser, with the server keeping none of it.
+
+**The rule, and it is the security boundary:** the bridge hands back **only files it recorded itself** — ones it received into `file-uploads/`, and ones the assistant handed back in `device` mode (`attachment` event, which now carries `file_id`) — **looked up by an id it minted, never by a path the server sends.** A compromised server can name an id it was given; it has no way to name `~/.ssh/id_ed25519`. The record is persisted per installation and server (`~/.cache/ai-bridge/served-files/<scope>.json`).
+
+The older `attachment_read` frame, which named a path and resolved it against the working directory, is **refused** (`stream_end` with an error).
+
+```
+browser ──GET (Range)──▶ server ──file_read──────────▶ bridge
+                          server ◀─file_read_result──── bridge   (found and unchanged: size + range; or why not)
+browser ◀──status/headers server
+                          server ◀─POST url (bytes)──── bridge   (Bearer token, same origin rules)
+browser ◀──body (piped)── server
+```
+
+### Server → Bridge: `file_read`
+
+```json
+{ "type": "file_read", "id": "c41a…", "file_id": "b7e2…",
+  "url": "https://studio.example.com/ai-bridge/downloads/c41a…",
+  "range": "bytes=1048576-", "head": false }
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | Names this transfer. |
+| `file_id` | The id from `upload_done` or the `attachment` event. Unknown ids are refused (`file_unknown`). |
+| `url` | Where to POST the bytes. Checked as an attachment URL; otherwise `file_refused`. |
+| `range` | The browser's `Range` header, passed through. One range is honoured; anything else gets the whole file; a start past the end is 416. |
+| `head` | Answer only; send no bytes. |
+
+At serve time the bridge re-checks the file: `lstat` must show a regular file (not a symlink), it is opened with `O_NOFOLLOW`, the opened inode must be the one checked, and its size must equal the recorded size. Otherwise `file_gone` or `file_changed`, with a sentence saying which.
+
+### Bridge → Server: `file_read_result`
+
+```json
+{ "type": "file_read_result", "id": "c41a…", "ok": true, "size": 482113, "status": 206, "start": 1048576, "end": 482112 }
+```
+
+```json
+{ "type": "file_read_result", "id": "c41a…", "ok": false, "code": "file_changed",
+  "error": "/…/file-uploads/contract.pdf has changed since it was sent: it is 90112 bytes now and was 482113. Open it on the machine itself." }
+```
+
+| `code` | Meaning |
+|---|---|
+| `file_unknown` | No record of that id. |
+| `file_gone` | The recorded path no longer exists or cannot be opened. |
+| `file_changed` | Not a plain file any more, replaced, or a different size. |
+| `file_refused` | The URL is not on the connected origin. |
+| `file_failed` | Anything else. |
+
+Then, unless `head`, 416, or an empty range, the bridge POSTs exactly `end - start + 1` bytes to `url` with `Authorization: Bearer <token>`. The server holds that request open until the browser has the bytes.
+
+### Server → Bridge: `file_read_cancel`
+
+```json
+{ "type": "file_read_cancel", "id": "c41a…" }
+```
+
+The browser went away; stop reading and abort the POST.
 
 ## Conversation Continuity
 
@@ -1512,6 +1587,8 @@ A file the assistant produced and chose to hand back. Emitted when the model cal
 
 `id` is the identifier the server assigned when the bridge uploaded the file to `POST /ai-bridge/attachments`, so the UI can render it from the server's own attachment store. A server that does not understand the event ignores it.
 
+In `device` mode (`welcome.config.attachments: "device"`) nothing is uploaded: `id` is null, and the event carries `path` (for showing) and `file_id`, the id the bridge recorded the file under. The server fetches it later with [`file_read`](#handing-files-back), never by `path`.
+
 The tool is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else.
 
 The model has to nominate the file, and that is not a limitation to work around: a transport cannot guess which of the hundred files a turn just touched is the answer. The path it names must resolve — **after `realpath`, because in `workspace` mode the model has a shell and can create a symlink** — inside the working directory or that turn's attachment directory, and it is subject to the same per-file cap and the same host binding as the inbound direction.
@@ -1899,6 +1976,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `stream` (main_state) | The main assistant became working or idle (input-open turns) |
 | `turn_input_ack` | Answering a `turn_input`, accepted or rejected |
 | `upload_done` | Answering an `upload_offer`: where the file is, or why not |
+| `file_read_result` | Answering a `file_read`: size and range, or why not |
 | `stream` (done) | Response complete |
 | `stream` (error) | Error during streaming |
 | `tool_call` | CLI invoked a server-side tool (via callback) |
@@ -1921,6 +1999,8 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `upload_offer` | A person's file is coming: fetch it into `file-uploads/` |
 | `upload_sent` | Every byte of an upload has passed through; its size and digest |
 | `upload_abort` | Stop receiving an upload and remove what arrived |
+| `file_read` | Hand a recorded file back, by id, to a one-time URL |
+| `file_read_cancel` | Stop handing a file back |
 
 ---
 
@@ -1967,7 +2047,7 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 
 **Helper activity does not bump the version either.** `parent_tool_use_id` on `block_start` and `tool_result`, the `task` stream event and `done.subagent_stats` are additive: absent means what it always meant, and a consumer ignores an event it does not know.
 
-**Person uploads do not bump the version.** `hello.file_uploads` and the four `upload_*` frames are additive; a server must not send `upload_offer` to a bridge that did not advertise `file_uploads`.
+**Person uploads and handing files back do not bump the version.** `hello.file_uploads`, `hello.file_downloads`, the four `upload_*` frames and the three `file_read*` frames are additive; a server must not send `upload_offer` to a bridge that did not advertise `file_uploads`.
 
 **Workspaces, attachments and `workspace` isolation do not bump the version.** They stay on `0.1`, deliberately. Every one of them is optional in both directions — `hello.workspaces`, `ai_request.working_dir`, `ai_request.attachments`, the `attachment` stream event and the `workspace` value of `cli_isolation` are all additive, and both ends already ignore fields they do not recognise. Only the major number is enforced, so a bump would refuse every bridge already installed in exchange for nothing.
 

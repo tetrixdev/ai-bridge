@@ -230,6 +230,10 @@ A server can also stream a file somebody picks in its chat composer **through** 
 - When the bridge creates `file-uploads/` it puts a `.gitignore` (`*`) in it, so files a client sent do not show up in `git status` or get committed by accident. Delete the ignore file if you want them tracked.
 - The per-file cap is `--attachment-max-mb`, the same one reported in `hello`.
 
+### Handing files back
+
+The person can open or download a file that lives on this machine — one they sent into `file-uploads/`, or one the assistant handed back — without the server keeping a copy: the bridge POSTs the bytes to a one-time server URL and the server pipes them to the browser ([`file_read`](PROTOCOL.md#handing-files-back)). The bridge serves **only files it recorded itself, by an id it minted**, never a path the server names, so a compromised server cannot use this to read anything else on the machine. The record lives in `~/.cache/ai-bridge/served-files/`. At serve time the file must still be a regular file (no symlink) of the recorded size, or the person is told it was changed or removed.
+
 ## Local tools
 
 By default every tool call round-trips to the server, and the server runs it.
