@@ -19,7 +19,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { enrol, grantedTo, loadSecrets } from '../../src/local/engram.js';
+import { enrol, fillRoles, loadSecrets } from '../../src/local/engram.js';
 import { runLocalTool } from '../../src/local/executor.js';
 import { loadOrCreateIdentity, saveIdentity } from '../../src/local/identity.js';
 
@@ -56,28 +56,39 @@ describe.skipIf(!process.env['ENGRAM_URL'])('a secret from a browser vault reach
       { cwd: dir, stdio: 'inherit' },
     );
 
-    // 4. The device opens what was wrapped for it.
+    // 4. The device opens what was wrapped for it, and fills a role with it
+    //    the way a local_call names it: item, field, sealed-value id, space.
     const available = await loadSecrets(cfg, identity, deviceId);
-    const [space] = available.spaceIds();
-    const granted = grantedTo(available, space, ['deploy-key']);
+    const listed = await (await fetch(new URL(`/devices/${deviceId}/secrets`, BASE), {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    })).json() as { secrets: { id: string; space_id: string; item_id: string; field: string }[] };
+    const row = listed.secrets.find((r) => r.field === 'deploy_key')!;
+    const filled = fillRoles(available, [{
+      role: 'deploy', item_id: row.item_id, space_id: row.space_id,
+      sealed: [{ field: 'deploy_key', secret_id: row.id, space_id: row.space_id }],
+    }]);
+    const granted = filled.sealed;
     expect(granted).toHaveLength(1);
-    expect(granted[0]!.name).toBe('DEPLOY_KEY');
-    // The same name, asked for from a space that does not hold it, is refused
-    // rather than served: the boundary is the space, not the spelling.
-    expect(() => grantedTo(available, 'a-space-this-device-does-not-hold', ['deploy-key'])).toThrow();
+    expect(granted[0]!.name).toBe('ENGRAM_DEPLOY_DEPLOY_KEY');
+    // The same value, claimed through a space that did not seal it, is refused
+    // rather than served: the boundary is the space, not the id.
+    expect(() => fillRoles(available, [{
+      role: 'deploy', item_id: row.item_id, space_id: 'another-space',
+      sealed: [{ field: 'deploy_key', secret_id: row.id, space_id: 'a-space-this-device-does-not-hold' }],
+    }])).toThrow();
 
     // 5. The tool sees the real value; the model does not. Both halves in one
     //    run, because either alone would pass while the other was broken.
     const result = await runLocalTool({
       name: 'check',
       command: 'sh',
-      args: ['-c', '[ "$DEPLOY_KEY" = "$ENGRAM_ARG_EXPECTED" ] && echo MATCH; echo "value: $DEPLOY_KEY"'],
+      args: ['-c', '[ "$ENGRAM_DEPLOY_DEPLOY_KEY" = "$ENGRAM_ARG_EXPECTED" ] && echo MATCH; echo "value: $ENGRAM_DEPLOY_DEPLOY_KEY"'],
       toolArgs: { expected: SECRET },
       secrets: granted,
     });
 
     expect(result.stdout).toContain('MATCH');
-    expect(result.stdout).toContain('[redacted: DEPLOY_KEY]');
+    expect(result.stdout).toContain('[redacted: ENGRAM_DEPLOY_DEPLOY_KEY]');
     expect(result.stdout).not.toContain(SECRET);
   }, 120_000);
 });
@@ -122,10 +133,12 @@ test('approve the device and give it a key', async ({ page, context }) => {
   await expect(page.locator('[data-testid=recovery-code]')).toBeVisible({ timeout: 5000 })
   await page.locator('button:has-text("I have written it down")').click()
 
-  await page.locator('[data-testid=secret-name]').fill('deploy-key')
-  await page.locator('[data-testid=secret-value]').fill(${JSON.stringify(secret)})
-  await page.locator('[data-testid=save-secret]').click()
-  await expect(page.locator('[data-testid=reveal-deploy-key]')).toBeVisible({ timeout: 5000 })
+  await page.locator('[data-testid=item-name]').fill('Deploy')
+  await page.locator('[data-testid=item-kind]').fill('github_deploy_key')
+  await page.locator('[data-testid=item-sealed-field]').fill('deploy_key')
+  await page.locator('[data-testid=item-sealed-value]').fill(${JSON.stringify(secret)})
+  await page.locator('[data-testid=save-item]').click()
+  await expect(page.locator('[data-testid="reveal-Deploy-deploy_key"]')).toBeVisible({ timeout: 5000 })
 
   await page.locator('[data-testid="approve-${deviceId}"]').click()
   await expect(page.locator('[data-testid="givekey-${deviceId}"]')).toBeVisible({ timeout: 5000 })

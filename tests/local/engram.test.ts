@@ -1,23 +1,21 @@
 /**
- * Which secrets a tool can reach, and which it must not.
+ * Which sealed values a tool can reach, and which it must not.
  *
- * The bug these tests exist for was live: `loadSecrets` decrypted every secret
- * from every space the device held a key for into ONE flat map, keyed both
- * `space/name` and bare `name`, and a tool's declared names resolved against
- * that flat map. A `ToolDefinition` carried no space at all. So a tool defined
- * in a shared space could name a credential that only exists in the user's
- * private space and be handed it. The only thing in the way was a name
- * collision, and colliding names were deleted, which means the reachable ones
- * were exactly the uniquely named ones.
- *
- * Every assertion below is about the same rule from a different direction:
- * a lookup names a space, or it does not resolve.
+ * A live bug shaped these: `loadSecrets` once decrypted every secret from
+ * every space into ONE flat map keyed by name, so a tool from a shared space
+ * could name a credential from the user's private space and be handed it.
+ * The store is now keyed by space and id and nothing else, and every sealed
+ * value a call names carries the space that sealed it and the item and field
+ * it belongs to. Every assertion below is the same rule from a different
+ * direction: a value is read through the space that sealed it, as the field of
+ * the item it belongs to, or not at all.
  */
 
 import { webcrypto } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fillRoles, grantedTo, loadSecrets, roleEnvName } from '../../src/local/engram.js';
+import { fieldEnvName, fillRoles, loadSecrets, sealedRefs } from '../../src/local/engram.js';
 import { b64u, type Identity } from '../../src/local/identity.js';
+import type { ItemFill } from '../../src/protocol/types.js';
 import { makeGranter, seal, wrapToDevice } from './vault-half.js';
 
 const C = webcrypto.subtle;
@@ -35,23 +33,29 @@ async function makeIdentity(): Promise<Identity> {
 
 /**
  * Stand in for Engram: real ciphertext, so decryption is exercised for real.
- * A secret's id is `<space>-<name>`, which makes an id in a test readable and
- * makes a cross-space id easy to write down.
+ * Each space holds items, each item sealed fields. A sealed value's id is
+ * `<space>-<item>-<field>` and an item's id `<space>-<item>`, which makes an id
+ * in a test readable and a cross-space id easy to write down.
  */
-async function serve(identity: Identity, spaces: Record<string, Record<string, string>>): Promise<void> {
+async function serve(identity: Identity, spaces: Record<string, Record<string, Record<string, string>>>): Promise<void> {
   const keys: { space_id: string; wrapped_key: string; granted_by_signing_key: string }[] = [];
   const granter = await makeGranter();
-  const secrets: { id: string; space_id: string; name: string; envelope: { iv: string; ct: string } }[] = [];
+  const secrets: { id: string; space_id: string; item_id: string; field: string; envelope: { iv: string; ct: string } }[] = [];
 
-  for (const [spaceId, entries] of Object.entries(spaces)) {
+  for (const [spaceId, items] of Object.entries(spaces)) {
     const spaceKey = webcrypto.getRandomValues(new Uint8Array(32));
     keys.push({
       space_id: spaceId,
       wrapped_key: await wrapToDevice(identity.publicKey, spaceKey, spaceId, granter),
       granted_by_signing_key: granter.signingPublicKey,
     });
-    for (const [name, value] of Object.entries(entries)) {
-      secrets.push({ id: `${spaceId}-${name}`, space_id: spaceId, name, envelope: await seal(spaceKey, value) });
+    for (const [item, fields] of Object.entries(items)) {
+      for (const [field, value] of Object.entries(fields)) {
+        secrets.push({
+          id: `${spaceId}-${item}-${field}`, space_id: spaceId, item_id: `${spaceId}-${item}`, field,
+          envelope: await seal(spaceKey, value),
+        });
+      }
     }
   }
 
@@ -67,170 +71,92 @@ afterEach(() => vi.unstubAllGlobals());
 const twoSpaces = async (): Promise<Identity> => {
   const identity = await makeIdentity();
   await serve(identity, {
-    shared: { 'shared-key': 'shared-value-0000' },
-    private: { 'personal-token': 'private-value-9999' },
+    shared: { app: { client_secret: 'shared-value-0000' } },
+    private: { app: { client_secret: 'private-value-9999' } },
   });
   return identity;
 };
 
-describe('a tool reaching for a secret in another space', () => {
-  it('cannot have it by name, however uniquely that name is spelled', async () => {
-    // The exact leak. `personal-token` exists in exactly one space, so under
-    // the old flat map it was reachable bare from anywhere, and a tool living
-    // in `shared` naming it was handed the user's private credential.
-    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
+/** The fill Engram sends for one role. */
+const fill = (role: string, space: string, item: string, sealedIn = space, plain: Record<string, string> = {}): ItemFill => ({
+  role, item_id: `${space}-${item}`, space_id: space, kind: 'azure_app', fields: plain,
+  sealed: [{ field: 'client_secret', secret_id: `${space}-${item}-client_secret`, space_id: sealedIn }],
+});
 
-    expect(() => grantedTo(store, 'shared', ['personal-token']))
-      .toThrow(/does not hold a secret named "personal-token"/);
-    // And from its own space it is perfectly ordinary, so the refusal above is
-    // about the boundary rather than about the secret being unavailable.
-    expect(grantedTo(store, 'private', ['personal-token']))
-      .toEqual([{ name: 'PERSONAL_TOKEN', value: 'private-value-9999' }]);
+describe('a sealed value, read through the space that sealed it', () => {
+  it('is opened from the space the call names, which may differ from the tool\'s', async () => {
+    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
+    expect(fillRoles(store, [fill('mailbox', 'private', 'app')]).sealed)
+      .toEqual([{ name: 'ENGRAM_MAILBOX_CLIENT_SECRET', value: 'private-value-9999' }]);
   });
 
-  it('cannot have it by id either, which is the same leak with a different key', async () => {
+  it('is refused when named under a space that did not seal it', async () => {
+    // The exact leak, by id: private's value, claimed through shared.
     const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
-    const fill = [{ role: 'mailbox', secret_id: 'private-personal-token' }];
-
-    expect(() => fillRoles(store, 'shared', fill)).toThrow(/cannot reach across spaces/);
-    expect(fillRoles(store, 'private', fill))
-      .toEqual([{ name: 'ENGRAM_SECRET_MAILBOX', value: 'private-value-9999' }]);
+    const crossed: ItemFill = {
+      ...fill('mailbox', 'private', 'app'),
+      sealed: [{ field: 'client_secret', secret_id: 'private-app-client_secret', space_id: 'shared' }],
+    };
+    expect(() => fillRoles(store, [crossed])).toThrow(/cannot be filled/);
   });
 
-  it('cannot fall back to a bare lookup, because a tool with no space resolves nothing', async () => {
-    // There is no bare form left to fall back TO, and a tool that cannot name
-    // a space is refused rather than resolved against everything the device
-    // holds. A refusal is a thing an operator can read and fix; a fallback is
-    // a credential handed over quietly.
+  it('is refused when named as a field of an item it does not belong to', async () => {
     const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
-    expect(() => grantedTo(store, undefined, ['personal-token'])).toThrow(/no space_id/);
+    const swapped: ItemFill = { ...fill('mailbox', 'private', 'app'), item_id: 'shared-app' };
+    expect(() => fillRoles(store, [swapped])).toThrow(/cannot be filled/);
+    const renamed: ItemFill = {
+      ...fill('mailbox', 'private', 'app'),
+      sealed: [{ field: 'refresh_token', secret_id: 'private-app-client_secret', space_id: 'private' }],
+    };
+    expect(() => fillRoles(store, [renamed])).toThrow(/cannot be filled/);
   });
 });
 
-describe('keying the secrets a device holds', () => {
-  it('serves a name two spaces both hold, to each space, without ambiguity', async () => {
-    // The old map deleted BOTH when two spaces used one name, so a perfectly
-    // well-scoped tool stopped working because someone in another space
-    // happened to pick the same word. Scoping the lookup removes the clash
-    // rather than the secrets.
-    const identity = await makeIdentity();
-    await serve(identity, { alpha: { 'deploy-key': 'alpha-key' }, beta: { 'deploy-key': 'beta-key' } });
-
-    const store = await loadSecrets(cfg, identity, 'dev_1');
-
-    expect(store.byName('alpha', 'deploy-key')?.value).toBe('alpha-key');
-    expect(store.byName('beta', 'deploy-key')?.value).toBe('beta-key');
-    expect(store.byName('gamma', 'deploy-key')).toBeUndefined();
-  });
-
-  it('keeps a name containing a slash, which is now just a name', async () => {
-    // It used to need dropping, because `space/name` and a bare name shared
-    // one keyspace and a secret NAMED `alpha/db-password` collided with space
-    // alpha's qualified key. With no shared keyspace there is nothing to
-    // collide with, and a secret stops being unusable over its punctuation.
-    const identity = await makeIdentity();
-    await serve(identity, { beta: { 'alpha/db-password': 'beta-value' } });
-
-    const store = await loadSecrets(cfg, identity, 'dev_1');
-
-    expect(store.byName('beta', 'alpha/db-password')?.value).toBe('beta-value');
-    expect(store.byName('alpha', 'db-password')).toBeUndefined();
-  });
-
-  it('refuses to guess between two secrets one space named the same', async () => {
-    const identity = await makeIdentity();
-    const spaceKey = webcrypto.getRandomValues(new Uint8Array(32));
-    const granter = await makeGranter();
-    const keys = [{
-      space_id: 'alpha',
-      wrapped_key: await wrapToDevice(identity.publicKey, spaceKey, 'alpha', granter),
-      granted_by_signing_key: granter.signingPublicKey,
-    }];
-    const secrets = [
-      { id: 'first', space_id: 'alpha', name: 'db', envelope: await seal(spaceKey, 'first-value') },
-      { id: 'second', space_id: 'alpha', name: 'db', envelope: await seal(spaceKey, 'second-value') },
-    ];
-    vi.stubGlobal('fetch', vi.fn(async (url: URL) => ({
-      ok: true,
-      json: async () => (String(url).endsWith('/keys') ? { keys } : { secrets }),
-    })));
-
-    const store = await loadSecrets(cfg, identity, 'dev_1');
-
-    // Neither by name, because picking one would be a coin flip with a
-    // credential. Both by id, because an id says which one.
-    expect(store.byName('alpha', 'db')).toBeUndefined();
-    expect(store.byId('alpha', 'first')?.value).toBe('first-value');
-    expect(store.byId('alpha', 'second')?.value).toBe('second-value');
-  });
-});
-
-describe('filling a role rather than naming a credential', () => {
-  it('gives the tool the role it declared, never the credential is called', async () => {
+describe('filling a role rather than naming an item', () => {
+  it('gives the tool each field under its role and name, plain ones as themselves', async () => {
     // The reason roles exist: one fetch_mail serving three app registrations
-    // instead of three tools. The tool reads ENGRAM_SECRET_MAILBOX and never
-    // learns which credential filled it.
+    // instead of three tools. The tool reads ENGRAM_MAILBOX_* and never learns
+    // which item filled it.
     const identity = await makeIdentity();
-    await serve(identity, { shared: { 'azure-app-a': 'value-for-a', 'azure-app-b': 'value-for-b' } });
+    await serve(identity, { shared: { a: { client_secret: 'value-for-a' }, b: { client_secret: 'value-for-b' } } });
     const store = await loadSecrets(cfg, identity, 'dev_1');
 
-    const first = fillRoles(store, 'shared', [{ role: 'mailbox', secret_id: 'shared-azure-app-a' }]);
-    const second = fillRoles(store, 'shared', [{ role: 'mailbox', secret_id: 'shared-azure-app-b' }]);
-
-    expect(first).toEqual([{ name: 'ENGRAM_SECRET_MAILBOX', value: 'value-for-a' }]);
-    expect(second).toEqual([{ name: 'ENGRAM_SECRET_MAILBOX', value: 'value-for-b' }]);
+    const first = fillRoles(store, [fill('mailbox', 'shared', 'a', 'shared', { client_id: 'id-a' })]);
+    const second = fillRoles(store, [fill('mailbox', 'shared', 'b', 'shared', { client_id: 'id-b' })]);
+    expect(first).toEqual({
+      env: { ENGRAM_MAILBOX_CLIENT_ID: 'id-a' },
+      sealed: [{ name: 'ENGRAM_MAILBOX_CLIENT_SECRET', value: 'value-for-a' }],
+    });
+    expect(second.sealed).toEqual([{ name: 'ENGRAM_MAILBOX_CLIENT_SECRET', value: 'value-for-b' }]);
   });
 
-  it('names the variable after the role, hyphens and all', () => {
-    expect(roleEnvName('mailbox')).toBe('ENGRAM_SECRET_MAILBOX');
-    expect(roleEnvName('sending-account')).toBe('ENGRAM_SECRET_SENDING_ACCOUNT');
+  it('names the variable after the role and the field, hyphens and all', () => {
+    expect(fieldEnvName('mailbox', 'client_secret')).toBe('ENGRAM_MAILBOX_CLIENT_SECRET');
+    expect(fieldEnvName('source-db', 'password')).toBe('ENGRAM_SOURCE_DB_PASSWORD');
   });
 
-  it('refuses two roles that become one variable', async () => {
-    // `mail-box` and `mail_box` are two roles and one environment variable.
-    // Filling both would hand the tool a credential under a role it did not
-    // ask for, decided by iteration order.
-    const identity = await makeIdentity();
-    await serve(identity, { shared: { one: 'value-one-xx', two: 'value-two-xx' } });
-    const store = await loadSecrets(cfg, identity, 'dev_1');
-
-    expect(() => fillRoles(store, 'shared', [
-      { role: 'mail-box', secret_id: 'shared-one' },
-      { role: 'mail_box', secret_id: 'shared-two' },
-    ])).toThrow(/both become ENGRAM_SECRET_MAIL_BOX/);
+  it('refuses two roles or fields that become one variable', async () => {
+    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
+    expect(() => fillRoles(store, [
+      { role: 'mail-box', item_id: 'x', space_id: 'shared', fields: { user: 'a' } },
+      { role: 'mail_box', item_id: 'y', space_id: 'shared', fields: { user: 'b' } },
+    ])).toThrow(/both become ENGRAM_MAIL_BOX_USER/);
   });
 
-  it('refuses a role that is not a usable variable name', async () => {
-    const identity = await makeIdentity();
-    await serve(identity, { shared: { one: 'value-one-xx' } });
-    const store = await loadSecrets(cfg, identity, 'dev_1');
-
-    expect(() => fillRoles(store, 'shared', [{ role: 'mail box; echo', secret_id: 'shared-one' }]))
+  it('refuses a role or a field that is not a usable variable name', async () => {
+    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
+    expect(() => fillRoles(store, [{ ...fill('mail box; echo', 'shared', 'app') }]))
       .toThrow(/not a usable role name/);
+    expect(() => fillRoles(store, [{ role: 'mailbox', item_id: 'x', space_id: 'shared', fields: { 'A B': 'x' } }]))
+      .toThrow(/not a lowercase name/);
   });
 
-  it('says nothing about a call that fills nothing', async () => {
+  it('says nothing about a call that fills nothing, and asks for nothing', async () => {
     const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
-    expect(fillRoles(store, 'shared', undefined)).toEqual([]);
-    expect(fillRoles(store, 'shared', [])).toEqual([]);
-  });
-});
-
-describe('a tool asking for a secret its space does not hold', () => {
-  it('fails the call rather than running the tool without it', async () => {
-    // Warning and running on was the worst of both: the tool ran as nobody, or
-    // wrote an empty value into whatever it configures, and the model read the
-    // result as success.
-    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
-    expect(() => grantedTo(store, 'shared', ['nothing-like-this']))
-      .toThrow(/does not hold a secret named "nothing-like-this"/);
-  });
-
-  it('says nothing about a tool that declared none', async () => {
-    const store = await loadSecrets(cfg, await twoSpaces(), 'dev_1');
-    expect(grantedTo(store, 'shared', undefined)).toEqual([]);
-    expect(grantedTo(store, 'shared', [])).toEqual([]);
-    // Not even the missing space is an error when nothing was asked for.
-    expect(grantedTo(store, undefined, [])).toEqual([]);
+    expect(fillRoles(store, undefined)).toEqual({ env: {}, sealed: [] });
+    expect(fillRoles(store, [])).toEqual({ env: {}, sealed: [] });
+    expect(sealedRefs(undefined)).toEqual([]);
+    expect(sealedRefs([fill('mailbox', 'private', 'app')]))
+      .toEqual([{ space_id: 'private', secret_id: 'private-app-client_secret' }]);
   });
 });

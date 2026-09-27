@@ -68,43 +68,26 @@ export interface ToolDefinition {
    */
   execute?: 'server' | 'local';
   /**
-   * local only. The space this tool belongs to.
-   *
-   * Every secret this tool can reach must live in this space. Without it the
-   * bridge cannot scope a lookup, and an unscoped lookup is exactly the bug
-   * this field exists to close: a tool defined in a shared space naming a
-   * credential that only exists in someone's private space, and being handed
-   * it because the name happened not to collide. A local tool that arrives
-   * without a space is refused rather than resolved against everything the
-   * device holds.
+   * local only. The space this tool belongs to, which is where its package is
+   * installed. The items filling its roles may come from other spaces the
+   * person reaches; each sealed value names its own space in `fill`.
    */
   space_id?: string;
   /**
-   * local only, and superseded by `needs` + `fill`. Names of the secrets this
-   * tool may be given, resolved WITHIN `space_id` and nowhere else.
+   * local only. What the tool needs, by ROLE: a label naming the service and
+   * the fields it reads.
    *
-   * Kept for servers that have not moved to roles yet. A name is a poor
-   * binding: it makes one tool per credential, so `fetch_mail` had to be
-   * written once per Azure app registration.
+   * The tool reads ENGRAM_<ROLE>_<FIELD> for each field, plain or sealed, so
+   * one `fetch_mail` serves three app registrations: a person chooses which
+   * item fills `mailbox`, and the tool never learns an item's name.
    */
-  secrets?: string[];
+  needs?: { role: string; kind?: string; fields?: string[] }[];
   /**
-   * local only. What the tool needs, by ROLE rather than by credential name.
-   *
-   * The tool reads ENGRAM_SECRET_<ROLE>, so one `fetch_mail` serves three
-   * app registrations: the caller decides which credential fills `mailbox`,
-   * and the tool never learns a credential's name.
-   *
-   * `kind` is advisory, for the vault's own picker (e.g. "azure-app").
+   * local only. Which item fills each role, as the server resolved it: plain
+   * fields as values, sealed fields as ids with the space each is sealed in.
+   * The bridge never turns a name into an id on its own.
    */
-  needs?: { role: string; kind?: string }[];
-  /**
-   * local only. Which credential fills each role, as resolved secret IDs.
-   *
-   * The server resolves these, because the server is what knows the binding a
-   * person configured. The bridge never turns a name into an ID on its own.
-   */
-  fill?: SecretFill[];
+  fill?: ItemFill[];
   /**
    * local only. An npm package this tool lives in, pinned exactly
    * (`@scope/name@1.2.3`).
@@ -128,15 +111,25 @@ export interface ToolDefinition {
 }
 
 /**
- * One role filled by one credential.
+ * One role, filled by one vault item.
  *
- * A secret ID, never a name. The bridge resolves the ID inside the call's
- * space and refuses if the secret lives anywhere else, so a caller cannot
- * reach across spaces by knowing an ID.
+ * Plain fields travel as values, because plain means not secret. Each sealed
+ * field travels as the id of the sealed value and the space it is sealed in,
+ * never as a value: the bridge opens it with that space's key, and refuses if
+ * it holds no such value in that space as that field of that item. The item's
+ * space may differ from the tool's; whether the person may use it with this
+ * tool is decided by Engram, from their consent, before the call is sent.
  */
-export interface SecretFill {
+export interface ItemFill {
   role: string;
-  secret_id: string;
+  item_id: string;
+  /** The space the item lives in. */
+  space_id: string;
+  kind?: string;
+  /** The plain fields the tool reads, with their values. */
+  fields?: Record<string, string>;
+  /** The sealed fields the tool reads: which value, sealed in which space. */
+  sealed?: { field: string; secret_id: string; space_id: string }[];
 }
 
 /** What a `local_call` asks the bridge to run. */
@@ -933,16 +926,17 @@ export interface TokenRefreshMessage {
  * person configured. It still goes through the same gate, so a bridge that was
  * never started with local execution refuses it outright.
  *
- * `space_id` scopes every credential this call can reach. `fill` names
- * resolved secret IDs, never names, and every one of them must live in
- * `space_id` or the call is refused.
+ * `space_id` is the tool's space, where its package is installed. `fill` names
+ * sealed values by id, each with the space it is sealed in, never a value; a
+ * value this device does not hold in that space, as that field of that item,
+ * refuses the call.
  */
 export interface LocalCallMessage {
   type: 'local_call';
   id: string;
   space_id: string;
   tool: LocalCallTool;
-  fill?: SecretFill[];
+  fill?: ItemFill[];
   /** Passed to the tool as one JSON document on stdin. */
   input?: unknown;
 }

@@ -18,7 +18,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { LocalCallMessage, LocalResultMessage } from '../protocol/types.js';
 import { createLogger } from '../utils/logger.js';
-import { fillRoles, type SecretStore } from './engram.js';
+import { fillRoles, sealedRefs, type SealedRef, type SecretStore } from './engram.js';
 import { runLocalTool } from './executor.js';
 import { localCallRefusal, type LocalExecutionConfig } from './gate.js';
 import { SpaceLimiter } from './limits.js';
@@ -52,10 +52,11 @@ export interface LocalCallContext {
   /** Per-space concurrency and pacing. One limiter for the whole bridge. */
   limiter: SpaceLimiter;
   /**
-   * The secrets this device holds, fetched or served from the bridge's cache.
-   * Given the ids the call needs so a cache miss can re-fetch before failing.
+   * The sealed values this device holds, fetched or served from the bridge's
+   * cache. Given the (space, id) pairs the call needs so a cache miss can
+   * re-fetch before failing.
    */
-  secrets: (spaceId: string, secretIds: string[]) => Promise<SecretStore>;
+  secrets: (refs: SealedRef[]) => Promise<SecretStore>;
   /** Overrides the default install root. Tests point this at a temp dir. */
   dataDir?: string;
 }
@@ -126,10 +127,11 @@ async function execute(
   });
   const { cwd, readDir, extraEnv } = staged;
 
-  // The space check. Every id must name a secret in THIS space; one that names
-  // a secret in another space reads exactly like one that does not exist.
-  const store = await ctx.secrets(call.space_id, (call.fill ?? []).map((f) => f.secret_id));
-  const granted = fillRoles(store, call.space_id, call.fill);
+  // Each sealed value is read through the space the call names for it, as the
+  // field of the item the call names, or the call is refused.
+  const store = await ctx.secrets(sealedRefs(call.fill));
+  const filled = fillRoles(store, call.fill);
+  const granted = filled.sealed;
   remember(granted);
 
   const sandbox: SandboxRequest = {
@@ -147,6 +149,7 @@ async function execute(
     // environment variables would lose that shape and cap its size.
     input: call.input ?? {},
     secrets: granted,
+    plain: filled.env,
     ...(cwd ? { cwd } : {}),
     sandbox,
     extraEnv,
@@ -272,8 +275,16 @@ function validate(message: LocalCallMessage): LocalCallMessage {
     }
   }
   for (const entry of message.fill ?? []) {
-    if (!entry || typeof entry.role !== 'string' || typeof entry.secret_id !== 'string') {
-      throw new Error(`each fill entry needs a role and a secret_id (tool "${tool.name}")`);
+    if (!entry || typeof entry.role !== 'string' || typeof entry.item_id !== 'string') {
+      throw new Error(`each fill entry needs a role and an item_id (tool "${tool.name}")`);
+    }
+    if (entry.fields !== undefined && (typeof entry.fields !== 'object' || entry.fields === null || Array.isArray(entry.fields))) {
+      throw new Error(`the plain fields for role "${entry.role}" must be an object (tool "${tool.name}")`);
+    }
+    for (const ref of entry.sealed ?? []) {
+      if (!ref || typeof ref.field !== 'string' || typeof ref.secret_id !== 'string' || typeof ref.space_id !== 'string') {
+        throw new Error(`each sealed field for role "${entry.role}" needs a field, a secret_id and a space_id (tool "${tool.name}")`);
+      }
     }
   }
   return message;

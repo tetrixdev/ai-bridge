@@ -387,8 +387,13 @@ A tool may carry fields that move execution from the server to the bridge:
   "parameters": { "type": "object", "properties": {} },
   "execute": "local",
   "space_id": "1f2c...",
-  "needs": [{ "role": "mailbox", "kind": "azure-app" }],
-  "fill": [{ "role": "mailbox", "secret_id": "9ab3..." }],
+  "needs": [{ "role": "mailbox", "kind": "azure_app",
+              "fields": ["tenant_id", "client_id", "client_secret"] }],
+  "fill": [{ "role": "mailbox", "item_id": "5d0e...", "space_id": "77aa...",
+             "kind": "azure_app",
+             "fields": { "tenant_id": "4f1c...", "client_id": "9a2e..." },
+             "sealed": [{ "field": "client_secret", "secret_id": "9ab3...",
+                          "space_id": "77aa..." }] }],
   "package": "@scope/fetch-mail@1.2.3",
   "network": false,
   "run": { "command": "node", "args": ["index.js"] }
@@ -406,25 +411,38 @@ operator started it with `--local-tools`. Otherwise the tool is refused and the
 refusal logged. This is deliberate: a local tool lets a server run commands on
 someone else's machine, as them, and that has to be chosen rather than sent.
 
-**`space_id`** is required for any local tool that touches a credential. Every
-secret the bridge resolves is scoped to it, and a tool that names no space
-resolves nothing: there is no unscoped lookup to fall back to. A tool defined
-in a shared space cannot reach a credential that lives in a private space, by
-name or by resolved id, however uniquely that credential is named.
+**`space_id`** is the tool's own space, where its package is installed.
 
-**`needs`** declares what the tool wants by ROLE. **`fill`** says which
-credential fills each role, as resolved secret IDs. The bridge injects each as
-`ENGRAM_SECRET_<ROLE UPPERCASED>` (`-` becomes `_`), so a tool reads the role it
-declared and never a credential name, and one `fetch_mail` serves three Azure
-app registrations. Two roles that would become the same variable fail the call
-rather than one silently overwriting the other.
+**`needs`** declares what the tool wants by ROLE: the label of the vault item
+that fits (`kind`, naming the service) and the `fields` it reads. **`fill`** is
+the item the server resolved for each role, after a person chose it for this
+exact tool: its plain fields as values, and each sealed field as the id of the
+sealed value and the **space it is sealed in**, never a value. That space may
+differ from the tool's: a tool in a shared space may run with an item from the
+person's private space.
 
-**`secrets`** is the older name-based form, still honoured, and now resolved
-strictly within `space_id`. A name a tool declared that its own space does not
-hold **fails the call**; the tool is not run without it. A tool that runs
-without a credential it declared does not fail cleanly, it connects as nobody or
-writes an empty value, and the model reads whatever comes back as the tool
-having worked.
+The bridge opens each sealed value only through the space the fill names for
+it, and only if the value it holds under that id is that field of that item. A
+value named through another space, or under another item or field, is refused
+exactly as one this device does not hold, and the call fails rather than running
+without it. Whether the person may use that item with that tool is the server's
+decision (Engram records a consent against a hash of the tool's definition);
+the bridge trusts the server for it the same way it trusts the server for the
+tool's command, which is what signing tools will change.
+
+**Environment: `ENGRAM_<ROLE>_<FIELD>`, for plain and sealed fields alike**,
+upper-cased, `-` becoming `_`: the role `mailbox` and the field `client_secret`
+arrive as `ENGRAM_MAILBOX_CLIENT_SECRET`. A tool reads every field of its item
+the same way and never learns which were sealed, nor what the item is called, so
+one `fetch_mail` serves three Azure app registrations. Sealed values are scrubbed
+from everything the tool prints; plain ones are not, because plain means not
+secret. Two role/field pairs that would become the same variable, or one that
+would replace a variable the bridge sets itself (`ENGRAM_PACKAGE_DIR`), fail the
+call rather than one silently overwriting the other.
+
+The older `secrets` field (credential names resolved within `space_id`) and the
+`{role, secret_id}` fill are retired: Engram no longer names sealed values, and
+a sealed value belongs to an item.
 
 **`package`** names an npm package, pinned exactly (`@scope/name@1.2.3`).
 Installed with `--ignore-scripts`, into a directory of its own per space. A
@@ -505,17 +523,21 @@ way in, not one per message type.
     "package": "@scope/name@1.2.3",
     "network": false
   },
-  "fill": [{ "role": "mailbox", "secret_id": "<uuid>" }],
+  "fill": [{ "role": "mailbox", "item_id": "<uuid>", "space_id": "<uuid>",
+             "kind": "azure_app", "fields": { "client_id": "9a2e..." },
+             "sealed": [{ "field": "client_secret", "secret_id": "<uuid>",
+                          "space_id": "<uuid>" }] }],
   "input": { "since": "2026-08-01" }
 }
 ```
 
-- **`space_id`** scopes every credential this call can reach. Each `secret_id`
-  in `fill` must name a secret that lives in this space. One that lives in
-  another space is refused exactly as one that does not exist: a call cannot
-  reach across spaces, by name or by id.
-- **`fill`** carries resolved secret IDs, never names. The bridge does not turn
-  a name into an id.
+- **`space_id`** is the tool's space: where its package is installed and what
+  the per-space limiter counts against.
+- **`fill`** is the same shape as a local tool's (above): plain fields as
+  values, each sealed field as (`secret_id`, `space_id`) with the space it is
+  sealed in. Each sealed value must be held by this device under that space, as
+  that field of that item, or the call is refused. The bridge does not turn a
+  name into an id.
 - **`input`** is passed to the tool as **one JSON document on stdin**. It is not
   flattened into environment variables.
 - **`tool.package`**, when present, is installed before the run (pinned exactly,
@@ -524,9 +546,21 @@ way in, not one per message type.
 - **`tool.network`**: `false` means the tool runs with no network. A host list is
   not enforced. See the sandbox section below.
 
-Each role in `fill` reaches the tool as `ENGRAM_SECRET_<ROLE UPPERCASED>`, with
-`-` replaced by `_`. The tool reads the role it declared and never a credential
-name.
+Each field reaches the tool as `ENGRAM_<ROLE>_<FIELD>`, upper-cased, with `-`
+replaced by `_`. The tool reads the role and field it declared and never an
+item's name.
+
+#### Where a device's sealed values come from
+
+The bridge fetches `/devices/:id/keys` (each space key wrapped to this device,
+with the granter's signing key beside it) and `/devices/:id/secrets` (each
+filled sealed value as `{id, space_id, item_id, field, envelope}`). A space key
+is opened only if the wrap is bound to this device and that space (the context
+in both HKDF and the AES-GCM additional data, as Engram's `public/vault.js`
+makes it) and carries a signature that verifies against the granter key; an
+envelope is opened with its space's key and the vault's size padding stripped.
+Engram's `tests/bridgecrypto.test.ts` runs this bridge's code against the real
+vault page, so the two cannot drift apart silently.
 
 ### Bridge → Server: `local_result`
 
