@@ -348,7 +348,7 @@ How much of the operator's local environment the spawned CLI may see, and what i
 
 | Value | The CLI may... | The operator's environment... |
 |---|---|---|
-| `isolated` (default) | reach server-declared tools through the bridge's MCP server. No edits. Per-CLI — see the flag table below: Claude's built-ins are denied outright, Codex keeps its own `shell` bounded by a read-only, no-network sandbox, and Gemini's built-ins stall on an approval nothing can answer. The bridge states this posture explicitly on Claude and Codex, so the operator's own CLI configuration cannot widen it; Gemini offers no such lever. | stays out: other MCP servers ignored, neutral fallback system prompt. |
+| `isolated` (default) | reach server-declared tools through the bridge's MCP server. No edits. Per-CLI — see the flag table below: Claude's built-ins are denied outright, Codex keeps its own `shell` bounded by a read-only, no-network sandbox, and Gemini's built-ins stall on an approval nothing can answer. The bridge states this posture explicitly on Claude and Codex, so the operator's own CLI configuration cannot widen it; Gemini offers no such lever. | stays out: other MCP servers ignored. The system prompt is the server's, or the CLI's own default when the server sends none. |
 | `workspace` | **also use its own file and shell tools**, inside `working_dir`. | stays out, exactly as in `isolated`. |
 | `native` | do anything the CLI can do. | is fully in play: user `CLAUDE.md`, skills, hooks, configured MCP servers, plugins, the CLI's own default prompt. |
 
@@ -370,7 +370,7 @@ This is not a formality. `workspace` is what enables the shell, and a shell in t
 
 An unrecognised value — a typo, a newer server — is also treated as `isolated` rather than passed to the adapters, which test it with `!== 'isolated'` and would otherwise land in the permissive branch on one CLI and the restrictive branch on another.
 
-The system prompt behaves in `workspace` exactly as in `isolated`: the server's prompt when there is one, the neutral fallback when there is not. Only `native` lets the CLI's own default through.
+The system prompt behaves the same in every mode: the server's `system_prompt` when there is one, and otherwise nothing, so the CLI keeps its own default prompt. The bridge writes no system prompt of its own; its lifecycle addendum (`bridge_prompt`) rides beside whichever prompt applies. Earlier bridges substituted a one-sentence neutral stand-in in `isolated` and `workspace`; a server that relied on it should send its own `system_prompt`.
 
 `bridge__attach_file` is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else, which is what the row above says and what it should keep meaning.
 

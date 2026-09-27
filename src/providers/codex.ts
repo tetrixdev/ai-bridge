@@ -248,9 +248,8 @@ export class CodexAdapter extends ProviderAdapter {
     // server-declared tools through the MCP server.
     //
     // Codex has no dedicated --system-prompt flag, so the resolved system
-    // prompt is concatenated. In isolated mode resolveSystemPrompt() returns
-    // a neutral default when the server didn't send one, so Codex's own
-    // built-in default never seeps through.
+    // prompt is concatenated. With no server prompt only the addendum is
+    // prepended, and Codex keeps its own built-in default.
     // The bridge's lifecycle addendum joins the server's prompt here rather
     // than riding its own flag: Codex has only the one prompt. Like the system
     // prompt itself it goes only on a fresh session — a resumed Codex session

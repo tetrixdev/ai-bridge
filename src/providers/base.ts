@@ -43,7 +43,7 @@ export interface ExecutionContext {
   /**
    * Server-supplied CLI isolation posture. `isolated` (default) keeps the
    * spawned CLI cut off from local influence — no built-in shell/edit, no
-   * user-level CLAUDE.md / skills / hooks, neutral fallback system prompt.
+   * user-level CLAUDE.md / skills / hooks.
    * `native` re-enables the legacy posture as an operator opt-in.
    */
   cliIsolation: CliIsolation;

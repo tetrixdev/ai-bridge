@@ -131,36 +131,31 @@ export function stripCredentials(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 /**
- * Neutral fallback system prompt used in `isolated` mode when the server did
- * not provide one. Without this the CLI would fall back to its built-in
- * default — typically a coding-agent persona that leaks Claude-Code /
- * Codex / Gemini-CLI conventions into a chat that should be governed by the
- * server-side product. Kept intentionally generic.
- */
-export const ISOLATED_FALLBACK_SYSTEM_PROMPT =
-  'You are an AI assistant. Use only the tools provided to you to fulfil the user\'s request, and reply in plain prose.';
-
-/**
- * Resolve the system prompt to pass to the CLI for this turn.
+ * Resolve the system prompt to pass to the CLI for this turn: the server's, or
+ * none at all.
  *
- * - If the server sent one, use it as-is (regardless of isolation).
- * - In `isolated` AND `workspace` mode with no server prompt, return the
- *   neutral fallback so the CLI's built-in default never seeps through.
- *   `workspace` widens what the CLI may DO; it does not hand the CLI's own
- *   coding-agent persona to a product whose prompt the server owns.
- * - In `native` mode with no server prompt, return null — the CLI applies
- *   whatever it normally would.
+ * The bridge does not write a system prompt of its own, in any isolation mode.
+ * When the server sends nothing, the CLI keeps its own default, and the
+ * bridge's lifecycle addendum (`bridge_prompt`) still rides beside it.
  *
- * Returns null only when the CLI should be left to its own default.
+ * It used to substitute a one-sentence stand-in in `isolated` and `workspace`
+ * ("You are an AI assistant. Use only the tools provided to you to fulfil the
+ * user's request, and reply in plain prose."), written for a player-facing
+ * game chat so the CLI's coding-agent persona could not leak into it. As a
+ * default for every consumer it did harm: it silently replaced the CLI's own
+ * guidance with a sentence that told a model with a shell to use "only the
+ * tools provided" and told one writing into a markdown-rendering chat to use
+ * plain prose. A product that wants a voice sends `system_prompt`; the one that
+ * needed the stand-in already does.
+ *
+ * `isolation` stays a parameter so the call sites say which posture they are
+ * in, and so a posture-specific rule has one place to go if one is ever needed.
  */
 export function resolveSystemPrompt(
   serverPrompt: string | null,
-  isolation: CliIsolation,
+  _isolation: CliIsolation,
 ): string | null {
-  if (serverPrompt) {
-    return serverPrompt;
-  }
-  return isolation === 'native' ? null : ISOLATED_FALLBACK_SYSTEM_PROMPT;
+  return serverPrompt ? serverPrompt : null;
 }
 
 /**
