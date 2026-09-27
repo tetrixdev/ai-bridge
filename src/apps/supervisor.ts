@@ -287,9 +287,12 @@ export class AppSupervisor {
     const body = typeof msg.body === 'string' ? msg.body : msg.body === undefined ? '' : JSON.stringify(msg.body);
     if (Buffer.byteLength(body) > MAX_BODY) {
       p.reject(new Error(`the backend answered with more than ${MAX_BODY} bytes; page the answer`));
-      return;
+    } else {
+      p.resolve({ status, headers, body });
     }
-    p.resolve({ status, headers, body });
+    // Either way the request is over, so the idle clock starts: returning early
+    // here left a process whose last answer was too large running until the
+    // bridge stopped.
     this.idleLater(running);
   }
 
