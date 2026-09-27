@@ -234,6 +234,13 @@ export interface HelloMessage {
    * `attachment_read`, which named a path.
    */
   file_downloads?: true;
+  /**
+   * This bridge runs Engram app backends (`app_call` / `app_result`), behind
+   * the same `--local-tools` gate as local tools. Sent whatever the gate says,
+   * like the flags above: it says the frames are understood, and a bridge
+   * that did not opt in answers each call with a refusal.
+   */
+  app_backends?: true;
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -476,7 +483,8 @@ export type BridgeToServerMessage =
   | CancelledMessage
   | TurnInputAckMessage
   | UploadDoneMessage
-  | FileReadResultMessage;
+  | FileReadResultMessage
+  | AppResultMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Bridge Messages
@@ -941,6 +949,41 @@ export interface LocalCallMessage {
   input?: unknown;
 }
 
+/**
+ * One request for an Engram app's backend, to run on this machine
+ * (PROTOCOL.md, "App backends"). Engram has already checked that the person
+ * approved this version and that the endpoint is declared.
+ */
+export interface AppCallMessage {
+  type: 'app_call';
+  id: string;
+  /** `hash` is the version's content hash: the working copy and the process are keyed on it. */
+  app: { space_id: string; name: string; version: number; hash: string };
+  /** The version's files, path to sha256; each is fetched as `${base}${sha256}`. */
+  files: { base: string; tree: Record<string, string> };
+  backend: {
+    main: string;
+    folders?: { path: string; write: boolean }[];
+    shell?: boolean;
+    programs?: string[];
+    network?: false | string[];
+  };
+  /** Vault roles, filled as for local tools: ENGRAM_<ROLE>_<FIELD> in the process environment. */
+  fill?: ItemFill[];
+  request: { method: string; path: string; headers?: Record<string, string>; body?: string };
+  /** Engram's API for this request, as the person, bounded by the manifest. Passed to the backend. */
+  engram: { api: string; token: string };
+}
+
+/** The backend's answer, or why there is none. Scrubbed of every sealed value it held. */
+export interface AppResultMessage {
+  type: 'app_result';
+  id: string;
+  ok: boolean;
+  response?: { status: number; headers: Record<string, string>; body: string };
+  error?: string;
+}
+
 /** Union of all messages the server sends to the bridge. */
 /**
  * Ask the bridge what is left of the subscription its CLI is signed in as.
@@ -982,7 +1025,8 @@ export type ServerToBridgeMessage =
   | FileReadCancelMessage
   | StreamCancelMessage
   | CancelMessage
-  | TurnInputMessage;
+  | TurnInputMessage
+  | AppCallMessage;
 
 // ---------------------------------------------------------------------------
 // Stream Event Types and Data
