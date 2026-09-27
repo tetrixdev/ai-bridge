@@ -8,7 +8,8 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { loadOrCreateIdentity, saveIdentity } from '../../src/local/identity.js';
+import { loadOrCreateIdentity, openEnvelope, saveIdentity, unpad, unwrapToDevice } from '../../src/local/identity.js';
+import { makeGranter, seal, wrapToDevice } from './vault-half.js';
 
 let dir: string;
 let path: string;
@@ -85,5 +86,51 @@ describe('reading an identity that is not simply absent', () => {
     const identity = await loadOrCreateIdentity(join(dir, 'nested', 'device.json'));
     expect(identity.deviceId).toBeUndefined();
     expect(identity.publicKey.length).toBeGreaterThan(0);
+  });
+});
+
+describe('opening a space key the vault wrapped for this device', () => {
+  // The format is Engram's (public/vault.js, wrapToPublic): bound to the space
+  // and to this device's key in both HKDF and the AEAD, and signed by whoever
+  // granted it. The bridge read an older format for months after the browser
+  // moved on, and nothing noticed because these tests wrapped the old way too.
+  const spaceKey = new Uint8Array(32).fill(7);
+
+  it('opens a wrap made for this space and signed by its granter', async () => {
+    const identity = await loadOrCreateIdentity(path);
+    const granter = await makeGranter();
+    const wrapped = await wrapToDevice(identity.publicKey, spaceKey, 'space-a', granter);
+    expect(await unwrapToDevice(identity, wrapped, { space: 'space-a' }, granter.signingPublicKey))
+      .toEqual(spaceKey);
+  });
+
+  it('refuses a wrap made for another space, which is the substitution the binding exists for', async () => {
+    const identity = await loadOrCreateIdentity(path);
+    const granter = await makeGranter();
+    const wrapped = await wrapToDevice(identity.publicKey, spaceKey, 'space-a', granter);
+    await expect(unwrapToDevice(identity, wrapped, { space: 'space-b' }, granter.signingPublicKey))
+      .rejects.toThrow(/not signed by the key it should have been/);
+  });
+
+  it('refuses an unsigned wrap, and one signed by somebody else', async () => {
+    const identity = await loadOrCreateIdentity(path);
+    const granter = await makeGranter();
+    const stranger = await makeGranter();
+    const unsigned = await wrapToDevice(identity.publicKey, spaceKey, 'space-a', granter, { unsigned: true });
+    await expect(unwrapToDevice(identity, unsigned, { space: 'space-a' }, granter.signingPublicKey))
+      .rejects.toThrow(/not signed/);
+    const forged = await wrapToDevice(identity.publicKey, spaceKey, 'space-a', stranger);
+    await expect(unwrapToDevice(identity, forged, { space: 'space-a' }, granter.signingPublicKey))
+      .rejects.toThrow(/somebody other than the person who granted it/);
+    // With no granter key served there is nothing to check against, so nothing opens.
+    const good = await wrapToDevice(identity.publicKey, spaceKey, 'space-a', granter);
+    await expect(unwrapToDevice(identity, good, { space: 'space-a' }, null)).rejects.toThrow(/no signing key/);
+  });
+
+  it('strips the size padding the vault adds before sealing', async () => {
+    const sealed = await seal(spaceKey, 'sk-live-1234');
+    expect(await openEnvelope(spaceKey, sealed)).toBe('sk-live-1234');
+    expect(new TextDecoder().decode(unpad(new Uint8Array([0, 0, 0, 2, 104, 105, 0, 0])))).toBe('hi');
+    expect(() => unpad(new Uint8Array([0, 0, 0, 9, 1]))).toThrow(/malformed/);
   });
 });

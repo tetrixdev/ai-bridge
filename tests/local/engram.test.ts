@@ -18,6 +18,7 @@ import { webcrypto } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fillRoles, grantedTo, loadSecrets, roleEnvName } from '../../src/local/engram.js';
 import { b64u, type Identity } from '../../src/local/identity.js';
+import { makeGranter, seal, wrapToDevice } from './vault-half.js';
 
 const C = webcrypto.subtle;
 const CURVE = { name: 'ECDH', namedCurve: 'P-256' } as const;
@@ -32,44 +33,23 @@ async function makeIdentity(): Promise<Identity> {
   };
 }
 
-/** The wrapping half of unwrapToDevice, which only Engram's browser code does. */
-async function wrapToDevice(publicKeyB64u: string, payload: Uint8Array): Promise<string> {
-  const pub = await C.importKey('raw', b64u.decode(publicKeyB64u), CURVE, false, []);
-  const eph = (await C.generateKey(CURVE, true, ['deriveBits'])) as webcrypto.CryptoKeyPair;
-  const shared = await C.deriveBits({ name: 'ECDH', public: pub }, eph.privateKey, 256);
-  const base = await C.importKey('raw', new Uint8Array(shared), 'HKDF', false, ['deriveKey']);
-  const kek = await C.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: new TextEncoder().encode('engram-space-key') },
-    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt'],
-  );
-  const iv = webcrypto.getRandomValues(new Uint8Array(12));
-  const ct = await C.encrypt({ name: 'AES-GCM', iv }, kek, payload);
-  return JSON.stringify({
-    epk: b64u.encode(await C.exportKey('raw', eph.publicKey)),
-    iv: b64u.encode(iv),
-    ct: b64u.encode(ct),
-  });
-}
-
-async function seal(spaceKey: Uint8Array, value: string): Promise<{ iv: string; ct: string }> {
-  const key = await C.importKey('raw', spaceKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
-  const iv = webcrypto.getRandomValues(new Uint8Array(12));
-  const ct = await C.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(value));
-  return { iv: b64u.encode(iv), ct: b64u.encode(ct) };
-}
-
 /**
  * Stand in for Engram: real ciphertext, so decryption is exercised for real.
  * A secret's id is `<space>-<name>`, which makes an id in a test readable and
  * makes a cross-space id easy to write down.
  */
 async function serve(identity: Identity, spaces: Record<string, Record<string, string>>): Promise<void> {
-  const keys: { space_id: string; wrapped_key: string }[] = [];
+  const keys: { space_id: string; wrapped_key: string; granted_by_signing_key: string }[] = [];
+  const granter = await makeGranter();
   const secrets: { id: string; space_id: string; name: string; envelope: { iv: string; ct: string } }[] = [];
 
   for (const [spaceId, entries] of Object.entries(spaces)) {
     const spaceKey = webcrypto.getRandomValues(new Uint8Array(32));
-    keys.push({ space_id: spaceId, wrapped_key: await wrapToDevice(identity.publicKey, spaceKey) });
+    keys.push({
+      space_id: spaceId,
+      wrapped_key: await wrapToDevice(identity.publicKey, spaceKey, spaceId, granter),
+      granted_by_signing_key: granter.signingPublicKey,
+    });
     for (const [name, value] of Object.entries(entries)) {
       secrets.push({ id: `${spaceId}-${name}`, space_id: spaceId, name, envelope: await seal(spaceKey, value) });
     }
@@ -160,7 +140,12 @@ describe('keying the secrets a device holds', () => {
   it('refuses to guess between two secrets one space named the same', async () => {
     const identity = await makeIdentity();
     const spaceKey = webcrypto.getRandomValues(new Uint8Array(32));
-    const keys = [{ space_id: 'alpha', wrapped_key: await wrapToDevice(identity.publicKey, spaceKey) }];
+    const granter = await makeGranter();
+    const keys = [{
+      space_id: 'alpha',
+      wrapped_key: await wrapToDevice(identity.publicKey, spaceKey, 'alpha', granter),
+      granted_by_signing_key: granter.signingPublicKey,
+    }];
     const secrets = [
       { id: 'first', space_id: 'alpha', name: 'db', envelope: await seal(spaceKey, 'first-value') },
       { id: 'second', space_id: 'alpha', name: 'db', envelope: await seal(spaceKey, 'second-value') },

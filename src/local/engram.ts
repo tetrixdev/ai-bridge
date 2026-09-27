@@ -164,9 +164,9 @@ export async function loadSecrets(
   identity: Identity,
   deviceId: string,
 ): Promise<SecretStore> {
-  const { keys } = await call<{ keys: { space_id: string; wrapped_key: string }[] }>(
-    cfg, `/devices/${deviceId}/keys`,
-  );
+  const { keys } = await call<{
+    keys: { space_id: string; wrapped_key: string; granted_by_signing_key?: string | null }[];
+  }>(cfg, `/devices/${deviceId}/keys`);
   const store = new SecretStore();
   if (keys.length === 0) {
     log.info('device holds no space keys yet; approve it in the browser and give it one');
@@ -176,10 +176,16 @@ export async function loadSecrets(
   const spaceKeys = new Map<string, Uint8Array>();
   for (const k of keys) {
     try {
-      spaceKeys.set(k.space_id, await unwrapToDevice(identity.privateKey, k.wrapped_key));
-    } catch {
-      // A key wrapped for a different device, or for a key we no longer hold.
-      log.warn('could not open a space key; ignoring it', { space: k.space_id });
+      spaceKeys.set(k.space_id, await unwrapToDevice(
+        identity, k.wrapped_key, { space: k.space_id }, k.granted_by_signing_key));
+    } catch (err) {
+      // A key wrapped for a different device, for a key we no longer hold, in
+      // the format before wraps were bound to their space, or not signed by
+      // whoever granted it. Said, because "no secrets" with nothing in the log
+      // is the failure this used to be.
+      log.warn('could not open a space key; ignoring it', {
+        space: k.space_id, reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
