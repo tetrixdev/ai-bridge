@@ -48,6 +48,7 @@ import { LOCAL_EXECUTION_OFF, refusalReason, runsLocally, type LocalExecutionCon
 import { runLocalTool } from './local/executor.js';
 import { fillRoles, loadSecrets, sealedRefs, SecretStore, type EngramConfig, type SealedRef } from './local/engram.js';
 import { handleLocalCall, stagePackage } from './local/call.js';
+import { AppSupervisor } from './apps/supervisor.js';
 import { SpaceLimiter } from './local/limits.js';
 import type { Identity } from './local/identity.js';
 import type { Redaction } from './local/scrub.js';
@@ -460,6 +461,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly allowedRootPaths: string[];
   /** Where attachments come from and go to. */
   private readonly apiOrigin: string;
+  /** Engram app backends this bridge runs, one process per app version. */
+  private readonly appSupervisor: AppSupervisor;
   private readonly attachmentLimits: AttachmentLimits;
   private readonly attachmentTimeouts: AttachmentTimeouts;
   private readonly attachmentCache: AttachmentCache;
@@ -506,6 +509,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.allowedRoots = options.allowedRoots ?? [];
     this.allowedRootPaths = rootPaths(this.allowedRoots);
     this.apiOrigin = options.apiOrigin ?? resolveApiOrigin(options.serverUrl);
+    this.appSupervisor = new AppSupervisor({
+      config: this.localExecution,
+      apiOrigin: this.apiOrigin,
+      secrets: (refs) => this.secretsFor(refs),
+      ...(this.localExecution.dataDir ? { dataDir: this.localExecution.dataDir } : {}),
+    });
     this.attachmentLimits = options.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS;
     this.attachmentTimeouts = options.attachmentTimeouts ?? DEFAULT_ATTACHMENT_TIMEOUTS;
     this.attachmentCache = options.attachmentCache
@@ -1045,6 +1054,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // A file being handed back streams over its own HTTP request, which would
     // otherwise keep going after the socket that asked for it is gone.
     for (const read of this.fileReads.values()) read.abort();
+    // App backends are the bridge's own children: they go with it.
+    await this.appSupervisor.stopAll();
     await this.mcpServer.stop();
 
     // Cancel active requests
@@ -1134,6 +1145,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         this.handleUsageRequestMessage(message);
         break;
 
+      case 'app_call':
+        void this.appSupervisor.handle(message).then(
+          (result) => this.send(result),
+          (err: unknown) => log.error('could not answer an app_call', {
+            id: message.id, error: err instanceof Error ? err.message : String(err),
+          }),
+        );
+        break;
       case 'local_call':
         this.handleLocalCallMessage(message);
         break;
@@ -1353,6 +1372,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       file_uploads: true,
       // Recorded files are handed back by id (`file_read`), never by path.
       file_downloads: true,
+      // Engram app backends, behind the --local-tools gate (src/apps/supervisor.ts).
+      app_backends: true,
       // Advertise the operator's allow-list so the server can offer a picker
       // rather than asking a developer to type an absolute path into a chat
       // box. Omitted entirely when empty: "no workspaces" and "this bridge
