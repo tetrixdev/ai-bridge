@@ -241,6 +241,8 @@ export interface HelloMessage {
    * that did not opt in answers each call with a refusal.
    */
   app_backends?: true;
+  /** Takes `app_call.use`: a linked item other than the default, beside one request (0.22.0). */
+  app_items?: true;
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -970,6 +972,14 @@ export interface AppCallMessage {
   };
   /** Vault roles, filled as for local tools: ENGRAM_<ROLE>_<FIELD> in the process environment. */
   fill?: ItemFill[];
+  /**
+   * Linked items THIS request uses instead of a role's default (0.22.0,
+   * `hello.app_items`). Opened here like `fill`, but handed to the backend on
+   * this one request's line as `vault` ({ENGRAM_<ROLE>_<FIELD>: value}), never
+   * put in the process's environment, so the process keeps running on the
+   * defaults and another request never sees them.
+   */
+  use?: ItemFill[];
   request: { method: string; path: string; headers?: Record<string, string>; body?: string };
   /** Engram's API for this request, as the person, bounded by the manifest. Passed to the backend. */
   engram: { api: string; token: string };
