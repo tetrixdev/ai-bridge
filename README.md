@@ -417,7 +417,10 @@ roles), before the bridge is ever asked to run it.
   program it starts is NOT confined. The network is not confined at all (Node
   22 cannot); the hosts it declares are shown to you, not enforced.
 - **Vault values** reach it as `ENGRAM_<ROLE>_<FIELD>`, like local tools, and
-  are scrubbed from what it answers.
+  are scrubbed from what it answers. These are the DEFAULT items you linked to
+  the app. For a role that takes several (one account per client), a request
+  that names another linked item gets that item's values on its own request
+  line, as `vault`, never in the process's environment (0.22.0).
 
 It talks to the bridge over stdin and stdout, one JSON line per request and
 per response, so nothing listens on your machine. See PROTOCOL.md "App

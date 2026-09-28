@@ -30,7 +30,9 @@ rl.on('line', (line) => {
   const answer = () => process.stdout.write(JSON.stringify({ id: req.id, status: 201, headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ pid: process.pid, n: ++n, path: req.path, method: req.method, body: req.body, api: req.engram.api,
       token: req.engram.token, secret: process.env.ENGRAM_MAIL_PASSWORD || null, plain: process.env.ENGRAM_MAIL_USER || null,
-      version: process.env.ENGRAM_APP_VERSION, read }) }) + '\\n')
+      version: process.env.ENGRAM_APP_VERSION, read,
+      vault: req.vault ? Object.keys(req.vault).sort() : null, vplain: req.vault?.ENGRAM_MAIL_USER ?? null,
+      vsecret: req.vault?.ENGRAM_MAIL_PASSWORD ?? null }) }) + '\\n')
   if (req.path === '/slow') setTimeout(answer, 300); else answer()
 })
 `;
@@ -187,6 +189,37 @@ describe('app backends', () => {
     expect(again.plain).toBe('you@example.test');
     expect(again.pid).not.toBe(body.pid);
     expect(s.list()).toHaveLength(1);
+  });
+
+  it('hand another linked item to one request beside it, never into the environment, on the same process', async () => {
+    const store = new SecretStore();
+    store.add({ id: 'sec-1', spaceId: 'space-1', itemId: 'item-1', field: 'password', value: 'default-secret-value' });
+    store.add({ id: 'sec-2', spaceId: 'space-1', itemId: 'item-2', field: 'password', value: 'second-secret-value' });
+    const s = supervisor({}, store);
+    const v = version(8);
+    const fill = [{ role: 'mail', item_id: 'item-1', space_id: 'space-1', fields: { user: 'me@example.test' },
+      sealed: [{ field: 'password', secret_id: 'sec-1', space_id: 'space-1' }] }];
+    const use = [{ role: 'mail', item_id: 'item-2', space_id: 'space-1', fields: { user: 'work@example.test' },
+      sealed: [{ field: 'password', secret_id: 'sec-2', space_id: 'space-1' }] }];
+
+    const plain = json(await s.handle(call(v, '/items', { fill })));
+    expect(plain.vault).toBeNull();
+    const named = json(await s.handle(call(v, '/items', { fill, use })));
+    // The same process: the defaults stay in its environment, untouched.
+    expect(named.pid).toBe(plain.pid);
+    expect(named.plain).toBe('me@example.test');
+    expect(named.vault).toEqual(['ENGRAM_MAIL_PASSWORD', 'ENGRAM_MAIL_USER']);
+    expect(named.vplain).toBe('work@example.test');
+    // Opened here and handed over, then scrubbed from the answer like the fill's.
+    expect(named.vsecret).toBe('[redacted: ENGRAM_MAIL_PASSWORD]');
+    // The next request without `use` sees none of it.
+    expect(json(await s.handle(call(v, '/items', { fill }))).vault).toBeNull();
+    expect(s.list()).toHaveLength(1);
+
+    // A role the call does not fill cannot be handed over on the side.
+    const r = await s.handle(call(v, '/items', { fill, use: [{ ...use[0]!, role: 'other' }] }));
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/a role it does not fill/);
   });
 
   it('refuse files that do not match their hash, and URLs off the server it is connected to', async () => {

@@ -1374,6 +1374,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       file_downloads: true,
       // Engram app backends, behind the --local-tools gate (src/apps/supervisor.ts).
       app_backends: true,
+      // ...and hands a backend another linked item beside one request (app_call.use).
+      app_items: true,
       // Advertise the operator's allow-list so the server can offer a picker
       // rather than asking a developer to type an absolute path into a chat
       // box. Omitted entirely when empty: "no workspaces" and "this bridge

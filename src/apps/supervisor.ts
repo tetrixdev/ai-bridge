@@ -142,7 +142,16 @@ export class AppSupervisor {
 
       const running = await this.processFor(call);
       granted = running.granted;
-      const response = await this.send(running, call);
+      // Another linked item than a role's default, for this request only:
+      // opened like the fill, handed over on the request's own line, and
+      // scrubbed from this answer with the process's own.
+      let vault: Record<string, string> | undefined;
+      if (call.use?.length) {
+        const used = fillRoles(await this.options.secrets(sealedRefs(call.use)), call.use);
+        vault = { ...used.env, ...Object.fromEntries(used.sealed.map((x) => [x.name, x.value])) };
+        granted = [...granted, ...used.sealed];
+      }
+      const response = await this.send(running, call, vault);
       return {
         type: 'app_result', id, ok: true,
         response: {
@@ -296,7 +305,7 @@ export class AppSupervisor {
     this.idleLater(running);
   }
 
-  private send(running: Running, call: AppCallMessage): Promise<BackendResponse> {
+  private send(running: Running, call: AppCallMessage, vault?: Record<string, string>): Promise<BackendResponse> {
     if (running.idle) { clearTimeout(running.idle); running.idle = undefined; }
     const rid = randomBytes(8).toString('hex');
     return new Promise<BackendResponse>((resolveResponse, reject) => {
@@ -310,6 +319,7 @@ export class AppSupervisor {
         id: rid, method: call.request.method, path: call.request.path,
         headers: call.request.headers ?? {}, body: call.request.body ?? '',
         engram: { api: call.engram.api, token: call.engram.token },
+        ...(vault ? { vault } : {}),
       });
       running.child.stdin!.write(line + '\n');
     });
@@ -450,6 +460,13 @@ function validate(m: AppCallMessage): AppCallMessage {
   }
   if (!m.engram || typeof m.engram.api !== 'string' || typeof m.engram.token !== 'string') {
     throw new Error('this app_call carries no Engram API token');
+  }
+  if (m.use !== undefined && !Array.isArray(m.use)) throw new Error('this app_call\'s "use" is a list of filled roles, as "fill" is');
+  // A role named in `use` must be one the process was filled for: a request
+  // handing over a role the backend was never given would be a second fill.
+  const filled = new Set((m.fill ?? []).map((f) => f.role));
+  for (const u of m.use ?? []) {
+    if (!filled.has(u.role)) throw new Error(`this app_call uses an item for "${u.role}", a role it does not fill`);
   }
   return m;
 }
