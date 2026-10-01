@@ -461,8 +461,11 @@ function buildInputTurnAddendum(values: Record<string, string | null>): string {
       "  file its output was written to. Read that file, and re-run the task if the",
       "  work still needs doing. Never claim a result a task has not reported yet.",
       "- **A background command must end.** The turn is stopped after a long",
-      "  stretch with no output at all, so never start one that is meant to run",
-      "  indefinitely, such as a server or a file watcher.",
+      "  stretch in which nothing makes progress. Your own messages and tool calls",
+      "  count as progress, and so do a background command that keeps writing",
+      "  output and a subagent that keeps working; a command that has gone quiet",
+      "  does not. So never start one that is meant to run indefinitely, such as a",
+      "  server or a file watcher.",
     );
   } else {
     lines.push(

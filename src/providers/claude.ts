@@ -65,6 +65,7 @@ import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-ca
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 import { stopTurn, stoppedByUs } from './stop.js';
 import { userMessageFrame } from './turn-input.js';
+import { createTaskOutputWatch } from './task-output-watch.js';
 
 /**
  * How long a turn with its input open waits for the CLI to start the turn it
@@ -371,6 +372,17 @@ export class ClaudeAdapter extends ProviderAdapter {
       const mainBackgroundTasks = new Set<string>();
       /** A main-assistant background task ended; the CLI owes it a turn. */
       let notificationOwed = false;
+      /**
+       * A background shell task writes nothing to the stream while it runs, so
+       * its output file growing is what counts as activity for the silence
+       * clock. See task-output-watch.ts.
+       */
+      const taskOutput = createTaskOutputWatch({
+        silenceSeconds: context.silenceTimeoutSeconds,
+        onGrowth: () => { timeouts?.notice(); },
+        log,
+        requestId,
+      });
       let graceTimer: ReturnType<typeof setTimeout> | null = null;
       let stdinClosed = false;
       /** The CLI has not echoed the opening message yet. */
@@ -451,9 +463,11 @@ export class ClaudeAdapter extends ProviderAdapter {
           if (frame['is_backgrounded'] === true && frame['owned_by_subagent'] !== true) {
             mainBackgroundTasks.add(task.task_id);
           }
+          taskOutput.started(frame);
         } else if (task.phase === 'finished'
           || (task.phase === 'updated' && task.status !== 'running' && task.status !== 'pending')) {
           runningTasks.delete(task.task_id);
+          taskOutput.ended(task.task_id);
           // The main assistant is told about its own background tasks in a
           // turn of the CLI's own, which is still to come. Whichever frame
           // says the task ended first counts: the CLI writes `updated` just
@@ -546,6 +560,7 @@ export class ClaudeAdapter extends ProviderAdapter {
           // internally and not yet written, and no amount of flushing on this
           // side reaches that.
           port?.end();
+          taskOutput.stop();
           stopTurn(child, { requestId, provider: 'claude' });
         },
       });
@@ -558,6 +573,7 @@ export class ClaudeAdapter extends ProviderAdapter {
         // Nothing more reaches a turn being stopped; what was accepted and not
         // read is reported by the bridge as `cancelled.pending_inputs`.
         port?.end();
+        taskOutput.stop();
         stopTurn(child, { requestId, provider: 'claude' });
       };
       signal.addEventListener('abort', onAbort, { once: true });
@@ -826,6 +842,9 @@ export class ClaudeAdapter extends ProviderAdapter {
             if (typeof toolUseId !== 'string') continue;
 
             const isError = entry['is_error'];
+            const resultText = flattenToolResult(entry['content']);
+            // A backgrounded command's reply names the file its output goes to.
+            taskOutput.toolResult(toolUseId, resultText);
             // Through the deferral queue like every other whole-message event.
             // A backgrounded sub-agent reports its results while the main agent
             // is still writing, so emitting directly put tool output inside an
@@ -835,7 +854,7 @@ export class ClaudeAdapter extends ProviderAdapter {
             // right only for foreground sub-agents.
             for (const data of toolResultEventData(
               toolUseId,
-              flattenToolResult(entry['content']),
+              resultText,
               typeof isError === 'boolean' ? isError : undefined,
             )) {
               const withParent: Record<string, unknown> = { ...data, ...parent };
@@ -1224,6 +1243,7 @@ export class ClaudeAdapter extends ProviderAdapter {
         signal.removeEventListener('abort', onAbort);
         clearRequestTimeout(timeoutTimer);
         port?.end();
+        taskOutput.stop();
         if (graceTimer !== null) clearTimeout(graceTimer);
 
         if (!settled) {
@@ -1258,6 +1278,7 @@ export class ClaudeAdapter extends ProviderAdapter {
         // The CLI is gone, whether or not we closed its input: nothing more
         // can reach it.
         port?.end();
+        taskOutput.stop();
         if (graceTimer !== null) clearTimeout(graceTimer);
         finalizer.onChildClose(code);
       });
