@@ -30,6 +30,7 @@ import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
 import { boundArgumentText, boundArguments, safeStringify, toolResultEventData } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
+import { logIgnoredAgents } from './agents.js';
 import { stopTurn, stoppedByUs } from './stop.js';
 
 const log = createLogger('CodexAdapter');
@@ -125,6 +126,7 @@ export class CodexAdapter extends ProviderAdapter {
     const userMessage = request.message;
 
     log.info('Executing Codex request', { requestId });
+    logIgnoredAgents(request.agents, 'codex', log);
 
     // Build CLI arguments
     let args: string[];

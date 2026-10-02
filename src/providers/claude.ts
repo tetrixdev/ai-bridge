@@ -67,6 +67,7 @@ import { createLogger, isDebugEnabled } from '../utils/logger.js';
 import { stopTurn, stoppedByUs } from './stop.js';
 import { userMessageFrame } from './turn-input.js';
 import { createTaskOutputWatch } from './task-output-watch.js';
+import { resolveAgents, writeClaudeAgentsFile, type AgentsFileHandle } from './agents.js';
 
 /**
  * How long a turn with its input open waits for the CLI to start the turn it
@@ -301,6 +302,19 @@ export class ClaudeAdapter extends ProviderAdapter {
       args.push('--mcp-config', configPath);
     }
 
+    // Server-defined subagents. Written to a 0600 file rather than passed
+    // inline: the prompts can be long (argv size limit, `spawn E2BIG`), and
+    // with --print the CLI accepts a path. Re-sent every turn like
+    // --system-prompt — `--agents` is per-invocation and not retained across
+    // --resume. Removed when the process closes (it is read at startup).
+    let agentsFile: AgentsFileHandle | null = null;
+    const { agents } = resolveAgents(request.agents, log);
+    if (agents !== null) {
+      agentsFile = writeClaudeAgentsFile(agents);
+      args.push('--agents', agentsFile.path);
+      log.debug('Passing subagents to claude', { requestId, agents: Object.keys(agents) });
+    }
+
     // Permission mode, decided independently of whether any tools were
     // registered — a `workspace` turn with no server tools still needs to be
     // able to edit and run things, and a `native` turn was always meant to.
@@ -463,9 +477,15 @@ export class ClaudeAdapter extends ProviderAdapter {
       // An input-open turn hands over its opening message as the first NDJSON
       // frame and keeps stdin open; every other turn writes the bare prompt
       // and closes it, exactly as before.
-      const child = acceptsInput
-        ? this.spawnCli('claude', args, env, userMessageFrame(userMessage), context.workingDir, { keepStdinOpen: true })
-        : this.spawnCli('claude', args, env, userMessage, context.workingDir);
+      let child: ReturnType<typeof this.spawnCli>;
+      try {
+        child = acceptsInput
+          ? this.spawnCli('claude', args, env, userMessageFrame(userMessage), context.workingDir, { keepStdinOpen: true })
+          : this.spawnCli('claude', args, env, userMessage, context.workingDir);
+      } catch (err) {
+        agentsFile?.release();
+        throw err;
+      }
 
       /**
        * Say what the main assistant is doing, only when it changes. Through
@@ -1290,6 +1310,7 @@ export class ClaudeAdapter extends ProviderAdapter {
 
       child.on('error', (err: NodeJS.ErrnoException) => {
         log.error('Failed to spawn claude', { error: err.message });
+        agentsFile?.release();
         // Provide user-friendly message for ENOENT
         const errorMessage = err.code === 'ENOENT'
           ? 'claude CLI not found. Install it or ensure it is on your PATH.'
@@ -1329,6 +1350,7 @@ export class ClaudeAdapter extends ProviderAdapter {
           });
         }
         clearRequestTimeout(timeoutTimer);
+        agentsFile?.release();
         // The CLI is gone, whether or not we closed its input: nothing more
         // can reach it.
         port?.end();

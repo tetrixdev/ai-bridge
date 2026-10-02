@@ -831,6 +831,8 @@ When the server needs an AI response (triggered by a user message in the browser
 
 **`system_prompt`**: The system prompt. May be `null`.
 
+**`agents`** *(optional)*: Subagents the assistant may delegate to this turn. See [Additive field: `agents`](#additive-field-agents--per-request-subagents).
+
 **`cli_session_id`**: The CLI session to resume, or `null` to start a fresh session. **The server owns this mapping** (persisted per conversation) and is the single source of truth — the bridge keeps no session map of its own. See [Conversation Continuity](#conversation-continuity).
 
 **`history`**: Prior conversation turns (`{role, content}`). Included only when `cli_session_id` is `null`, so a fresh CLI session can be seeded with context. Omitted when resuming — the resumed session already holds its history.
@@ -988,6 +990,34 @@ Server-supplied text is capped at 8 KB. A cap with a clear refusal beats a `spaw
 **The addendum is generated from the resolved environment, not shipped as a fixed string.** If a project uses `bridge_env` to turn background work back on, an addendum still saying the capability is disabled would be lying to the model about something it can observe directly in its own tool schema. The lifecycle bullets change with the configuration; "one process per turn, nothing survives it" is stated either way, because it is true either way.
 
 `off` and `replace` are the project's right, and both are logged at warning level naming what was dropped: a project that takes them on owns explaining the lifecycle itself.
+
+#### Additive field: `agents` — per-request subagents
+
+Helpers (subagents) the assistant may delegate to, defined by the server per request. An object keyed by agent name; each value is Claude Code's `--agents` JSON shape:
+
+```json
+"agents": {
+  "researcher": {
+    "description": "Looks things up in memory before answering. Use for any question about past calls.",
+    "prompt": "You are a careful researcher. Query memory, then answer in two sentences.",
+    "tools": ["mcp__bridge__memory_query"],
+    "model": "haiku"
+  }
+}
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `description` | string | yes | When the main assistant should delegate to this helper. |
+| `prompt` | string | yes | The helper's system prompt. |
+| `tools` | string[] | no | Tools the helper may use. **Absent = every tool the main assistant has.** |
+| `model` | string | no | `sonnet`, `opus`, `haiku`, `inherit` or a full model id. Absent = inherit. |
+
+- **Claude**: written to a `0600` file in a per-turn temp directory and passed as `--agents <file>`; the file is removed when the CLI exits. Like `system_prompt`, it is per-invocation and **not retained across `--resume`** — send it on every turn that should have the helpers.
+- **Codex / Gemini**: ignored (debug log). Neither CLI takes subagent definitions.
+- **Absent or `null`**: no flag, today's behaviour.
+- **Validation drops, never refuses.** An entry with a bad name (must be 1–64 of `A-Z a-z 0-9 - _`, starting with a letter or digit), a missing/empty `description` or `prompt`, a `tools` that is not an array of non-empty strings, or a non-string `model` is dropped whole and logged at warning level with the reason; the rest are passed on. A malformed `tools` drops the entry rather than the field, because dropping only the field would widen the helper to every tool. Fields other than the four above are stripped (logged), not forwarded. A non-object `agents` is ignored as a whole.
+- **Isolation is unchanged.** The helpers run inside the same CLI process and under the same permission posture as the main assistant: `tools` can only narrow what a helper may use, never widen it past what the posture allows. (Verified on Claude Code 2.1.283: in `isolated` posture the main assistant can still delegate to a defined helper.)
 
 ### Bridge → Server: `ai_request_ack`
 

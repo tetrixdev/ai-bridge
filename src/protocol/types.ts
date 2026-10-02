@@ -882,6 +882,36 @@ export interface AiRequestMessage {
     mode?: 'default' | 'off' | 'append' | 'replace';
     text?: string | null;
   };
+  /**
+   * Subagents (helpers) the assistant may delegate to this turn, keyed by
+   * agent name. Provider-neutral on the wire; Claude passes them to
+   * `--agents`, other providers ignore the field (debug log).
+   *
+   * Per-invocation, like `system_prompt`: not retained across `--resume`, so a
+   * server sends it on every turn it wants the helpers available.
+   *
+   * Absent or null means none. An invalid entry is dropped (logged at warning
+   * level), never the turn. See AgentDefinition.
+   */
+  agents?: Record<string, AgentDefinition> | null;
+}
+
+/**
+ * One subagent definition — Claude Code's `--agents` JSON shape, restricted
+ * to the fields the protocol carries. Other fields are stripped.
+ */
+export interface AgentDefinition {
+  /** When the main assistant should delegate to this helper. Required. */
+  description: string;
+  /** The helper's system prompt. Required. */
+  prompt: string;
+  /**
+   * Tools the helper may use. Absent = inherits every tool the main assistant
+   * has. A malformed list drops the whole entry rather than widening it.
+   */
+  tools?: string[];
+  /** Model alias or id (`sonnet`, `opus`, `haiku`, `inherit`, …). Absent = inherit. */
+  model?: string;
 }
 
 /**
