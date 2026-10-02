@@ -33,9 +33,19 @@ describe('writeClaudeMcpConfig', () => {
           type: 'http',
           url: conn.url,
           headers: { Authorization: `Bearer ${conn.bearerToken}` },
+          alwaysLoad: true,
         },
       },
     });
+  });
+
+  it('marks only the bridge server alwaysLoad so its tools are not deferred behind ToolSearch', () => {
+    const path = writeClaudeMcpConfig(conn);
+    const content = JSON.parse(readFileSync(path, 'utf-8')) as {
+      mcpServers: Record<string, { alwaysLoad?: boolean }>;
+    };
+    expect(Object.keys(content.mcpServers)).toEqual([BRIDGE_MCP_SERVER_NAME]);
+    expect(content.mcpServers[BRIDGE_MCP_SERVER_NAME].alwaysLoad).toBe(true);
   });
 
   it('writes the config file with mode 0600 — the file holds the bearer token', () => {
