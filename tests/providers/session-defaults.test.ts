@@ -179,6 +179,20 @@ describe('a turn that keeps its input open (accepts_input)', () => {
     expect(text).not.toContain('Background shell commands are disabled');
   });
 
+  it('says what counts as progress, so a long wait on working tasks is not mistaken for silence', () => {
+    const text = buildBridgeAddendum(resolveBridgeEnv(undefined, { acceptsInput: true }).values, { acceptsInput: true });
+    const flat = text.replace(/\s+/g, ' ');
+
+    // The old wording ("no output at all") was read as including a task's own
+    // log lines, which did not count then. They do now, when they keep growing.
+    expect(flat).not.toContain('no output at all');
+    expect(flat).toContain('nothing makes progress');
+    expect(flat).toContain('a background command that keeps writing output');
+    expect(flat).toContain('a subagent that keeps working');
+    expect(flat).toContain('a command that has gone quiet does not');
+    expect(flat).toContain('never start one that is meant to run indefinitely');
+  });
+
   it('still forbids detaching work from the turn, in every mode', () => {
     const modes: Array<[Record<string, string | null> | undefined, boolean]> = [
       [undefined, true], [undefined, false], [{ [BACKGROUND]: '0' }, false], [{ [BACKGROUND]: '1' }, true],
