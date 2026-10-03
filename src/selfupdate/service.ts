@@ -252,8 +252,8 @@ async function prefetchLocked(
   timeoutMs: number,
   deps: PrefetchDeps,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const locked = await acquireLock(deps);
-  if (!locked) return { ok: false, reason: 'another bridge on this machine has been fetching for too long' };
+  const token = await acquireLock(deps);
+  if (token === null) return { ok: false, reason: 'another bridge on this machine has been fetching for too long' };
   try {
     const args = ['-y', '--prefer-online', '--ignore-scripts', `${PACKAGE}@${version}`, '--version'];
     let result = await deps.run(args, timeoutMs);
@@ -271,31 +271,53 @@ async function prefetchLocked(
     if (said !== version) return { ok: false, reason: `it reported version "${said}"` };
     return { ok: true };
   } finally {
-    try { rmSync(deps.lockDir, { recursive: true, force: true }); } catch { /* already gone */ }
+    releaseLock(deps, token);
   }
 }
 
-/** mkdir is atomic: whoever creates the directory holds the lock. */
-async function acquireLock(deps: PrefetchDeps): Promise<boolean> {
+/**
+ * mkdir is atomic: whoever creates the directory holds the lock. The holder
+ * writes a token of its own inside, so a release removes only ITS lock: a
+ * fetch that ran past the stale age and was taken over must not then delete
+ * the lock of the bridge that took over. A stale lock is taken over by
+ * renaming it aside first, which only one process can do.
+ *
+ * Resolves with the token to release with, or null when the wait ran out.
+ */
+async function acquireLock(deps: PrefetchDeps): Promise<string | null> {
   mkdirSync(dirname(deps.lockDir), { recursive: true });
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const deadline = Date.now() + deps.lockWaitMs;
   for (;;) {
     try {
       mkdirSync(deps.lockDir);
-      return true;
-    } catch {
+      writeFileSync(join(deps.lockDir, 'owner'), token);
+      return token;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
       try {
         if (Date.now() - statSync(deps.lockDir).mtimeMs > deps.lockStaleMs) {
-          rmSync(deps.lockDir, { recursive: true, force: true });
+          const aside = `${deps.lockDir}.stale-${token}`;
+          renameSync(deps.lockDir, aside);
+          rmSync(aside, { recursive: true, force: true });
           continue;
         }
       } catch {
-        continue; // released between the two calls
+        continue; // released, or taken over by someone else, in between
       }
     }
-    if (Date.now() >= deadline) return false;
+    if (Date.now() >= deadline) return null;
     await deps.sleep(2000);
   }
+}
+
+function releaseLock(deps: PrefetchDeps, token: string): void {
+  try {
+    if (readFileSync(join(deps.lockDir, 'owner'), 'utf8') !== token) return;
+    const aside = `${deps.lockDir}.released-${token}`;
+    renameSync(deps.lockDir, aside);
+    rmSync(aside, { recursive: true, force: true });
+  } catch { /* already gone, or not ours */ }
 }
 
 /**

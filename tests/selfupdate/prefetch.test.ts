@@ -123,3 +123,21 @@ describe('never throws', () => {
     expect(await prefetch('0.24.1', 1000, d)).toEqual({ ok: false, reason: 'spawn npx ENOENT' });
   });
 });
+
+describe('the lock belongs to whoever holds it', () => {
+  it('a fetch whose lock was taken over does not remove the new holder\'s lock', async () => {
+    const root = scratch();
+    const lock = join(root, 'prefetch.lock');
+    const { d } = deps(root, [], {
+      run: async () => {
+        // While this fetch runs, its lock goes stale and another bridge takes over.
+        rmSync(lock, { recursive: true, force: true });
+        mkdirSync(lock);
+        writeFileSync(join(lock, 'owner'), 'the-other-bridge');
+        return { error: null, killed: false, stdout: '0.24.1\n', stderr: '' };
+      },
+    });
+    expect(await prefetch('0.24.1', 1000, d)).toEqual({ ok: true });
+    expect(existsSync(join(lock, 'owner'))).toBe(true);
+  });
+});
