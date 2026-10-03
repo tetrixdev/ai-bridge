@@ -243,6 +243,14 @@ export interface HelloMessage {
   app_backends?: true;
   /** Takes `app_call.use`: a linked item other than the default, beside one request (0.22.0). */
   app_items?: true;
+  /**
+   * This bridge follows `welcome.desired_bridge_version` by itself: it runs as
+   * a service that can restart it onto a pinned version, and is not opted out.
+   * `false` from a bridge that understands the field but will not follow it
+   * (a terminal, an unpinned unit, opted out), absent from one that predates
+   * it. Either way such a machine needs updating by hand.
+   */
+  self_update?: boolean;
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -556,6 +564,13 @@ export interface WelcomeMessage {
    * behaviour.
    */
   cli_isolation?: CliIsolation;
+  /**
+   * The bridge version this server wants every machine on, exactly. A bridge
+   * that can (`hello.self_update`) fetches it, waits until idle, pins it and
+   * restarts onto it, whether it is higher or lower than its own. Strict
+   * semver only; anything else is ignored. Absent: no opinion.
+   */
+  desired_bridge_version?: string;
 }
 
 /** Server-provided configuration values. */

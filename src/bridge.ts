@@ -99,6 +99,12 @@ const log = createLogger('Bridge');
 // ---------------------------------------------------------------------------
 
 export interface BridgeOptions {
+  /**
+   * Following the server's desired version (src/selfupdate/). `enabled` is
+   * what `hello.self_update` says; `onDesired` gets each welcome's
+   * `desired_bridge_version`, undefined when it carried none.
+   */
+  selfUpdate?: { enabled: boolean; onDesired: (version: unknown) => void };
   /** WebSocket server URL (wss://...) — token is appended as ?token= */
   serverUrl: string;
   /** Authentication token (placed in URL query param, NOT in hello body) */
@@ -493,8 +499,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    */
   private readonly uploadContexts = new Map<string, UploadContext>();
 
+  private readonly selfUpdate: BridgeOptions['selfUpdate'];
+
   constructor(options: BridgeOptions) {
     super();
+    this.selfUpdate = options.selfUpdate;
     this.serverUrl = options.serverUrl;
     this.token = options.token;
     this.providers = options.providers;
@@ -1076,6 +1085,20 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   }
 
   /**
+   * Nothing is in progress: no turn (a sub-agent runs inside one), no turn
+   * still stopping, no upload arriving, no file going out either way, no app
+   * call. What self-update waits for before it restarts the bridge.
+   */
+  isIdle(): boolean {
+    return this.activeRequests.size === 0
+      && this.cancelledRequests.size === 0
+      && this.incomingUploads.size === 0
+      && this.fileReads.size === 0
+      && this.transfers.size === 0
+      && this.appSupervisor.inFlight() === 0;
+  }
+
+  /**
    * Returns true if the WebSocket is currently open.
    */
   isConnected(): boolean {
@@ -1376,6 +1399,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       app_backends: true,
       // ...and hands a backend another linked item beside one request (app_call.use).
       app_items: true,
+      // Follows welcome.desired_bridge_version by itself (src/selfupdate/).
+      self_update: this.selfUpdate?.enabled ?? false,
       // Advertise the operator's allow-list so the server can offer a picker
       // rather than asking a developer to type an absolute path into a chat
       // box. Omitted entirely when empty: "no workspaces" and "this bridge
@@ -1533,6 +1558,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       request_timeout: DEFAULT_REQUEST_TIMEOUT_SECONDS,
       silence_timeout: DEFAULT_SILENCE_TIMEOUT_SECONDS,
     };
+
+    // The version the server wants this machine on. Handed over on every
+    // welcome, so a deploy that changes it reaches every bridge as it
+    // reconnects; absent means the server no longer asks for one.
+    this.selfUpdate?.onDesired(message.desired_bridge_version);
 
     // The server tops up long-lived tokens — adopt a fresh one if offered.
     if (message.refreshed_token) {

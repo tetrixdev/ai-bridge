@@ -29,6 +29,8 @@ import { buildAllowedRoots, type AllowedRoot } from './workspace/allowlist.js';
 import { resolveApiOrigin } from './attachments/origin.js';
 import { enrol, type EngramConfig } from './local/engram.js';
 import { installBridge, listBridges, pathsFor, readEnvFile, uninstallBridge } from './service/index.js';
+import { SelfUpdater } from './selfupdate/updater.js';
+import { detect as detectService, pinVersion, prefetch } from './selfupdate/service.js';
 import {
   ATTACHMENT_OPTIONS,
   resolveAttachmentSettings,
@@ -189,6 +191,12 @@ program
     process.env['AI_BRIDGE_API'],
   )
   .option(
+    '--no-self-update',
+    'Do not follow the version the server asks this bridge to run (or set AI_BRIDGE_SELF_UPDATE=0). '
+    + 'For pinning by hand. Self-update only ever acts when the bridge runs as a systemd service whose '
+    + 'unit starts @tetrixdev/ai-bridge@${AI_BRIDGE_VERSION}; anywhere else it just logs.',
+  )
+  .option(
     '--keep-attachments',
     'Keep downloaded attachments after a turn instead of deleting them. Debugging aid.',
     false,
@@ -216,7 +224,7 @@ program
     localTools: boolean; engram?: string; engramToken?: string;
     deviceLabel: string; deviceMode: string; identityFile: string; localDataDir: string;
     allowDir: string[]; api?: string; keepAttachments: boolean; allowNative: boolean;
-    envFile?: string; installName?: string;
+    envFile?: string; installName?: string; selfUpdate: boolean;
   } & AttachmentOptionValues) => {
     opts.installName = process.env['AI_BRIDGE_NAME'] || undefined;
     // Before anything reads server or token. The file is the lowest precedence
@@ -426,7 +434,36 @@ program
       }
     }
 
-    const bridge = new Bridge({
+    // Following the server's desired version (src/selfupdate/). Decided before
+    // connecting, because hello says whether this bridge will.
+    const selfUpdateOff = !opts.selfUpdate
+      || /^(0|false|off|no)$/i.test(process.env['AI_BRIDGE_SELF_UPDATE'] ?? '');
+    const detection = detectService();
+    const unitName = 'managed' in detection ? detection.managed.unit : 'manual';
+    let restartBridge: () => Promise<void> = async () => { /* replaced once the bridge exists */ };
+    const updater = new SelfUpdater({
+      currentVersion: BRIDGE_VERSION,
+      optedOut: selfUpdateOff,
+      detection,
+      prefetch: (version) => prefetch(version),
+      isIdle: (): boolean => bridge.isIdle(),
+      pin: (version, previous) => {
+        if (!('managed' in detection)) throw new Error('not a managed service');
+        pinVersion(detection.managed.envFile, version, previous);
+      },
+      restart: () => { void restartBridge(); },
+      statePath: join(homedir(), '.cache', 'ai-bridge', `self-update-${unitName.replace(/[^A-Za-z0-9_.@-]/g, '_')}.json`),
+      log,
+    });
+    if ('managed' in detection && !selfUpdateOff) {
+      log.info(`Self-update: on, through ${detection.managed.unit} (${detection.managed.envFile})`);
+    } else {
+      log.info(`Self-update: off (${selfUpdateOff ? 'turned off' : (detection as { reason: string }).reason})`);
+    }
+    updater.start();
+
+    const bridge: Bridge = new Bridge({
+      selfUpdate: { enabled: updater.enabled, onDesired: (version) => updater.onDesired(version) },
       serverUrl,
       token,
       providers,
@@ -490,6 +527,16 @@ program
       process.exit(0);
     };
 
+    // Self-update's way out: a clean disconnect, then a non-zero exit, which
+    // both Restart=always and Restart=on-failure answer by starting the unit
+    // again, now on the version just pinned. 75 is EX_TEMPFAIL.
+    restartBridge = async () => {
+      updater.cancel();
+      await bridge.disconnect();
+      closeLogFile();
+      process.exit(75);
+    };
+
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
 
@@ -548,7 +595,10 @@ const installCommand = program
   .requiredOption('-t, --token <token>', 'Pairing token, as the web application gave it to you')
   .option('--allow-dir <path>', 'The one folder the assistant may read, write and run things inside')
   .option('--name <name>', 'What to call this bridge. Defaults to the server\'s hostname, so one bridge per server.')
-  .option('--force', 'Replace an install of this name even if it is paired to a different server or machine', false);
+  .option('--force', 'Replace an install of this name even if it is paired to a different server or machine', false)
+  .option('--allow-native', 'Pass --allow-native to the service (see the main options)', false)
+  .option('--local-tools', 'Pass --local-tools to the service (see the main options)', false)
+  .option('--no-self-update', 'Do not follow the version the server asks for; stay on the installed one until you change AI_BRIDGE_VERSION by hand');
 // The same attachment settings as a direct run, recorded in the service's env
 // file. Left out, a reinstall keeps whatever the install it replaces had.
 for (const option of ATTACHMENT_OPTIONS) {
@@ -557,6 +607,7 @@ for (const option of ATTACHMENT_OPTIONS) {
 installCommand
   .action((opts: {
     server: string; token: string; allowDir?: string; name?: string; force: boolean;
+    allowNative: boolean; localTools: boolean; selfUpdate: boolean;
   } & AttachmentOptionValues) => {
     try {
       validateAttachmentOptions(opts);
@@ -568,6 +619,11 @@ installCommand
       const { name, replaced } = installBridge({
         server: opts.server, token: opts.token, allowDir: opts.allowDir,
         name: opts.name, force: opts.force, settings,
+        flags: [
+          ...(opts.allowNative ? ['--allow-native'] : []),
+          ...(opts.localTools ? ['--local-tools'] : []),
+          ...(opts.selfUpdate ? [] : ['--no-self-update']),
+        ],
       });
       const paths = pathsFor(name);
       console.log(`${replaced ? 'Replaced' : 'Installed'} "${name}", running in the background.`);

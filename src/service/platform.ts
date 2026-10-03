@@ -36,11 +36,18 @@ const run = (cmd: string, args: string[]): void => {
   execFileSync(cmd, args, { stdio: 'ignore' });
 };
 
-export function install(paths: Paths, config: BridgeConfig): void {
+/** Switches a service may pass to the bridge. Anything else is refused, so an
+ *  install cannot be talked into writing an arbitrary command line. */
+export const INSTALL_FLAGS = ['--allow-native', '--local-tools', '--no-self-update'] as const;
+
+export function install(paths: Paths, config: BridgeConfig, flags: string[] = []): void {
+  for (const flag of flags) {
+    if (!(INSTALL_FLAGS as readonly string[]).includes(flag)) throw new Error(`not a flag a service can be installed with: ${flag}`);
+  }
   const os = supported();
-  if (os === 'darwin') return installLaunchd(paths, config);
+  if (os === 'darwin') return installLaunchd(paths, config, flags);
   if (os === 'win32') return installScheduledTask(paths, config);
-  return installSystemd(paths, config);
+  return installSystemd(paths, config, flags);
 }
 
 /**
@@ -69,10 +76,19 @@ function installScheduledTask(paths: Paths, config: BridgeConfig): void {
   run('schtasks', ['/Run', '/TN', paths.label]);
 }
 
-function installSystemd(paths: Paths, config: BridgeConfig): void {
+/**
+ * The unit text, separate from installing it so it can be tested.
+ *
+ * Pinned: the version comes from AI_BRIDGE_VERSION in the env file, so moving
+ * the bridge is one line there and a restart, done by self-update or by hand.
+ * Unpinned, it ran whatever npx resolved, which is not even reliably the
+ * newest: npx reuses its cache, and one machine ran a release two weeks old.
+ * `Restart=always` brings it back after self-update's exit.
+ */
+export function systemdUnit(paths: Paths, config: BridgeConfig, flags: string[], npx: string): string {
   const allow = config.allowDir ? ` --allow-dir "${config.allowDir}"` : '';
-  mkdirSync(dirname(paths.unit), { recursive: true });
-  writeFileSync(paths.unit, `[Unit]
+  const extra = flags.length > 0 ? ` ${flags.join(' ')}` : '';
+  return `[Unit]
 Description=AI Bridge (${paths.label})
 After=network-online.target
 
@@ -81,13 +97,18 @@ Type=simple
 EnvironmentFile=${paths.env}
 # A login shell's PATH is not a service's PATH.
 Environment=PATH=%h/.local/bin:%h/.nvm/versions/node/current/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=${npxPath()} -y --ignore-scripts @tetrixdev/ai-bridge${allow}
+ExecStart=${npx} -y --ignore-scripts @tetrixdev/ai-bridge@\${AI_BRIDGE_VERSION}${allow}${extra}
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=default.target
-`);
+`;
+}
+
+function installSystemd(paths: Paths, config: BridgeConfig, flags: string[]): void {
+  mkdirSync(dirname(paths.unit), { recursive: true });
+  writeFileSync(paths.unit, systemdUnit(paths, config, flags, npxPath()));
   run('systemctl', ['--user', 'daemon-reload']);
   run('systemctl', ['--user', 'enable', paths.label]);
   // `enable --now` does NOTHING to a unit that is already running, so a
@@ -96,13 +117,17 @@ WantedBy=default.target
   run('systemctl', ['--user', 'restart', paths.label]);
 }
 
-function installLaunchd(paths: Paths, config: BridgeConfig): void {
+function installLaunchd(paths: Paths, config: BridgeConfig, flags: string[]): void {
   const home = homedir();
   // The credentials are read from the file rather than written into the plist.
   // A plist is readable by everyone by default, and `launchctl print` shows its
   // environment -- so a token in there is a token on somebody's screen the next
   // time they debug the agent.
-  const args = ['-y', '--ignore-scripts', '@tetrixdev/ai-bridge', '--env-file', paths.env];
+  // Pinned to the installing version, written into the plist: launchd has no
+  // environment substitution, so it does not follow the server's desired
+  // version by itself. Reinstall with the version wanted to move it.
+  const pkg = config.version ? `@tetrixdev/ai-bridge@${config.version}` : '@tetrixdev/ai-bridge';
+  const args = ['-y', '--ignore-scripts', pkg, '--env-file', paths.env, ...flags];
   mkdirSync(dirname(paths.unit), { recursive: true });
   mkdirSync(dirname(paths.log), { recursive: true });
   // launchd has no EnvironmentFile, so the agent is pointed at ours with

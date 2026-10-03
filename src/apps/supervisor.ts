@@ -130,7 +130,23 @@ export class AppSupervisor {
    * Answer one app_call. Never throws: every failure is `ok: false` with a
    * sentence, scrubbed of every sealed value this backend was handed.
    */
+  /** App calls being answered right now, including ones still starting their backend. */
+  inFlight(): number {
+    return this.calls;
+  }
+
+  private calls = 0;
+
   async handle(message: AppCallMessage): Promise<AppResultMessage> {
+    this.calls++;
+    try {
+      return await this.handleOne(message);
+    } finally {
+      this.calls--;
+    }
+  }
+
+  private async handleOne(message: AppCallMessage): Promise<AppResultMessage> {
     const id = typeof message.id === 'string' ? message.id : '';
     let granted: Redaction[] = [];
     try {

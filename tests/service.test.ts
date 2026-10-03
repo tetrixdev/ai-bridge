@@ -151,3 +151,42 @@ describe('settings an install carries', () => {
     expect(body.match(/AI_BRIDGE_TOKEN=/g)).toHaveLength(1);
   });
 });
+
+describe('a pinned service', () => {
+  test('the systemd unit starts the version in the env file, with the flags asked for, and restarts', async () => {
+    const { systemdUnit } = await import('../src/service/platform.js');
+    const { pathsFor } = await import('../src/service/naming.js');
+    const unit = systemdUnit(pathsFor('studio'), { server: 'wss://x', token: 't', allowDir: '/srv/app' }, ['--allow-native'], '/usr/bin/npx');
+    expect(unit).toContain('ExecStart=/usr/bin/npx -y --ignore-scripts @tetrixdev/ai-bridge@${AI_BRIDGE_VERSION} --allow-dir "/srv/app" --allow-native\n');
+    expect(unit).toContain('Restart=always');
+    expect(unit).toMatch(/EnvironmentFile=.*studio\.env/);
+  });
+
+  test('install refuses a flag outside its short list', async () => {
+    const { install } = await import('../src/service/platform.js');
+    const { pathsFor } = await import('../src/service/naming.js');
+    expect(() => install(pathsFor('x'), { server: 'wss://x', token: 't' }, ['--allow-native; rm -rf ~'])).toThrow(/not a flag/);
+  });
+
+  test('the env file records the installed version, and a reinstall keeps the previous-version note', async () => {
+    const { writeConfig, readConfig } = await import('../src/service/config.js');
+    const { mkdtempSync, readFileSync, writeFileSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(join(tmpdir(), 'svc-'));
+    const file = join(dir, 'b.env');
+    try {
+      writeConfig(file, { server: 'wss://x', token: 't', version: '0.24.0' });
+      expect(readFileSync(file, 'utf8')).toContain('AI_BRIDGE_VERSION=0.24.0\n');
+      writeFileSync(file, `${readFileSync(file, 'utf8')}AI_BRIDGE_PREVIOUS_VERSION=0.23.0\n`);
+      writeConfig(file, { server: 'wss://x', token: 't', version: '0.25.0' });
+      const text = readFileSync(file, 'utf8');
+      expect(text.match(/AI_BRIDGE_VERSION=/g)).toHaveLength(1);
+      expect(text).toContain('AI_BRIDGE_VERSION=0.25.0\n');
+      expect(text).toContain('AI_BRIDGE_PREVIOUS_VERSION=0.23.0\n');
+      expect(readConfig(file)?.version).toBe('0.25.0');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
