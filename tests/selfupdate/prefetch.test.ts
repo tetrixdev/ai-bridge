@@ -108,3 +108,18 @@ describe('which cache directory is broken', () => {
     expect(brokenNpxDir("Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/usr/lib/node_modules/x/index.js'", '0.24.1')).toBeNull();
   });
 });
+
+describe('never throws', () => {
+  it('a lock directory that cannot be made comes back as a failure', async () => {
+    const root = scratch();
+    writeFileSync(join(root, 'file'), 'x');
+    const { d } = deps(root, [{ stdout: '0.24.1\n' }], { lockDir: join(root, 'file', 'sub', 'prefetch.lock') });
+    expect(await prefetch('0.24.1', 1000, d)).toMatchObject({ ok: false });
+  });
+
+  it('a run that throws comes back as a failure', async () => {
+    const root = scratch();
+    const { d } = deps(root, [], { run: async () => { throw new Error('spawn npx ENOENT'); } });
+    expect(await prefetch('0.24.1', 1000, d)).toEqual({ ok: false, reason: 'spawn npx ENOENT' });
+  });
+});

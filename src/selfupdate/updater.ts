@@ -163,7 +163,14 @@ export class SelfUpdater {
 
   private async fetch(version: string): Promise<void> {
     if (this.target !== version) return;
-    const result = await this.d.prefetch(version);
+    let result: { ok: true } | { ok: false; reason: string };
+    try {
+      result = await this.d.prefetch(version);
+    } catch (err) {
+      // prefetch() promises not to throw; if one ever does, it is a failed
+      // fetch like any other, retried later, never an end to retrying.
+      result = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    }
     if (this.target !== version) return; // superseded while fetching
     if (!result.ok) {
       this.fetchFailures++;

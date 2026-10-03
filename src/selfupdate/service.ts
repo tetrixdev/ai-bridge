@@ -237,6 +237,21 @@ export async function prefetch(
   timeoutMs = 180_000,
   deps: PrefetchDeps = realPrefetchDeps,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
+  // "Never throws" is what the updater's retry depends on: it schedules the
+  // next attempt only on a failure RESULT. A lock directory that cannot be
+  // made, or a broken one that cannot be removed, must come back as one.
+  try {
+    return await prefetchLocked(version, timeoutMs, deps);
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function prefetchLocked(
+  version: string,
+  timeoutMs: number,
+  deps: PrefetchDeps,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
   const locked = await acquireLock(deps);
   if (!locked) return { ok: false, reason: 'another bridge on this machine has been fetching for too long' };
   try {
