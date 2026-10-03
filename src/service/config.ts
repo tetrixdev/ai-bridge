@@ -30,11 +30,18 @@ export interface BridgeConfig {
    * `--env-file` reads them everywhere else.
    */
   settings?: Record<string, string> | undefined;
+  /**
+   * The bridge version the service runs, as AI_BRIDGE_VERSION. The unit
+   * starts `@tetrixdev/ai-bridge@${AI_BRIDGE_VERSION}`, so this line is the
+   * one thing to change to move it, and what self-update rewrites.
+   */
+  version?: string | undefined;
 }
 
 /** Keys this module writes. Anything else in the file belongs to somebody else. */
 const OWN_KEYS = new Set([
-  'AI_BRIDGE_SERVER', 'AI_BRIDGE_TOKEN', 'AI_BRIDGE_ALLOW_DIR', 'AI_BRIDGE_NAME', ...ATTACHMENT_ENV_KEYS,
+  'AI_BRIDGE_SERVER', 'AI_BRIDGE_TOKEN', 'AI_BRIDGE_ALLOW_DIR', 'AI_BRIDGE_NAME', 'AI_BRIDGE_VERSION',
+  ...ATTACHMENT_ENV_KEYS,
 ]);
 
 function keyOf(line: string): string | null {
@@ -71,6 +78,7 @@ export function readConfig(path: string): BridgeConfig | null {
     token: out['AI_BRIDGE_TOKEN'],
     allowDir: out['AI_BRIDGE_ALLOW_DIR'] || undefined,
     name: out['AI_BRIDGE_NAME'] || undefined,
+    version: out['AI_BRIDGE_VERSION'] || undefined,
     ...(Object.keys(settings).length > 0 ? { settings } : {}),
   };
 }
@@ -94,6 +102,7 @@ export function writeConfig(path: string, config: BridgeConfig): void {
     `AI_BRIDGE_TOKEN=${config.token}`,
     ...(config.allowDir ? [`AI_BRIDGE_ALLOW_DIR=${config.allowDir}`] : []),
     ...(config.name ? [`AI_BRIDGE_NAME=${config.name}`] : []),
+    ...(config.version ? [`AI_BRIDGE_VERSION=${config.version}`] : []),
     ...settings,
     ...foreign,
     '',

@@ -260,6 +260,14 @@ This bridge answers [`file_read`](#handing-files-back): it hands back a file it 
 
 This bridge understands [`app_call`](#app-backends). Sent whatever `--local-tools` says, like the flags above: it says the frame is understood, and a bridge that did not opt in answers every `app_call` with a refusal. A server must not send `app_call` to a bridge that did not advertise it; it would be logged as an unknown frame and never answered.
 
+#### Additive field: `self_update`
+
+```json
+{ "type": "hello", "...": "...", "self_update": true }
+```
+
+`true` when this bridge will follow [`welcome.desired_bridge_version`](#desired_bridge_version) by itself: it runs as a systemd service that restarts it, whose unit starts `@tetrixdev/ai-bridge@${AI_BRIDGE_VERSION}`, and it is not opted out. `false` from a bridge that understands the field and will not follow it (a terminal, an unpinned unit, macOS or Windows, `--no-self-update`). Absent from a bridge older than 0.24.0. Either way, a machine without `true` needs updating by hand once.
+
 ### Bridge → Server: `providers_update`
 
 Sent mid-connection when the bridge's set of available provider CLIs changes after the `hello` — for example, the user installs or removes a CLI while the bridge stays connected.
@@ -384,6 +392,26 @@ The system prompt behaves the same in every mode: the server's `system_prompt` w
 `bridge__attach_file` is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else, which is what the row above says and what it should keep meaning.
 
 **Gemini and `working_dir`.** Gemini is the one CLI with no per-invocation MCP config flag — it reads `.gemini/settings.json` from cwd. When cwd is a developer's checkout the bridge therefore writes into it, and handles that explicitly: it **refuses the turn rather than overwriting** a settings file the repository already has, removes the one it wrote when the turn ends (`done`, `error` or `cancel`), and removes the `.gemini` directory too if it created it and nothing else is in it. Because there is only one such path per directory and the file carries a per-spawn bearer token, **two concurrent Gemini turns in one directory are refused** rather than allowed to race — the loser would otherwise read the winner's credential and have its tool calls routed to the other turn's request.
+
+#### `desired_bridge_version`
+
+```json
+{ "type": "welcome", "...": "...", "desired_bridge_version": "0.24.1" }
+```
+
+The bridge version this server wants every machine on, exactly: higher or lower than what runs, the server decides. Additive and optional; absent means no opinion, and a bridge that predates it ignores it like any unknown field. It is read on every welcome, so changing it and restarting the server process (which every deploy does) reaches each bridge as it reconnects; nothing needs pushing to a connected one.
+
+**Only a strict semver string** — `MAJOR.MINOR.PATCH`, optionally `-prerelease`; no `v`, no build metadata, no range, tag, URL or command. The package is fixed by the bridge, so the most a server can pick is one published release of `@tetrixdev/ai-bridge`. Anything else is ignored with a warning. A version below **0.24.0**, the first that updates itself, is refused too: it would leave the machine on a release that never follows again.
+
+What a bridge with `self_update: true` does when the value differs from its own version:
+
+1. Fetches it into the npx cache and runs it once with `--version` (`npx -y --prefer-online --ignore-scripts @tetrixdev/ai-bridge@<v> --version`). If that fails it keeps running as it is and tries again later: 5 minutes, doubling, at most 6 hours.
+2. Waits until nothing is in progress: no turn (sub-agents run inside one), no turn still stopping, no upload, no file read or transfer, no app call. Work is never cut off.
+3. Writes `AI_BRIDGE_VERSION=<v>` (and `AI_BRIDGE_PREVIOUS_VERSION=<old>`) into its unit's env file, disconnects with a normal close, and exits with code 75. systemd starts the unit again, now on `<v>`, which reconnects and says hello as usual.
+
+If it comes back still on the old version, the pin did not take; the next attempt at that version waits 5 minutes, doubling, at most a day, rather than restarting in a loop. A bridge that cannot follow (`self_update` false or absent) logs that the server wants another version and carries on.
+
+What this does not cover: a new version that crashes before it reaches this code. The old one has gone by then; the `--version` run in step 1 is what keeps that rare.
 
 #### Local tools (optional)
 
@@ -2133,6 +2161,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Helper activity does not bump the version either.** `parent_tool_use_id` on `block_start` and `tool_result`, the `task` stream event and `done.subagent_stats` are additive: absent means what it always meant, and a consumer ignores an event it does not know.
 
 **Person uploads and handing files back do not bump the version.** `hello.file_uploads`, `hello.file_downloads`, the four `upload_*` frames and the three `file_read*` frames are additive; a server must not send `upload_offer` to a bridge that did not advertise `file_uploads`.
+
+**Self-update does not bump the version.** `welcome.desired_bridge_version` and `hello.self_update` are additive in both directions.
 
 **App backends do not bump the version.** `hello.app_backends`, `app_call` and `app_result` are additive; a server must not send `app_call` to a bridge that did not advertise `app_backends`. `hello.app_items` and `app_call.use` are additive the same way.
 

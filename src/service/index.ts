@@ -15,6 +15,7 @@ import type { BridgeConfig } from './config.js';
 import { deviceOf, readConfig, replaceable, writeConfig } from './config.js';
 import { nameFromServer, normaliseName, pathsFor } from './naming.js';
 import { install as installService, status, supported, uninstall as removeService } from './platform.js';
+import { BRIDGE_VERSION } from '../protocol/version.js';
 
 export { nameFromServer, normaliseName, pathsFor } from './naming.js';
 export { deviceOf, readConfig } from './config.js';
@@ -42,6 +43,13 @@ export interface InstallRequest extends BridgeConfig {
    *  the whole point is that overwriting somebody's other server is a decision,
    *  not a side effect. */
   force?: boolean | undefined;
+  /**
+   * Switches the service passes to the bridge on every start, such as
+   * `--allow-native` or `--local-tools`. Written into the unit, not the env
+   * file: they are what the bridge is allowed to do, decided by whoever
+   * installs it, and a reinstall without them takes them away.
+   */
+  flags?: string[] | undefined;
 }
 
 export interface Installed {
@@ -66,6 +74,10 @@ export function configForInstall(req: InstallRequest, name: string, existing: Br
     allowDir: req.allowDir,
     name,
     settings: { ...existing?.settings, ...req.settings },
+    // The version doing the install is the version installed. From here on
+    // the server's desired version moves it (src/selfupdate/), or a person
+    // edits this one line.
+    version: BRIDGE_VERSION,
   };
 }
 
@@ -94,7 +106,7 @@ export function installBridge(req: InstallRequest): { name: string; replaced: bo
   }
 
   writeConfig(paths.env, next);
-  installService(paths, next);
+  installService(paths, next, req.flags ?? []);
   return { name, replaced };
 }
 

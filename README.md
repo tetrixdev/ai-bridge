@@ -68,6 +68,62 @@ variables, which is why a Windows machine could hold only one pairing however
 many bridges were installed: two of them reading `AI_BRIDGE_TOKEN` read the same
 one.
 
+### Following the server's version
+
+A server can say which bridge version every machine should run
+(`desired_bridge_version` in its welcome; see PROTOCOL.md). A bridge that runs as
+a systemd service follows it by itself, upgrade or downgrade: it fetches that
+version, waits until nothing is in progress, pins it and restarts onto it. If
+the fetch fails it stays on what it runs and tries again later. It tells the
+server whether it will follow, as `self_update` in its hello.
+
+It acts only when all of this is true, and otherwise just logs that the server
+wants another version:
+
+- it runs inside a systemd unit (user or system) with `Restart=always` or
+  `Restart=on-failure`;
+- the unit starts `@tetrixdev/ai-bridge@${AI_BRIDGE_VERSION}`, so the version
+  comes from the environment;
+- exactly one of the unit's env files sets `AI_BRIDGE_VERSION`, and the bridge
+  can write it (`AI_BRIDGE_ENV_FILE=<path>` names it when the unit loads more
+  than one);
+- it is not turned off with `--no-self-update` or `AI_BRIDGE_SELF_UPDATE=0`.
+
+`ai-bridge install` writes exactly that shape on Linux, pinned to the version
+doing the install. A host application with an install script of its own can
+write the same thing:
+
+```ini
+# ~/.config/ai-bridge-myapp.env   (mode 600)
+AI_BRIDGE_SERVER=wss://your-app.com/api/ai-bridge/ws
+AI_BRIDGE_TOKEN=...
+AI_BRIDGE_VERSION=0.24.0
+```
+
+```ini
+# ~/.config/systemd/user/ai-bridge-myapp.service
+[Service]
+EnvironmentFile=%h/.config/ai-bridge-myapp.env
+Environment=PATH=%h/.local/bin:%h/.nvm/versions/node/current/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env npx --yes @tetrixdev/ai-bridge@${AI_BRIDGE_VERSION} --allow-dir /srv/app --allow-native
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+To pin by hand instead, pass `--no-self-update` (or `install --no-self-update`)
+and change `AI_BRIDGE_VERSION` yourself, then restart the unit.
+
+**Not covered: macOS and Windows.** `install` pins the installing version into
+the launch agent, but launchd and Windows logon tasks do not read a version
+from an env file, so those bridges report `self_update: false` and are updated
+by reinstalling with the version you want (`npx @tetrixdev/ai-bridge@<v> install …`).
+
+`install` also takes `--allow-native` and `--local-tools`, written into the
+unit, for a host that needs them.
+
 `--env-file` is available on its own, too, for anyone running the bridge some
 other way. A flag or an environment variable still wins over the file, so a
 service can be pointed at one and overridden by hand for a single run.
@@ -106,6 +162,7 @@ are left where they are.
 | `--attachment-cache-ttl-hours <n>` | `AI_BRIDGE_ATTACHMENT_CACHE_TTL_HOURS` | Keep a downloaded attachment for later turns until it has gone unused this long (default `72`). `0` turns the cache off |
 | `--attachment-cache-max-mb <n>` | `AI_BRIDGE_ATTACHMENT_CACHE_MAX_MB` | Cap on what is kept for later turns; least recently used go first (default `1024`). `0` turns the cache off |
 | `--allow-native` | | Permit the server to select `native` isolation — the CLI's full local environment, including your own MCP servers, hooks, plugins and a shell. **Off unless you pass it.** Only for a bridge you run against your own machine |
+| `--no-self-update` | `AI_BRIDGE_SELF_UPDATE=0` | Do not follow the version the server asks for; pin `AI_BRIDGE_VERSION` by hand. See [Following the server's version](#following-the-servers-version) |
 | `--keep-attachments` | | Keep downloaded attachments after a turn instead of deleting them. Debugging aid |
 
 ## Working in a repository
