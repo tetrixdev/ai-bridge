@@ -17,14 +17,26 @@
  *    which runs a foreground shell task of its own.
  *  - claude-input-redirect-foreground-bash-turn: "stop and answer 6×7 instead"
  *    sent 15 s into a 40 s FOREGROUND command: read when the command returned.
+ *  - claude-input-redirect-foreground-helper-turn: the same message sent while
+ *    the main assistant waited on a FOREGROUND helper (captured with
+ *    CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1): read when the helper returned.
+ *
+ * And one captured without input, reused for its frames:
+ *
+ *  - claude-queued-notification-turn: a resumed session whose previous turn
+ *    was stopped with a background command running. The CLI first answers
+ *    that leftover notification — a STAMPED result, num_turns 0, 71 ms — and
+ *    only then the prompt.
  *
  * The stand-in CLI (support/input-turn.ts) replays them and holds each echo back
  * until the adapter has actually written the message, as the real CLI does.
  */
 
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
-  stepsFromFixture, runInputTurn, of, lineIndex, type Step,
+  FIXTURES, stepsFromFixture, runInputTurn, of, mainStates, lineIndex, type Step,
 } from './support/input-turn.js';
 import { TurnInputPort, userMessageFrame } from '../../src/providers/turn-input.js';
 import type { DoneData } from '../../src/protocol/types.js';
@@ -38,6 +50,8 @@ vi.mock('../../src/providers/claude-capabilities.js', () => ({
 const BACKGROUND_BASH = 'claude-input-background-bash-turn.ndjson';
 const BACKGROUND_HELPER = 'claude-input-background-helper-turn.ndjson';
 const FOREGROUND_BASH = 'claude-input-redirect-foreground-bash-turn.ndjson';
+const FOREGROUND_HELPER = 'claude-input-redirect-foreground-helper-turn.ndjson';
+const QUEUED_NOTIFICATION = 'claude-queued-notification-turn.ndjson';
 
 /**
  * Offer every injected message once, as soon as the turn takes them: at the
@@ -54,6 +68,8 @@ function offerAtStart(injected: string[], results: Array<{ status: string }>) {
 }
 
 const line = (value: unknown): Step => ({ line: JSON.stringify(value) });
+const readFixture = (name: string): string[] =>
+  readFileSync(join(FIXTURES, name), 'utf8').split('\n').filter((l) => l.trim() !== '');
 const init = line({ type: 'system', subtype: 'init', session_id: 's1', model: 'claude-sonnet-5' });
 const echo = (content: string): Step => line({
   type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: 's1', isReplay: true,
@@ -280,6 +296,49 @@ describe('messages for a running turn', () => {
       .join('');
     expect(answer).toContain('42');
     expect(turn.record.eofAt!).toBeGreaterThan(lineIndex(lines, (f) => f['type'] === 'user' && f['isReplay'] === true, true));
+  });
+
+  it('accepts a message while the main assistant waits on a foreground helper, read when it returns (captured)', async () => {
+    const { steps, opening, injected } = stepsFromFixture(FOREGROUND_HELPER);
+    expect(injected).toEqual(['stop and answer 6×7 instead']);
+    const outcomes: Array<{ status: string }> = [];
+    let stateWhenOffered: string | undefined;
+    let lastState: string | undefined;
+
+    const turn = await runInputTurn({
+      steps,
+      message: opening,
+      onEvent: (e, port) => {
+        if (e.event === 'main_state') lastState = (e.data as { state: string }).state;
+        // Offered the moment the helper starts: the main assistant is blocked
+        // on its Agent call from here until the helper hands back.
+        if (outcomes.length === 0 && e.event === 'task' && (e.data as { phase: string }).phase === 'started') {
+          stateWhenOffered = lastState;
+          outcomes.push(port.offer('m1', injected[0]));
+        }
+      },
+    });
+
+    // Input open and the main assistant working: accepted, and written at once.
+    expect(outcomes).toEqual([{ status: 'accepted' }]);
+    expect(stateWhenOffered).toBe('working');
+    expect(turn.record.frames).toHaveLength(2);
+    // Read only once the helper's call returned: user_input comes after the
+    // helper's last task event and after the Agent call's own tool_result.
+    const started = of(turn.events, 'task')[0].data as { tool_use_id?: string; is_backgrounded?: boolean };
+    expect(started.is_backgrounded).toBe(false);
+    const callId = started.tool_use_id;
+    expect(callId).toBeDefined();
+    const names = turn.events.map((e) => e.event);
+    const handBack = turn.events.findIndex((e) => e.event === 'tool_result'
+      && (e.data as { tool_call_id?: string }).tool_call_id === callId);
+    expect(handBack).toBeGreaterThan(-1);
+    expect(names.indexOf('user_input')).toBeGreaterThan(handBack);
+    expect(names.indexOf('user_input')).toBeGreaterThan(names.lastIndexOf('task'));
+    const answer = of(turn.events.slice(names.indexOf('user_input')), 'block_delta')
+      .map((e) => (e.data as { content?: string }).content ?? '')
+      .join('');
+    expect(answer).toContain('42');
   });
 
   it('builds one done from every result: the last one, with usage and num_turns summed', async () => {
@@ -529,5 +588,195 @@ describe('the port', () => {
       input_tokens: 1, output_tokens: 2, cache_creation_input_tokens: 3, cache_read_input_tokens: 4,
     });
     expect(data.num_turns).toBe(1);
+  });
+});
+
+describe('a resumed session whose last turn left a background task running', () => {
+  /**
+   * The incident, frame for frame: a new input-open turn on a session whose
+   * previous turn was stopped while its background command still ran. The CLI
+   * answers that task's leftover notification FIRST — a stamped result, no
+   * API call, num_turns 0 — and only after a pause takes in our opening
+   * message and answers it. Built from the captured queued-notification turn
+   * (its notification, stamped result, init, status, rate-limit frame and the
+   * whole reply), with the opening's echo where --replay-user-messages puts it,
+   * and the CLI then reading the message the test offers in the window.
+   *
+   * `notificationFirst` is the order that fixture was captured in (the
+   * notification's result ahead of init); the default is the incident's,
+   * init first.
+   */
+  function incident(opts: { notificationFirst?: boolean } = {}) {
+    const frames = readFixture(QUEUED_NOTIFICATION);
+    const [notification, stamped, initFrame, status, rateLimit, ...reply] = frames;
+    expect(JSON.parse(stamped)).toMatchObject({ type: 'result', origin: { kind: 'task-notification' }, num_turns: 0 });
+    const opening = 'What does the repo do? Look around first.';
+    const injected = 'Also: what is the capital of France? One word.';
+
+    const steps: Step[] = [];
+    const written: string[] = [];
+    const put = (raw: string): number => {
+      steps.push({ line: raw });
+      written.push(raw);
+
+      return written.length - 1;
+    };
+    const putStep = (step: Step): number => put((step as { line: string }).line);
+
+    if (opts.notificationFirst === true) {
+      put(notification);
+      put(stamped);
+      put(initFrame);
+    } else {
+      put(initFrame);
+      put(notification);
+      put(stamped);
+    }
+    steps.push({ sleep: 40 });
+    put(status);
+    put(rateLimit);
+    // The pause the incident had before the CLI read its prompt.
+    steps.push({ sleep: 300 });
+    const openingEcho = putStep(echo(opening));
+    for (const raw of reply) {
+      put(raw);
+      const frame = JSON.parse(raw) as Record<string, unknown>;
+      if (frame['type'] === 'result'
+        || (frame['type'] === 'stream_event' && (frame['event'] as Record<string, unknown>)['type'] === 'message_delta')) {
+        steps.push({ sleep: 40 });
+      }
+    }
+    const firstUnstamped = written.length - 1;
+    // Then the message offered in the window: a turn of the CLI's own for it.
+    steps.push({ waitInput: 2 });
+    putStep(init);
+    putStep(echo(injected));
+    putStep(text('Paris'));
+    const lastResult = putStep(result());
+    steps.push({ waitEof: true });
+
+    return { steps, opening, injected, openingEcho, firstUnstamped, lastResult };
+  }
+
+  it.each([
+    ['init first, as in the incident', false],
+    ['the notification ahead of init, as captured', true],
+  ])('does not close stdin before the opening is read (%s), and accepts a message in that window', async (_name, notificationFirst) => {
+    const { steps, opening, injected, openingEcho, firstUnstamped, lastResult } = incident({ notificationFirst });
+    const outcomes: Array<{ status: string; reason?: string }> = [];
+
+    const turn = await runInputTurn({
+      steps,
+      message: opening,
+      cliSessionId: 'sess_prev',
+      onEvent: (e, port) => {
+        // The rate-limit frame comes after the stamped result and before the
+        // opening's echo: exactly the window in which the input used to be
+        // closed already.
+        if (e.event === 'rate_limit' && outcomes.length === 0) outcomes.push(port.offer('m1', injected));
+      },
+    });
+
+    expect(outcomes).toEqual([{ status: 'accepted' }]);
+    // Not closed at the stamped result, nor before the opening's echo, nor
+    // before the reply's own (unstamped) result — and not before the offered
+    // message was read and answered.
+    expect(turn.record.eofAt).not.toBeNull();
+    expect(turn.record.eofAt!).toBeGreaterThan(openingEcho);
+    expect(turn.record.eofAt!).toBeGreaterThan(firstUnstamped);
+    expect(turn.record.eofAt!).toBe(lastResult + 1);
+    expect(of(turn.events, 'user_input').map((e) => e.data)).toEqual([{ message_id: 'm1' }]);
+    expect(turn.port.pending()).toEqual([]);
+
+    // main_state never said idle on the stamped result: the first idle is the
+    // end of the reply, after its first block.
+    expect(mainStates(turn.events)).toEqual(['working', 'idle', 'working', 'idle']);
+    const firstIdle = turn.events.findIndex((e) => e.event === 'main_state'
+      && (e.data as { state: string }).state === 'idle');
+    expect(firstIdle).toBeGreaterThan(turn.events.map((e) => e.event).indexOf('block_start'));
+
+    // The stamped result still counts in done, with every other one.
+    const done = of(turn.events, 'done');
+    expect(done).toHaveLength(1);
+    // 0 for the notification, 3 for the reply, 1 for the offered message.
+    expect((done[0].data as DoneData).num_turns).toBe(4);
+    expect(of(turn.events, 'input_closed')).toHaveLength(1);
+  });
+
+  it('still closes after the unstamped result when the CLI never echoes the opening', async () => {
+    // The fallback: a CLI that skipped (or folded) the echo. The unstamped
+    // result answers our prompt, so the opening was read; waiting for an echo
+    // that never comes would hang the turn until the silence bound.
+    const turn = await runInputTurn({
+      message: 'go',
+      cliSessionId: 'sess_prev',
+      steps: [
+        init,
+        result({ origin: { kind: 'task-notification' }, num_turns: 0 }), { sleep: 150 },
+        text('hi'), { sleep: 150 },
+        result(),
+        { waitEof: true },
+      ],
+    });
+
+    // Lines: init, stamped result (2) | text (3) | result (4). Not before it.
+    expect(turn.record.eofAt).toBe(4);
+    expect(mainStates(turn.events)).toEqual(['working', 'idle']);
+    expect(of(turn.events, 'input_closed').map((e) => e.data)).toEqual([{ reason: 'idle' }]);
+    expect(of(turn.events, 'done')).toHaveLength(1);
+  });
+});
+
+describe('input_closed', () => {
+  it('is sent once, when the terminal rule closes stdin: after the last idle, before done', async () => {
+    const { steps, opening, injected } = stepsFromFixture(BACKGROUND_BASH);
+
+    const turn = await runInputTurn({ steps, message: opening, onEvent: offerAtStart(injected, []) });
+
+    const closed = of(turn.events, 'input_closed');
+    expect(closed.map((e) => e.data)).toEqual([{ reason: 'idle' }]);
+    const names = turn.events.map((e) => e.event);
+    const at = names.indexOf('input_closed');
+    expect(at).toBeGreaterThan(names.lastIndexOf('main_state'));
+    expect(at).toBeGreaterThan(names.lastIndexOf('user_input'));
+    expect(names.slice(at + 1)).toEqual(['done']);
+  });
+
+  it('comes with the port already ended: a message offered on it is answered turn_ending', async () => {
+    const outcomes: Array<{ status: string; reason?: string }> = [];
+    await runInputTurn({
+      message: 'go',
+      steps: [echo('go'), init, text('done'), result(), { waitEof: true }, { sleep: 50 }],
+      onEvent: (e, port) => {
+        if (e.event === 'input_closed') outcomes.push(port.offer('late', 'too late'));
+      },
+    });
+
+    expect(outcomes).toEqual([{ status: 'rejected', reason: 'turn_ending' }]);
+  });
+
+  it('is not sent when the turn ends any other way', async () => {
+    // Stopped by a cancel while a task runs: stdin was never closed by the rule.
+    const controller = new AbortController();
+    const cancelled = await runInputTurn({
+      message: 'go',
+      signal: controller.signal,
+      steps: [echo('go'), init, taskStarted('t1', 'local_bash', true), text('working on it'), result(), { sleep: 5000 }],
+      onEvent: (e) => {
+        if (e.event === 'main_state' && (e.data as { state: string }).state === 'idle') setImmediate(() => controller.abort());
+      },
+    });
+    // The CLI dying while a task still runs, so the rule never closed stdin.
+    const failed = await runInputTurn({
+      message: 'go',
+      steps: [echo('go'), init, taskStarted('t1', 'local_bash', true), text('started'), result(), { sleep: 50 }, { exit: 3 }],
+    });
+    // And never on a turn that did not ask for input.
+    const plain = await runInputTurn({ message: 'go', withPort: false, steps: [init, text('hi'), result()] });
+
+    for (const turn of [cancelled, failed, plain]) {
+      expect(of(turn.events, 'input_closed')).toHaveLength(0);
+      expect(turn.events.at(-1)!.event).toBe('done');
+    }
   });
 });

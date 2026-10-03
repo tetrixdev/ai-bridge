@@ -71,6 +71,24 @@ class SlowStopAdapter extends InputAdapter {
   }
 }
 
+/**
+ * Like InputAdapter, but closes its input on cue the way the Claude adapter's
+ * terminal rule does: the port ends, `input_closed` is emitted, and the turn
+ * runs on until finish() — the CLI still finishing what it has.
+ */
+class ClosingAdapter extends InputAdapter {
+  close: () => void = () => {};
+  override execute(context: ExecutionContext, onEvent: (e: AdapterStreamEvent) => void): Promise<string | null> {
+    const running = super.execute(context, onEvent);
+    this.close = (): void => {
+      context.turnInput?.end();
+      onEvent({ event: 'input_closed', data: { reason: 'idle' } });
+    };
+
+    return running;
+  }
+}
+
 let wss: WebSocketServer;
 let url: string;
 let socket: WsSocket;
@@ -145,6 +163,24 @@ describe('accepts_input', () => {
     await startBridge([new InputAdapter('claude')]);
 
     expect(frames.find((f) => f['type'] === 'hello')!['turn_input']).toBe(true);
+  });
+
+  it('advertises input_closed in hello, and forwards the event as a stream frame', async () => {
+    const adapter = new ClosingAdapter('claude');
+    await startBridge([adapter]);
+    expect(frames.find((f) => f['type'] === 'hello')!['input_closed']).toBe(true);
+
+    request('req_close', { accepts_input: true });
+    await waitFor((f) => f['event'] === 'block_start', 'the turn starting');
+    adapter.close();
+    const closed = await waitFor((f) => f['event'] === 'input_closed', 'input_closed');
+
+    expect(closed).toEqual({ type: 'stream', request_id: 'req_close', event: 'input_closed', data: { reason: 'idle' } });
+    // The turn is still running, and takes nothing more.
+    socket.send(JSON.stringify({ type: 'turn_input', request_id: 'req_close', message_id: 'late', content: 'too late' }));
+    expect(await ackFor('req_close', 'late')).toMatchObject({ status: 'rejected', reason: 'turn_ending' });
+    adapter.finish();
+    await waitFor((f) => f['event'] === 'done', 'done');
   });
 
   it('confirms it on the ack, and runs the turn with background tasks on and the matching addendum', async () => {

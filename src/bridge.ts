@@ -1388,6 +1388,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // Messages for a running turn are understood. Per turn, the ack's
       // `input_open` is still what says a turn takes them.
       turn_input: true,
+      // ...and the moment such a turn stops taking them is announced, as the
+      // `input_closed` stream event.
+      input_closed: true,
       // Person uploads stream straight into the working folder. Advertised
       // whatever the allow-list says: `workspaces` is what tells the server
       // whether there is a folder, and this is only whether the frames are

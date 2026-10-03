@@ -268,6 +268,14 @@ This bridge understands [`app_call`](#app-backends). Sent whatever `--local-tool
 
 `true` when this bridge will follow [`welcome.desired_bridge_version`](#desired_bridge_version) by itself: it runs as a systemd service that restarts it, whose unit starts `@tetrixdev/ai-bridge@${AI_BRIDGE_VERSION}`, and it is not opted out. `false` from a bridge that understands the field and will not follow it (a terminal, an unpinned unit, macOS or Windows, `--no-self-update`). Absent from a bridge older than 0.24.0. Either way, a machine without `true` needs updating by hand once.
 
+#### Additive field: `input_closed`
+
+```json
+{ "type": "hello", "...": "...", "turn_input": true, "input_closed": true }
+```
+
+This bridge sends the [`input_closed`](#input_closed) stream event when a turn with its input open stops taking messages. A bridge without it closes the input at the same moment and says nothing; a server can then learn it only from a `turn_input` answered `turn_ending`, or from the terminal frame. An older server ignores the field and the event.
+
 ### Bridge → Server: `providers_update`
 
 Sent mid-connection when the bridge's set of available provider CLIs changes after the `hello` — for example, the user installs or removes a CLI while the bridge stays connected.
@@ -843,11 +851,15 @@ What changes for such a turn:
 
 - **The CLI reads its messages as NDJSON on stdin.** Spawned with `--input-format stream-json --replay-user-messages`; the opening `message` is written as the first frame, and stdin stays open. The frame, verified against Claude Code 2.1.280, is `{"type":"user","message":{"role":"user","content":"<text>"}}`. The CLI echoes each message back at the moment it takes it in, which is what [`user_input`](#user_input) is made from.
 - **The turn ends by a rule, not at the first `result`.** The bridge closes stdin — after which the CLI finishes, exits, and the bridge sends `done` — only when **all** of these hold:
-  1. the main assistant is idle (its message ended, or a `result` arrived);
+  1. the main assistant has **taken in the opening message** and is idle (its message ended, or a `result` arrived);
   2. **no task it or a helper started is still running**, whatever its `task_type` (`local_agent`, `local_bash`, anything else), as tracked from the task's `started` to its `finished` (or an `updated` to a status other than `running`/`pending`);
   3. every accepted `turn_input` has been read (its `user_input` was sent).
 
   In addition, when a background task of the main assistant ends, the CLI answers it in a turn of its own; the bridge waits for that turn to start (up to 10 s) before closing, so a message sent meanwhile is still delivered.
+
+  The bridge announces the close with [`input_closed`](#input_closed) (when it advertised `hello.input_closed`). From then on every `turn_input` is answered `turn_ending`, while the CLI finishes what it has; `done` follows its exit.
+
+  **The opening message counts as unread until the CLI has taken it in** — its echo was seen, or a `result` without `origin` arrived (that one answers the prompt, so it cannot come before the prompt was read; it is the fallback for a CLI that ever skipped or folded the echo, and either signal is enough). Until then a `result` with an `origin` does not make the main assistant idle: it is kept for `done` like every other, and nothing else changes. The case this exists for, seen in production: a previous turn on the session was stopped while a background task it started still ran. On `--resume` the CLI first answers that leftover `<task-notification>` — a turn of its own ending in `origin: task-notification`, `num_turns` 0, about 100 ms in — and only then reads the opening. That task is not one of this turn's and the opening is not a `turn_input`, so the rule used to hold and closed the input before the assistant had read its prompt: the turn ran on for 34 minutes and every `turn_input` was rejected `turn_ending`. A bridge without `hello.input_closed` may still do this.
 
   A `result` before that is **not** terminal. Captured on 2.1.280 with stdin open: a background shell command yields a `result` as soon as the reply ends (no `origin`), and a second one (`origin: task-notification`) when the CLI later answers the command's end; each mid-turn message adds one more. `done` carries the **last** result's fields with `usage` and `num_turns` **summed** across all of them (`cost_usd`, `duration_api_ms` and `subagent_stats` are already running totals in the CLI's own results, so they are taken from the last). That holds however the turn ends: after an error `result` (the CLI then exits 1, and the error is reported as usual — `session_lost` included — ahead of that `done`), and on a turn a `cancel`, a bound or a crash stopped, whose `done` would otherwise be empty.
 - **Background tasks are on** for this turn: the bridge leaves `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` unset rather than applying its default of `"1"` (see [`bridge_env`](#additive-fields-bridge_env-and-bridge_prompt)). Every other turn keeps the default. A server's explicit `bridge_env` value still wins.
@@ -1079,13 +1091,17 @@ The answer to every `turn_input`, sent at once.
 | `status` | `reason` | Meaning | What the server does |
 |---|---|---|---|
 | `accepted` | — | Written to the running CLI and queued there. The assistant reads it at its next step; [`user_input`](#user_input) says when. | Wait for `user_input`. |
-| `rejected` | `turn_ending` | The turn is still running but takes nothing more: the bridge has closed its input (the turn is finishing), or it is being stopped — a `cancel`, a bound, a dropped connection; stopping can take up to ~10 s. **Its CLI may still be alive and writing to the session.** | **Hold it until this request's terminal frame** — `done`, `cancelled`, or the `error` `bridge_disconnected` replayed after a reconnect — **then** start a new turn with it. Never sooner: a new turn resumes the same session, and there is no lock on it, so two CLIs would write to it at once. |
+| `rejected` | `turn_ending` | The turn is still running but takes nothing more: the bridge has closed its input (the turn is finishing; announced as [`input_closed`](#input_closed)), or it is being stopped — a `cancel`, a bound, a dropped connection; stopping can take up to ~10 s. **Its CLI may still be alive and writing to the session.** | **Hold it until this request's terminal frame** — `done`, `cancelled`, or the `error` `bridge_disconnected` replayed after a reconnect — **then** start a new turn with it. Never sooner: a new turn resumes the same session, and there is no lock on it, so two CLIs would write to it at once. |
 | `rejected` | `turn_not_running` | No turn by that id is running: it never existed, or it has ended and its terminal frame went out ahead of this ack. | Start a normal new turn with it. |
 | `rejected` | `input_not_open` | The turn is running but cannot take it: it was not started with `accepts_input`, or its CLI has not started its session yet (input opens at the CLI's first `system/init`, so a CLI that fails before it has a session — a resumed session that is gone — never takes a message it would lose). | Hold it until the turn is over. |
 
 A `reason` the server does not know is to be treated like `turn_ending`: hold the message until the request's terminal frame. Holding is always safe; starting a turn early is not.
 
 Nothing promises the assistant will change course. A message is read **after the step the assistant is in**: straight away when it is idle (for example while only background tasks run), otherwise when its current tool call returns — captured on 2.1.280, a message sent 15 s into a 40 s foreground command was read when the command finished, and then answered.
+
+The same holds while the main assistant waits on a **foreground helper** (the Agent/Task tool, not backgrounded): the input is open and the main assistant `working`, so the message is accepted and written to the CLI at once, and the CLI reads it when the helper hands back — after the helper's last `task` event and the Agent call's `tool_result`. Captured on 2.1.280: a message sent 15 s in was read when the helper returned, 35 s later, and then answered. That capture ran with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` (a server's `bridge_env` can set it), because with background tasks on — this mode's default — the model asked for a foreground helper started it in the background anyway, and the main assistant was idle and read the message straight away. The bridge holds nothing back in either case; when the message is read is the CLI's doing.
+
+A turn on a resumed session can open with a turn of the CLI's own (a notification left over from an earlier, stopped turn) before the CLI reads the opening message. A message sent in that window is accepted and read after the opening — see the terminal rule under [`accepts_input`](#additive-option-accepts_input--a-turn-that-takes-messages-while-it-runs); a bridge before `hello.input_closed` could close the input there and reject it `turn_ending`.
 
 ---
 
@@ -1679,6 +1695,23 @@ On a turn with its input open: whether the **main** assistant (not a helper) is 
 
 A message sent while it is `idle` is read straight away; one sent while it is `working` is read after its current step. `idle` is not the end of the turn: background tasks may still be running, and the turn goes on until they end.
 
+`idle` is never sent before the main assistant has taken in the opening message: a `result` the CLI writes for work of its own ahead of it (one with an `origin`) leaves the state `working`.
+
+#### `input_closed`
+
+On a turn with its input open: the bridge has closed the CLI's input, and the turn takes no more messages. Advertised by `hello.input_closed`.
+
+```json
+{ "type": "stream", "request_id": "req_abc123", "event": "input_closed", "data": { "reason": "idle" } }
+```
+
+- Sent when the terminal rule closes the input (see [`accepts_input`](#additive-option-accepts_input--a-turn-that-takes-messages-while-it-runs)), while the turn is still running — the CLI then finishes what it has and exits, and `done` follows. That gap is usually short, but it is not bounded by anything the bridge controls.
+- At most once per turn, and never after the turn's terminal frame. A turn that ends any other way — a `cancel`, a bound, a dropped connection, a CLI that exits or crashes with its input still open — does not send it.
+- **`reason`**: `idle` — the main assistant has taken in the opening message and is idle, no task it or a helper started is running, and every accepted `turn_input` has been read. The only reason today. **A server must accept a reason it does not know** and treat it the same way.
+- Every `turn_input` after it is answered `turn_ending`: hold the message until the request's terminal frame, then start a new turn with it. A server can stop offering at this event rather than learn it from the ack.
+
+Like every stream event it counts as activity for the silence bound.
+
 #### `attachment`
 
 A file the assistant produced and chose to hand back. Emitted when the model calls the bridge-owned `bridge__attach_file` tool and the upload succeeded.
@@ -2087,6 +2120,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `stream` (task) | A helper started, progressed, is still alive, or ended |
 | `stream` (user_input) | The assistant took in a `turn_input` message |
 | `stream` (main_state) | The main assistant became working or idle (input-open turns) |
+| `stream` (input_closed) | The bridge closed the CLI's input; the turn takes no more messages (input-open turns) |
 | `turn_input_ack` | Answering a `turn_input`, accepted or rejected |
 | `upload_done` | Answering an `upload_offer`: where the file is, or why not |
 | `file_read_result` | Answering a `file_read`: size and range, or why not |
@@ -2161,6 +2195,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Helper activity does not bump the version either.** `parent_tool_use_id` on `block_start` and `tool_result`, the `task` stream event and `done.subagent_stats` are additive: absent means what it always meant, and a consumer ignores an event it does not know.
 
 **Person uploads and handing files back do not bump the version.** `hello.file_uploads`, `hello.file_downloads`, the four `upload_*` frames and the three `file_read*` frames are additive; a server must not send `upload_offer` to a bridge that did not advertise `file_uploads`.
+
+**Announcing the input's close does not bump the version.** `hello.input_closed` and the `input_closed` stream event are additive: a consumer ignores an event it does not know, and a server that does not see the flag learns the close the way it always did, from `turn_ending`.
 
 **Self-update does not bump the version.** `welcome.desired_bridge_version` and `hello.self_update` are additive in both directions.
 
