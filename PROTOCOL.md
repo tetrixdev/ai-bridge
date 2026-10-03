@@ -274,7 +274,7 @@ This bridge understands [`app_call`](#app-backends). Sent whatever `--local-tool
 { "type": "hello", "...": "...", "turn_input": true, "input_closed": true }
 ```
 
-This bridge sends the [`input_closed`](#input_closed) stream event when a turn with its input open stops taking messages. A bridge without it closes the input at the same moment and says nothing; a server can then learn it only from a `turn_input` answered `turn_ending`, or from the terminal frame. An older server ignores the field and the event.
+This bridge sends the [`input_closed`](#input_closed) stream event when a turn with its input open stops taking messages. A bridge without it still closes the input by the terminal rule but says nothing — and it may close it too early, before the CLI has read the opening message (see the terminal rule under [`accepts_input`](#additive-option-accepts_input--a-turn-that-takes-messages-while-it-runs)). A server can then learn of the close only from a `turn_input` answered `turn_ending`, or from the terminal frame. An older server ignores the field and the event.
 
 ### Bridge → Server: `providers_update`
 
