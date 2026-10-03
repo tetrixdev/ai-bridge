@@ -42,12 +42,13 @@
  * stdin that stays open (`--input-format stream-json --replay-user-messages`),
  * its echo of each one becomes `user_input` and the main assistant's state
  * `main_state`; and no `result` ends the turn. stdin is closed by the terminal
- * rule in maybeClose() — main assistant idle, no task running, nothing unread —
- * and `done` follows the process's exit, built from every result.
+ * rule in maybeClose() — main assistant idle, no task running, nothing unread
+ * (the opening message included) — announced as `input_closed`, and `done`
+ * follows the process's exit, built from every result.
  */
 
 import { createInterface } from 'node:readline';
-import type { ModelInfo, TaskData, TaskPhase, TaskUsage } from '../protocol/types.js';
+import type { InputClosedData, ModelInfo, TaskData, TaskPhase, TaskUsage } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
 import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
 import { startTurnTimeouts, clearRequestTimeout, type TurnTimeouts } from './timeout.js';
@@ -387,6 +388,29 @@ export class ClaudeAdapter extends ProviderAdapter {
       let stdinClosed = false;
       /** The CLI has not echoed the opening message yet. */
       let openingEchoPending = true;
+      /**
+       * Input-open turns only: the main assistant has taken in the opening
+       * message. Until it has, it is not idle, whatever a `result` says, and
+       * the terminal rule cannot close stdin.
+       *
+       * The case this exists for: a previous turn on the session was stopped
+       * while a background task it started was still running. On --resume the
+       * CLI first answers that task's leftover `<task-notification>` — a turn
+       * of its own, with a STAMPED result (`origin: task-notification`,
+       * num_turns 0, ~100 ms) — and only then reads our opening message. That
+       * task is not one of this turn's, the opening was written at spawn so it
+       * is not pending on the port, and so that stamped result met every
+       * condition of the rule: stdin was closed before the assistant had read
+       * its prompt. Seen in production: the turn then ran 34 more minutes, and
+       * every `turn_input` sent meanwhile was rejected `turn_ending`.
+       *
+       * Set by EITHER the opening's echo OR an unstamped result — never both
+       * required. The echo is the precise signal; the unstamped result is the
+       * fallback for a CLI that ever skips or folds the echo, since it answers
+       * OUR prompt and so cannot come before it was read. Requiring both would
+       * leave such a turn unable to close, hanging until the silence bound.
+       */
+      let openingTakenIn = false;
       let seenInit = false;
       /**
        * Frames that arrived after the turn ended. Zero on a healthy turn, and
@@ -449,6 +473,12 @@ export class ClaudeAdapter extends ProviderAdapter {
        */
       const setMain = (state: 'working' | 'idle'): void => {
         if (!acceptsInput || settled || mainState === state) return;
+        // Not idle while the opening is still unread: it is about to be
+        // answered. Kept here, the one place `main_state` is decided, so what
+        // the server is told agrees with the terminal rule — and a message
+        // sent in that window is described, truthfully, as read after the
+        // current step rather than straight away.
+        if (state === 'idle' && !openingTakenIn) return;
         mainState = state;
         emitWholeMessage({ event: 'main_state', data: { state } });
       };
@@ -479,13 +509,22 @@ export class ClaudeAdapter extends ProviderAdapter {
       };
 
       /** Close stdin: the CLI finishes what it has, then exits, then `done`. */
-      const closeInput = (why: string): void => {
+      const closeInput = (why: string, reason: InputClosedData['reason']): void => {
         if (stdinClosed) return;
         stdinClosed = true;
         if (graceTimer !== null) clearTimeout(graceTimer);
         graceTimer = null;
         port?.end();
         log.info('Closing the CLI input — the turn is over', { requestId, why });
+        // Said out loud, because the gap between this and `done` is not
+        // always short: the CLI still finishes what it has, and a turn that
+        // closed wrongly kept running for half an hour with nothing telling
+        // the server why every message it sent came back `turn_ending`. From
+        // here the server can stop offering and hold messages for the next
+        // turn. Once per turn (the stdinClosed latch above), never after
+        // `done`, and through the deferral queue like `main_state`, so it
+        // keeps its place among the events around it and counts as activity.
+        if (acceptsInput && !settled) emitWholeMessage({ event: 'input_closed', data: { reason } });
         try {
           child.stdin?.end();
         } catch {
@@ -496,7 +535,8 @@ export class ClaudeAdapter extends ProviderAdapter {
       /**
        * The terminal rule, for input-open turns: close stdin only when the main
        * assistant is idle, NO task it or a helper started is still running
-       * (any task_type), and every accepted message has been read. A `result`
+       * (any task_type), and every accepted message has been read — the
+       * opening message too (see openingTakenIn). A `result`
        * is not the end: with stdin open the CLI writes one each time the main
        * assistant finishes a message, including while a background task works
        * on. Runs after every frame and on one event loop with offer(), so a
@@ -504,6 +544,11 @@ export class ClaudeAdapter extends ProviderAdapter {
        */
       const maybeClose = (): void => {
         if (!acceptsInput || stdinClosed || settled) return;
+        // The opening message counts as unread until the CLI has taken it in.
+        // It was written at spawn, so the port does not hold it, and setMain()
+        // keeping the assistant `working` meanwhile would already stop the
+        // close; checked here as well so the rule does not hinge on that.
+        if (!openingTakenIn) return;
         if (mainState !== 'idle' || runningTasks.size > 0 || (port?.pendingCount() ?? 0) > 0) return;
         if (notificationOwed) {
           graceTimer ??= setTimeout(() => {
@@ -517,7 +562,7 @@ export class ClaudeAdapter extends ProviderAdapter {
 
           return;
         }
-        closeInput('idle, no task running, no message pending');
+        closeInput('idle, no task running, no message pending', 'idle');
       };
 
       /**
@@ -790,6 +835,7 @@ export class ClaudeAdapter extends ProviderAdapter {
               && (text === userMessage || port?.pendingCount() === 0 || text !== port?.peekContent());
             if (isOpening) {
               openingEchoPending = false;
+              openingTakenIn = true;
 
               return;
             }
@@ -1093,6 +1139,14 @@ export class ClaudeAdapter extends ProviderAdapter {
             // result is the main assistant's own reply and settles nothing
             // owed (captured: a task stopped mid-reply is answered after it).
             if (origin !== null) notificationOwed = false;
+            // An unstamped result answers OUR prompt, so the opening was read
+            // whether or not its echo was seen. A stamped one says nothing
+            // about it: on --resume the CLI may answer a notification left
+            // over from an earlier turn before it reads the opening (see
+            // openingTakenIn, and the non-input `origin !== null` case below).
+            // Kept in `results` either way; until the opening is taken in it
+            // just does not make the main assistant idle (setMain refuses).
+            if (origin === null) openingTakenIn = true;
             setMain('idle');
 
             return;

@@ -208,6 +208,13 @@ export interface HelloMessage {
    */
   turn_input?: true;
   /**
+   * This bridge announces, with the `input_closed` stream event, the moment an
+   * input-open turn stops taking messages. Absent from a bridge that predates
+   * it, which closes the input just the same and says nothing; an older server
+   * ignores the field and the event.
+   */
+  input_closed?: true;
+  /**
    * Directories this bridge may be asked to work in. Absent or empty means
    * the operator allowed none, and every `ai_request.working_dir` is refused.
    * An older server ignores the field.
@@ -1068,6 +1075,7 @@ export type StreamEventType =
   | 'task'
   | 'user_input'
   | 'main_state'
+  | 'input_closed'
   | 'done'
   | 'error';
 
@@ -1254,6 +1262,22 @@ export interface MainStateData {
 }
 
 /**
+ * Data payload for `input_closed` events, on turns that run with their input
+ * open: the bridge has closed the CLI's input, and the turn takes no more
+ * messages. Sent at most once per turn, and only while it is still running —
+ * the CLI finishes what it has, then `done` follows. Every `turn_input` from
+ * here on is answered `turn_ending`.
+ *
+ * `idle`: the terminal rule — the main assistant has taken in the opening
+ * message and is idle, no task it or a helper started is running, and every
+ * accepted message has been read. The only reason today; a server must still
+ * accept one it does not know, since a later bridge may add others.
+ */
+export interface InputClosedData {
+  reason: 'idle';
+}
+
+/**
  * Data payload for `attachment` events — a file the assistant produced and
  * chose to hand back, already uploaded to the server.
  *
@@ -1380,6 +1404,7 @@ export type StreamEventData =
   | TaskData
   | UserInputData
   | MainStateData
+  | InputClosedData
   | AttachmentEventData
   | DoneData
   | StreamErrorData;
