@@ -220,3 +220,16 @@ describe('loop protection', () => {
     expect(h.state()).toEqual({});
   });
 });
+
+describe('a prefetch that throws anyway', () => {
+  it('is a failed fetch, retried later', async () => {
+    let n = 0;
+    const h = harness({ prefetch: async () => { n++; if (n === 1) throw new Error('boom'); return { ok: true }; } });
+    h.updater.onDesired('0.25.0');
+    await h.flush();
+    expect(h.calls.restart).toEqual([]);
+    expect(h.logs.join('\n')).toMatch(/could not fetch 0\.25\.0 \(boom\)/);
+    await h.advance(FETCH_RETRY_MS(1));
+    expect(h.calls.restart).toEqual(['0.25.0']);
+  });
+});

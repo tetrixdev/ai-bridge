@@ -405,7 +405,7 @@ The bridge version this server wants every machine on, exactly: higher or lower 
 
 What a bridge with `self_update: true` does when the value differs from its own version:
 
-1. Fetches it into the npx cache and runs it once with `--version` (`npx -y --prefer-online --ignore-scripts @tetrixdev/ai-bridge@<v> --version`). If that fails it keeps running as it is and tries again later: 5 minutes, doubling, at most 6 hours.
+1. Fetches it into the npx cache and runs it once with `--version` (`npx -y --prefer-online --ignore-scripts @tetrixdev/ai-bridge@<v> --version`). If that fails it keeps running as it is and tries again later: 5 minutes, doubling, at most 6 hours. Fetches on one machine take turns (a lock in `~/.cache/ai-bridge/`): two npx installs of one version at once can leave half a package in npx's shared cache, which fails every later run of that version. A cache directory of the target version that fails with a missing module is removed and fetched once more (0.24.1).
 2. Waits until nothing is in progress: no turn (sub-agents run inside one), no turn still stopping, no upload, no file read or transfer, no app call. Work is never cut off.
 3. Writes `AI_BRIDGE_VERSION=<v>` (and `AI_BRIDGE_PREVIOUS_VERSION=<old>`) into its unit's env file, disconnects with a normal close, and exits with code 75. systemd starts the unit again, now on `<v>`, which reconnects and says hello as usual.
 

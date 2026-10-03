@@ -23,8 +23,8 @@
  * more than one; every other check still applies.
  */
 import { execFile, execFileSync } from 'node:child_process';
-import { accessSync, constants, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { accessSync, constants, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 export const PACKAGE = '@tetrixdev/ai-bridge';
@@ -182,6 +182,35 @@ export function pinVersion(envFile: string, version: string, previous: string): 
   renameSync(tmp, target);
 }
 
+/** What prefetch() runs and touches, injectable for tests. */
+export interface PrefetchDeps {
+  /** Runs npx; resolves with what it printed, and the error when it failed. */
+  run: (args: string[], timeoutMs: number) => Promise<{ error: Error | null; killed: boolean; stdout: string; stderr: string }>;
+  lockDir: string;
+  /** How long to wait for another bridge on this machine to finish fetching. */
+  lockWaitMs: number;
+  /** A lock older than this was left by a process that died. */
+  lockStaleMs: number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+export const realPrefetchDeps: PrefetchDeps = {
+  run: (args, timeoutMs) => new Promise((resolve) => {
+    execFile('npx', args, { cwd: tmpdir(), timeout: timeoutMs, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({
+        error: err,
+        killed: Boolean((err as { killed?: boolean } | null)?.killed),
+        stdout: String(stdout ?? ''),
+        stderr: String(stderr ?? ''),
+      });
+    });
+  }),
+  lockDir: join(homedir(), '.cache', 'ai-bridge', 'prefetch.lock'),
+  lockWaitMs: 5 * 60_000,
+  lockStaleMs: 10 * 60_000,
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+};
+
 /**
  * Make sure a version exists and can be fetched, by fetching it into the npx
  * cache and running it once.
@@ -190,23 +219,121 @@ export function pinVersion(envFile: string, version: string, previous: string): 
  * for it; `--version` so what comes back is the version itself saying its own
  * number, which proves the package installed and starts, not merely that a
  * tarball downloaded. Never throws: resolves with the reason it failed.
+ *
+ * One fetch at a time per machine. Two npx installs of the same version write
+ * into the same cache directory, and when they overlap the result can be half
+ * a package (seen 2026-10-03: @modelcontextprotocol/sdk without its
+ * package.json), after which every later npx run of that version reuses the
+ * broken directory and fails. Several bridges on one machine told to update at
+ * once is exactly that overlap, so the fetch takes a lock first.
+ *
+ * And a directory broken anyway (by something else's npx, or a crash mid
+ * install) is repaired: when the run fails because a module is missing from
+ * an npx cache directory that holds THIS version, that directory is removed
+ * and the fetch tried once more.
  */
-export function prefetch(version: string, timeoutMs = 180_000): Promise<{ ok: true } | { ok: false; reason: string }> {
-  return new Promise((resolve) => {
-    execFile(
-      'npx',
-      ['-y', '--prefer-online', '--ignore-scripts', `${PACKAGE}@${version}`, '--version'],
-      { cwd: tmpdir(), timeout: timeoutMs, encoding: 'utf8', maxBuffer: 1024 * 1024 },
-      (err, stdout) => {
-        const said = String(stdout ?? '').trim().split('\n').pop()?.trim() ?? '';
-        if (err) {
-          resolve({ ok: false, reason: (err as NodeJS.ErrnoException & { killed?: boolean }).killed ? 'timed out' : err.message.split('\n')[0] ?? 'failed' });
-        } else if (said !== version) {
-          resolve({ ok: false, reason: `it reported version "${said}"` });
-        } else {
-          resolve({ ok: true });
+export async function prefetch(
+  version: string,
+  timeoutMs = 180_000,
+  deps: PrefetchDeps = realPrefetchDeps,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  // "Never throws" is what the updater's retry depends on: it schedules the
+  // next attempt only on a failure RESULT. A lock directory that cannot be
+  // made, or a broken one that cannot be removed, must come back as one.
+  try {
+    return await prefetchLocked(version, timeoutMs, deps);
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function prefetchLocked(
+  version: string,
+  timeoutMs: number,
+  deps: PrefetchDeps,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const token = await acquireLock(deps);
+  if (token === null) return { ok: false, reason: 'another bridge on this machine has been fetching for too long' };
+  try {
+    const args = ['-y', '--prefer-online', '--ignore-scripts', `${PACKAGE}@${version}`, '--version'];
+    let result = await deps.run(args, timeoutMs);
+    if (result.error) {
+      const broken = brokenNpxDir(`${result.stderr}\n${result.error.message}`, version);
+      if (broken) {
+        rmSync(broken, { recursive: true, force: true });
+        result = await deps.run(args, timeoutMs);
+      }
+    }
+    const said = result.stdout.trim().split('\n').pop()?.trim() ?? '';
+    if (result.error) {
+      return { ok: false, reason: result.killed ? 'timed out' : result.error.message.split('\n')[0] ?? 'failed' };
+    }
+    if (said !== version) return { ok: false, reason: `it reported version "${said}"` };
+    return { ok: true };
+  } finally {
+    releaseLock(deps, token);
+  }
+}
+
+/**
+ * mkdir is atomic: whoever creates the directory holds the lock. The holder
+ * writes a token of its own inside, so a release removes only ITS lock: a
+ * fetch that ran past the stale age and was taken over must not then delete
+ * the lock of the bridge that took over. A stale lock is taken over by
+ * renaming it aside first, which only one process can do.
+ *
+ * Resolves with the token to release with, or null when the wait ran out.
+ */
+async function acquireLock(deps: PrefetchDeps): Promise<string | null> {
+  mkdirSync(dirname(deps.lockDir), { recursive: true });
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const deadline = Date.now() + deps.lockWaitMs;
+  for (;;) {
+    try {
+      mkdirSync(deps.lockDir);
+      writeFileSync(join(deps.lockDir, 'owner'), token);
+      return token;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      try {
+        if (Date.now() - statSync(deps.lockDir).mtimeMs > deps.lockStaleMs) {
+          const aside = `${deps.lockDir}.stale-${token}`;
+          renameSync(deps.lockDir, aside);
+          rmSync(aside, { recursive: true, force: true });
+          continue;
         }
-      },
-    );
-  });
+      } catch {
+        continue; // released, or taken over by someone else, in between
+      }
+    }
+    if (Date.now() >= deadline) return null;
+    await deps.sleep(2000);
+  }
+}
+
+function releaseLock(deps: PrefetchDeps, token: string): void {
+  try {
+    if (readFileSync(join(deps.lockDir, 'owner'), 'utf8') !== token) return;
+    const aside = `${deps.lockDir}.released-${token}`;
+    renameSync(deps.lockDir, aside);
+    rmSync(aside, { recursive: true, force: true });
+  } catch { /* already gone, or not ours */ }
+}
+
+/**
+ * The npx cache directory a "Cannot find module" error points into, when that
+ * directory holds this very version of the bridge, so removing it is safe:
+ * nothing runs from an install that cannot start. Null otherwise.
+ */
+export function brokenNpxDir(errorText: string, version: string): string | null {
+  if (!/ERR_MODULE_NOT_FOUND|Cannot find (?:module|package)/.test(errorText)) return null;
+  const m = /((?:\/|[A-Za-z]:\\)[^\s'"]*?[\/\\]_npx[\/\\][0-9a-f]+)[\/\\]node_modules[\/\\]/.exec(errorText);
+  if (!m) return null;
+  const dir = m[1]!;
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, 'node_modules', '@tetrixdev', 'ai-bridge', 'package.json'), 'utf8')) as { version?: string };
+    return pkg.version === version ? dir : null;
+  } catch {
+    return null;
+  }
 }
