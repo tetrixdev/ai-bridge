@@ -31,6 +31,7 @@ import { resumeAwareErrorCode } from './session-error.js';
 import { boundArgumentText, boundArguments, safeStringify, toolResultEventData } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 import { stopTurn, stoppedByUs } from './stop.js';
+import { logIgnoredSubagentPrompt } from './subagent-prompt.js';
 
 const log = createLogger('CodexAdapter');
 
@@ -125,6 +126,7 @@ export class CodexAdapter extends ProviderAdapter {
     const userMessage = request.message;
 
     log.info('Executing Codex request', { requestId });
+    logIgnoredSubagentPrompt(request.subagent_prompt, 'codex', log);
 
     // Build CLI arguments
     let args: string[];

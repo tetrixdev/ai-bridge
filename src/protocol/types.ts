@@ -811,6 +811,17 @@ export interface AiRequestMessage {
   provider: string;
   message: string;
   system_prompt: string | null;
+  /**
+   * Text appended to the system prompt of every subagent the assistant starts
+   * this turn (nested ones included; not forks, which reuse the main prompt).
+   * Provider-neutral on the wire; Claude passes it as
+   * `--append-subagent-system-prompt-file` (Claude Code 2.1.261+, skipped with
+   * a warning on an older CLI), other providers ignore it (debug log).
+   *
+   * Per-invocation, like `system_prompt`: not retained across `--resume`, so a
+   * server sends it on every turn. Absent, null or empty means none.
+   */
+  subagent_prompt?: string | null;
   options: AiRequestOptions;
   /**
    * The CLI session to resume, or null to start a fresh session.

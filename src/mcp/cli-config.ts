@@ -4,7 +4,7 @@
  * Each provider CLI accepts MCP server configuration in its own shape:
  *
  *   - Claude:  --mcp-config <jsonfile> --strict-mcp-config
- *              file: { mcpServers: { bridge: { type, url, headers } } }
+ *              file: { mcpServers: { bridge: { type, url, headers, alwaysLoad } } }
  *   - Codex:   -c mcp_servers.bridge.url=... -c mcp_servers.bridge.bearer_token_env_var=...
  *              token is read from the env var at runtime, so the bridge sets
  *              that env var on the spawned codex process.
@@ -54,6 +54,12 @@ export function writeClaudeMcpConfig(conn: McpConnection): string {
         type: 'http',
         url: conn.url,
         headers: { Authorization: `Bearer ${conn.bearerToken}` },
+        // Load every bridge tool up front instead of deferring it behind
+        // ToolSearch: the bridge's tools are the point of the turn, and a
+        // deferred tool costs one extra model round trip (ToolSearch, then
+        // the call) per turn. Claude Code 2.1.121+ supports the per-server
+        // `alwaysLoad` option (see its changelog); older versions ignore it.
+        alwaysLoad: true,
       },
     },
   };
