@@ -483,10 +483,6 @@ It talks to the bridge over stdin and stdout, one JSON line per request and
 per response, so nothing listens on your machine. See PROTOCOL.md "App
 backends".
 
-## Subagents per request
-
-A server can define Claude Code subagents for one turn with the optional `agents` field on `ai_request` — an object keyed by agent name, each `{ description, prompt, tools?, model? }` (Claude Code's `--agents` shape). The Claude adapter writes it to a temp file, passes `--agents <file>`, and deletes it when the turn ends; Codex and Gemini ignore it. Invalid entries are dropped with a warning, never the turn. Helpers run under the turn's isolation posture; `tools` only narrows it. Details in [PROTOCOL.md](PROTOCOL.md#additive-field-agents--per-request-subagents).
-
 ## Supported Providers
 
 | Provider | CLI Binary | Session Resume | Streaming | Thinking | Server Tools |
