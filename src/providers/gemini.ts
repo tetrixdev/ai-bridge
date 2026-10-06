@@ -60,6 +60,7 @@ import { resumeAwareErrorCode } from './session-error.js';
 import { boundArguments, safeStringify, toolResultEventData } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 import { stopTurn, stoppedByUs } from './stop.js';
+import { logIgnoredSubagentPrompt } from './subagent-prompt.js';
 
 /**
  * Known Gemini CLI model aliases and models.
@@ -99,6 +100,7 @@ export class GeminiAdapter extends ProviderAdapter {
     const userMessage = request.message;
 
     log.info('Executing Gemini request', { requestId });
+    logIgnoredSubagentPrompt(request.subagent_prompt, 'gemini', log);
 
     // Build the prompt — prepend system prompt if provided (Gemini CLI has no
     // dedicated --system-instruction flag, so we concatenate). With no server

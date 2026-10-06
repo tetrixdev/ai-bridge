@@ -831,6 +831,8 @@ When the server needs an AI response (triggered by a user message in the browser
 
 **`system_prompt`**: The system prompt. May be `null`.
 
+**`subagent_prompt`** *(optional)*: Text appended to the system prompt of every subagent the assistant starts this turn. See [Additive field: `subagent_prompt`](#additive-field-subagent_prompt--text-for-every-subagent).
+
 **`cli_session_id`**: The CLI session to resume, or `null` to start a fresh session. **The server owns this mapping** (persisted per conversation) and is the single source of truth — the bridge keeps no session map of its own. See [Conversation Continuity](#conversation-continuity).
 
 **`history`**: Prior conversation turns (`{role, content}`). Included only when `cli_session_id` is `null`, so a fresh CLI session can be seeded with context. Omitted when resuming — the resumed session already holds its history.
@@ -988,6 +990,20 @@ Server-supplied text is capped at 8 KB. A cap with a clear refusal beats a `spaw
 **The addendum is generated from the resolved environment, not shipped as a fixed string.** If a project uses `bridge_env` to turn background work back on, an addendum still saying the capability is disabled would be lying to the model about something it can observe directly in its own tool schema. The lifecycle bullets change with the configuration; "one process per turn, nothing survives it" is stated either way, because it is true either way.
 
 `off` and `replace` are the project's right, and both are logged at warning level naming what was dropped: a project that takes them on owns explaining the lifecycle itself.
+
+#### Additive field: `subagent_prompt` — text for every subagent
+
+A string the bridge appends to the system prompt of every subagent (helper) the assistant starts during this turn — for example the house rules a delegated task must still follow. It sits next to `system_prompt`, which only reaches the main assistant.
+
+```json
+"subagent_prompt": "Answer in Dutch. Never quote vault values back."
+```
+
+- **Claude**: written to a `0600` file in a per-turn temp directory and passed as `--append-subagent-system-prompt-file <file>`; the file is removed when the CLI exits. Claude Code appends it to every subagent's system prompt, **nested subagents included**. **Forks do not get it**: a fork reuses the main assistant's system prompt, so whatever a fork must know belongs in `system_prompt`. Like `system_prompt`, it is per-invocation and **not retained across `--resume`** — send it on every turn that should have it.
+- **Needs Claude Code 2.1.261+.** An older CLI exits on the unknown flag, so the bridge checks the version it detected at startup (`claude --version`) and, on an older or unknown version, **skips the flag with a warning** and runs the turn without it. Verified on 2.1.283 (a `general-purpose` subagent obeyed the appended text; the main assistant did not see it).
+- **Codex / Gemini**: ignored (debug log). Neither CLI has subagents to give it to.
+- **Absent, `null`, empty or whitespace-only**: no flag, today's behaviour. A non-string is ignored with a warning, never the turn.
+- **Isolation is unchanged.** It is prompt text only; it grants nothing. Subagents run under the turn's permission posture as before.
 
 ### Bridge → Server: `ai_request_ack`
 

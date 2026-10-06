@@ -11,6 +11,7 @@ import { promisify } from 'node:util';
 import type { ProviderCapability } from '../protocol/types.js';
 import { stripCredentials } from './env.js';
 import { createLogger } from '../utils/logger.js';
+import { noteDetectedClaudeVersion } from './subagent-prompt.js';
 
 const log = createLogger('Detector');
 const execFileAsync = promisify(execFile);
@@ -105,6 +106,10 @@ async function probeOne(probe: CliProbe): Promise<ProviderCapability> {
       error: err instanceof Error ? err.message : String(err),
     });
   }
+
+  // Version-gated Claude flags (subagent-prompt.ts) read the detected version.
+  // Re-detection updates it, so a CLI upgraded under a running bridge is seen.
+  if (probe.name === 'claude') noteDetectedClaudeVersion(capability.version);
 
   return capability;
 }

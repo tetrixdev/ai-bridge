@@ -483,6 +483,10 @@ It talks to the bridge over stdin and stdout, one JSON line per request and
 per response, so nothing listens on your machine. See PROTOCOL.md "App
 backends".
 
+## Subagent prompt per request
+
+A server can add text to the system prompt of every subagent Claude starts in a turn with the optional `subagent_prompt` string on `ai_request` (next to `system_prompt`, which only reaches the main assistant). The Claude adapter writes it to a temp file, passes `--append-subagent-system-prompt-file <file>`, and deletes it when the turn ends. Nested subagents get it; forks do not (they reuse the main system prompt). Needs Claude Code 2.1.261+; on an older CLI the flag is skipped with a warning. Codex and Gemini ignore it. Details in [PROTOCOL.md](PROTOCOL.md#additive-field-subagent_prompt--text-for-every-subagent).
+
 ## Supported Providers
 
 | Provider | CLI Binary | Session Resume | Streaming | Thinking | Server Tools |
