@@ -10,6 +10,7 @@
  *   npx @tetrixdev/ai-bridge --server wss://... --token <token> --test
  */
 
+import { readUpstreamConfig } from './mcp/upstream.js';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -215,6 +216,11 @@ program
     'Read AI_BRIDGE_SERVER, AI_BRIDGE_TOKEN, AI_BRIDGE_ALLOW_DIR and the AI_BRIDGE_ATTACHMENT_* settings from this file. What `ai-bridge install` points a service at, so a token lives in one file with one owner rather than inside a service definition anybody can print.',
   )
   .option(
+    '--mcp-upstreams <file>',
+    'PROTOTYPE: a JSON file of MCP servers to connect to and offer to the CLI beside the server\'s tools ({"name": {"command", "args"} | {"url"}}). Their MCP App views are passed on to the server. Or set AI_BRIDGE_MCP_UPSTREAMS.',
+    process.env['AI_BRIDGE_MCP_UPSTREAMS'],
+  )
+  .option(
     '--log-file <path>',
     'Also append logs to this file (or set AI_BRIDGE_LOG_FILE env var). Rotates once past 5 MB, keeping one previous copy.',
     process.env['AI_BRIDGE_LOG_FILE'],
@@ -224,7 +230,7 @@ program
     localTools: boolean; engram?: string; engramToken?: string;
     deviceLabel: string; deviceMode: string; identityFile: string; localDataDir: string;
     allowDir: string[]; api?: string; keepAttachments: boolean; allowNative: boolean;
-    envFile?: string; installName?: string; selfUpdate: boolean;
+    envFile?: string; installName?: string; selfUpdate: boolean; mcpUpstreams?: string;
   } & AttachmentOptionValues) => {
     opts.installName = process.env['AI_BRIDGE_NAME'] || undefined;
     // Before anything reads server or token. The file is the lowest precedence
@@ -481,6 +487,7 @@ program
       keepAttachments: operatorPosture.keepAttachments,
       servedFilesPath: operatorPosture.servedFilesPath,
       allowNative: operatorPosture.allowNative,
+      ...(opts.mcpUpstreams ? { mcpUpstreams: readUpstreamConfig(opts.mcpUpstreams) } : {}),
     });
 
     // Lifecycle logging

@@ -1935,6 +1935,32 @@ The bridge passes this error back to the CLI, which typically incorporates it in
 
 ---
 
+## MCP Apps (PROTOTYPE)
+
+Branch `proto/mcp-apps`. MCP Apps (ext-apps, SEP-1865): a tool definition names
+a view in `_meta.ui.resourceUri` (a `ui://` resource, `text/html;profile=mcp-app`)
+and the web application draws it as the host.
+
+- **Server tools.** A `welcome` tool definition may carry `_meta`; the bridge
+  passes it through unchanged on the CLI's `tools/list`. `tool_call` carries
+  `provider_tool_call_id` (Claude Code's `_meta["claudecode/toolUseId"]`), the
+  id the stream later names in `tool_result`, so the server can join the call it
+  ran to the call it sees.
+- **Upstream servers.** `--mcp-upstreams <file>` (`{"mcpServers": {"name":
+  {"command","args","env"} | {"url"}}}`) makes the bridge an MCP client of those
+  servers and offers their tools to the CLI as `<name>__<tool>`; a tool whose
+  `_meta.ui.visibility` leaves out `"model"` is not offered. The operator
+  configures these; a server cannot add one.
+- **`tool_result.ui`.** When such a tool names a view, the first `tool_result`
+  stream event of that call carries `ui`: `{server, tool_name, resource_uri,
+  arguments, result}`, where `result` is the whole CallToolResult. The model
+  only ever got the text content.
+- **`mcp_request` / `mcp_result`.** The server relays a view's own requests:
+  `{type: "mcp_request", id, server, method, params}` with `method`
+  `resources/read` (a `ui://` uri only) or `tools/call` (refused for a tool
+  whose visibility leaves out `"app"`). The bridge answers
+  `{type: "mcp_result", id, result}` or `{type: "mcp_result", id, error}`.
+
 ## Heartbeat
 
 Keeps the WebSocket alive and detects dead connections.

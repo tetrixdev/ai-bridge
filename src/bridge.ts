@@ -16,6 +16,7 @@
  *   - Lifecycle event emission
  */
 
+import { UpstreamHub, type UpstreamConfig } from './mcp/upstream.js';
 import { createReadStream, statSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { basename } from 'node:path';
@@ -99,6 +100,8 @@ const log = createLogger('Bridge');
 // ---------------------------------------------------------------------------
 
 export interface BridgeOptions {
+  /** PROTOTYPE (MCP Apps): MCP servers to connect to and offer to the CLI, by name. */
+  mcpUpstreams?: Record<string, UpstreamConfig>;
   /**
    * Following the server's desired version (src/selfupdate/). `enabled` is
    * what `hello.self_update` says; `onDesired` gets each welcome's
@@ -477,6 +480,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly keepAttachments: boolean;
   /** Whether the operator permitted the server to select `native`. */
   private readonly allowNative: boolean;
+  /** PROTOTYPE (MCP Apps): MCP servers this bridge connects to itself (src/mcp/upstream.ts). */
+  private readonly upstream: UpstreamHub | null;
   /**
    * In-flight MCP server startup from the current handshake, if any.
    *
@@ -532,6 +537,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.keepAttachments = options.keepAttachments ?? false;
     this.servedFiles = new ServedFiles(options.servedFilesPath ?? null);
     this.allowNative = options.allowNative ?? false;
+    this.upstream = options.mcpUpstreams && Object.keys(options.mcpUpstreams).length
+      ? new UpstreamHub(options.mcpUpstreams) : null;
+    // Started in the background; its tools join the bridge's own once it is up.
+    void this.upstream?.start().then(() => this.registerBridgeTools());
     this.sessionWorkingDirs = new SessionWorkingDirs(
       undefined,
       options.sessionStorePath === undefined ? sessionStorePath() : options.sessionStorePath,
@@ -550,6 +559,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // tools/list but would still answer if invoked, and a server that
       // declares a tool of its own called `bridge__attach_file` would have it
       // silently hijacked into the bridge's uploader instead of round-tripping.
+      // PROTOTYPE (MCP Apps): a tool of an MCP server this bridge connects to
+      // itself. Run here; its view, if it names one, goes out with the
+      // call's tool_result (see send()).
+      if (this.upstream?.owns(toolName) && this.mcpServer.hasBridgeTool(toolName)) {
+        const out = await this.upstream.callFromModel(toolName, args, providerToolCallId);
+        if (out.isError) throw new Error(out.text);
+        return out.text;
+      }
       if (toolName === ATTACH_FILE_TOOL && this.mcpServer.hasBridgeTool(ATTACH_FILE_TOOL)) {
         return this.handleAttachFile(requestId, args);
       }
@@ -600,7 +617,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private registerBridgeTools(): void {
     const tools = this.cliIsolation === 'isolated'
       ? []
-      : [ATTACH_FILE_TOOL_DEFINITION as unknown as import('./protocol/types.js').ToolDefinition];
+      : [ATTACH_FILE_TOOL_DEFINITION as unknown as import('./protocol/types.js').ToolDefinition,
+         // PROTOTYPE (MCP Apps): the operator's own upstream MCP servers.
+         ...(this.upstream?.definitions() ?? [])];
 
     this.mcpServer.setBridgeTools(tools);
   }
@@ -1169,6 +1188,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         this.handleUsageRequestMessage(message);
         break;
 
+      case 'mcp_request': {
+        // PROTOTYPE (MCP Apps): a view's request, relayed by the host.
+        const req = message as unknown as { id: string; server: string; method: string; params?: Record<string, unknown> };
+        const hub = this.upstream;
+        void (hub ? hub.request(req.server, req.method, req.params ?? {}) : Promise.reject(new Error('no upstream MCP servers on this bridge')))
+          .then(
+            (result) => this.send({ type: 'mcp_result', id: req.id, result }),
+            (err: unknown) => this.send({ type: 'mcp_result', id: req.id, error: err instanceof Error ? err.message : String(err) }),
+          );
+        break;
+      }
       case 'app_call':
         void this.appSupervisor.handle(message).then(
           (result) => this.send(result),
@@ -2489,6 +2519,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * be checked once for every field it carries — including fields added later.
    */
   private send(message: BridgeToServerMessage): void {
+    // PROTOTYPE (MCP Apps): the first tool_result of a call whose upstream
+    // tool names a view carries what the host needs to draw it.
+    if (this.upstream && message.type === 'stream' && (message as { event?: string }).event === 'tool_result') {
+      const data = (message as unknown as { data: Record<string, unknown> }).data;
+      const ui = typeof data?.['tool_call_id'] === 'string' ? this.upstream.takeUi(data['tool_call_id'] as string) : undefined;
+      if (ui) message = { ...message, data: { ...data, ui } } as BridgeToServerMessage;
+    }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       log.warn('Cannot send message — WebSocket not open', { type: message.type });
       return;

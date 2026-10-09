@@ -128,6 +128,8 @@ export class BridgeMcpServer {
           name: t.name,
           description: t.description,
           inputSchema: this.normalizeInputSchema(t.parameters),
+          // MCP Apps: the definition's _meta (ui.resourceUri) reaches the CLI.
+          ...(t._meta ? { _meta: t._meta } : {}),
         })),
       };
     });

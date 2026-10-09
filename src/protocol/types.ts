@@ -108,6 +108,11 @@ export interface ToolDefinition {
   network?: boolean | string[];
   /** local only. The command to run, and any arguments before the tool's own. */
   run?: { command: string; args?: string[] };
+  /**
+   * PROTOTYPE (MCP Apps): the definition's MCP `_meta`, passed through
+   * unchanged to the CLI's tools/list. ext-apps puts `ui.resourceUri` here.
+   */
+  _meta?: Record<string, unknown>;
 }
 
 /**
@@ -349,6 +354,16 @@ export interface ToolCallMessage {
   provider_tool_call_id?: string;
 }
 
+/**
+ * PROTOTYPE (MCP Apps): the answer to `mcp_request`, correlated by `id`.
+ */
+export interface McpResultMessage {
+  type: 'mcp_result';
+  id: string;
+  result?: unknown;
+  error?: string;
+}
+
 /** Non-streaming error response. */
 export interface BridgeErrorMessage {
   type: 'error';
@@ -492,6 +507,7 @@ export interface UsageLimitFrame {
 }
 
 export type BridgeToServerMessage =
+  | McpResultMessage
   | HelloMessage
   | AiRequestAckMessage
   | StreamMessage
@@ -1056,7 +1072,22 @@ export interface UsageRequestMessage {
   provider?: string;
 }
 
+/**
+ * PROTOTYPE (MCP Apps): a view the server hosts asks its MCP server for
+ * something, on behalf of the person looking at it. Only `resources/read` (a
+ * ui:// resource) and `tools/call` (a tool its server lets an app call).
+ */
+export interface McpRequestMessage {
+  type: 'mcp_request';
+  id: string;
+  /** The upstream server, as the `ui.server` of the call's tool_result named it. */
+  server: string;
+  method: 'resources/read' | 'tools/call';
+  params: Record<string, unknown>;
+}
+
 export type ServerToBridgeMessage =
+  | McpRequestMessage
   | WelcomeMessage
   | AiRequestMessage
   | ToolResolveMessage
@@ -1165,6 +1196,19 @@ export interface ToolResultData {
    * chunked result, like `is_error`. See BlockStartData.parent_tool_use_id.
    */
   parent_tool_use_id?: string;
+  /**
+   * PROTOTYPE (MCP Apps): the call was to an MCP server the bridge connects
+   * to itself (--mcp-upstreams) and its tool names a view. What the host needs
+   * to draw it; the model only got `result`. On the first chunk only.
+   */
+  ui?: {
+    server: string;
+    tool_name: string;
+    resource_uri: string;
+    arguments: Record<string, unknown>;
+    /** The whole CallToolResult: content, structuredContent, _meta. */
+    result: unknown;
+  };
 }
 
 /**
