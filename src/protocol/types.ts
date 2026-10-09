@@ -340,6 +340,13 @@ export interface ToolCallMessage {
   tool_call_id: string;
   tool_name: string;
   arguments: Record<string, unknown>;
+  /**
+   * The CLI's own id for the call, the one its stream later names in
+   * `tool_result` (Claude Code: `_meta["claudecode/toolUseId"]` on tools/call).
+   * Absent when the CLI did not send one. Lets a server join a call it is
+   * running to the call it sees in the stream.
+   */
+  provider_tool_call_id?: string;
 }
 
 /** Non-streaming error response. */

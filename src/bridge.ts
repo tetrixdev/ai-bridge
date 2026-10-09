@@ -540,7 +540,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // The MCP server's tool-call handler proxies through the existing
     // toolResolver → WebSocket round-trip. The requestId comes from the
     // per-spawn token the CLI presented, looked up by BridgeMcpServer.
-    this.mcpServer = new BridgeMcpServer(async (requestId, toolName, args) => {
+    this.mcpServer = new BridgeMcpServer(async (requestId, toolName, args, providerToolCallId) => {
       // Bridge-owned tools first, and by exact name. These never become a
       // `tool_call` frame: the server has no idea what a path on this machine
       // is, and asking it would be both useless and a disclosure.
@@ -574,6 +574,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
             tool_call_id: tcId,
             tool_name: tName,
             arguments: tArgs,
+            ...(providerToolCallId ? { provider_tool_call_id: providerToolCallId } : {}),
           });
         },
         requestId,
