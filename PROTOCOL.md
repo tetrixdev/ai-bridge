@@ -18,6 +18,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Conversation Continuity](#conversation-continuity)
 - [Streaming Events](#streaming-events)
 - [Tool Calls](#tool-calls)
+- [MCP Apps](#mcp-apps)
 - [Heartbeat](#heartbeat)
 - [Error Handling](#error-handling)
 - [Provider Reference](#provider-reference)
@@ -267,6 +268,14 @@ This bridge understands [`app_call`](#app-backends). Sent whatever `--local-tool
 ```
 
 `true` when this bridge will follow [`welcome.desired_bridge_version`](#desired_bridge_version) by itself: it runs as a systemd service that restarts it, whose unit starts `@tetrixdev/ai-bridge@${AI_BRIDGE_VERSION}`, and it is not opted out. `false` from a bridge that understands the field and will not follow it (a terminal, an unpinned unit, macOS or Windows, `--no-self-update`). Absent from a bridge older than 0.24.0. Either way, a machine without `true` needs updating by hand once.
+
+#### Additive field: `mcp_apps`
+
+```json
+{ "type": "hello", "...": "...", "mcp_apps": { "spec": "2026-01-26", "revision": 1 } }
+```
+
+This bridge implements [MCP Apps](#mcp-apps): `spec` is the ext-apps revision, `revision` the revision of the bridge's own MCP Apps frames. Absent from a bridge that predates them; a server then tells the person to update it and must not send `mcp_request`.
 
 #### Additive field: `input_closed`
 
@@ -1935,31 +1944,150 @@ The bridge passes this error back to the CLI, which typically incorporates it in
 
 ---
 
-## MCP Apps (PROTOTYPE)
+## MCP Apps
 
-Branch `proto/mcp-apps`. MCP Apps (ext-apps, SEP-1865): a tool definition names
-a view in `_meta.ui.resourceUri` (a `ui://` resource, `text/html;profile=mcp-app`)
-and the web application draws it as the host.
+[MCP Apps](https://github.com/modelcontextprotocol/ext-apps) (ext-apps, spec
+revision `2026-01-26`): a tool definition names a view in
+`_meta.ui.resourceUri` (a `ui://` resource, `text/html;profile=mcp-app`), and the
+web application draws that view as the **host**, in a sandboxed frame, next to
+the call that produced it. The bridge carries what the host needs; it never
+renders anything.
 
-- **Server tools.** A `welcome` tool definition may carry `_meta`; the bridge
-  passes it through unchanged on the CLI's `tools/list`. `tool_call` carries
-  `provider_tool_call_id` (Claude Code's `_meta["claudecode/toolUseId"]`), the
-  id the stream later names in `tool_result`, so the server can join the call it
-  ran to the call it sees.
-- **Upstream servers.** `--mcp-upstreams <file>` (`{"mcpServers": {"name":
-  {"command","args","env"} | {"url"}}}`) makes the bridge an MCP client of those
-  servers and offers their tools to the CLI as `<name>__<tool>`; a tool whose
-  `_meta.ui.visibility` leaves out `"model"` is not offered. The operator
-  configures these; a server cannot add one.
-- **`tool_result.ui`.** When such a tool names a view, the first `tool_result`
-  stream event of that call carries `ui`: `{server, tool_name, resource_uri,
-  arguments, result}`, where `result` is the whole CallToolResult. The model
-  only ever got the text content.
-- **`mcp_request` / `mcp_result`.** The server relays a view's own requests:
-  `{type: "mcp_request", id, server, method, params}` with `method`
-  `resources/read` (a `ui://` uri only) or `tools/call` (refused for a tool
-  whose visibility leaves out `"app"`). The bridge answers
-  `{type: "mcp_result", id, result}` or `{type: "mcp_result", id, error}`.
+There are two sources of tools with views:
+
+- **The server's own tools** (from `welcome.tools`). The server already knows
+  each definition; the bridge only has to let the CLI see `_meta` and tell the
+  server which stream call a `tool_call` is.
+- **Upstream MCP servers** the person running the bridge configured with
+  `--mcp-upstreams` (see [docs/mcp-upstreams.md](docs/mcp-upstreams.md)). The
+  bridge is their MCP client, so only it sees their definitions: it tells the
+  server which call has a view (`tool_result.ui`) and relays the view's own
+  requests (`mcp_request` / `mcp_result`). A server cannot add an upstream.
+
+### Handshake: `hello.mcp_apps`
+
+```json
+{ "type": "hello", "...": "...", "mcp_apps": { "spec": "2026-01-26", "revision": 1 } }
+```
+
+`spec` is the ext-apps revision implemented; `revision` the revision of the
+bridge's own frames below, bumped whenever one of them changes shape. A bridge
+without the field predates MCP Apps: a server must not send it `mcp_request`
+(it would be logged as unknown and never answered) and should tell the person
+to update the bridge. Bridges follow the server's version by themselves
+([`desired_bridge_version`](#desired_bridge_version)), so the expected fix is a
+`desired_bridge_version` at or above the first release with `mcp_apps`.
+
+### Server tools: `_meta` and `provider_tool_call_id`
+
+- A `welcome.tools[]` definition may carry `_meta` (any JSON object). The bridge
+  passes it **unchanged** to the CLI's `tools/list`, so `ui.resourceUri` and
+  `ui.visibility` reach a CLI that hosts views itself.
+- A `tool_call` frame carries `provider_tool_call_id` when the CLI sent its own
+  id for the call (Claude Code: `_meta["claudecode/toolUseId"]` on
+  `tools/call`). It is the id the stream later names as
+  `tool_result.tool_call_id` (and the `tool_call` block's id), so the server can
+  join the call it is running to the call it sees in the stream. Absent when the
+  CLI sent none (Codex, Gemini): such a call cannot be given a view.
+
+```json
+{ "type": "tool_call", "request_id": "req_1", "tool_call_id": "tc_9", "tool_name": "approve",
+  "arguments": {}, "provider_tool_call_id": "toolu_01AbC" }
+```
+
+### Upstream tools: names, visibility and what the model gets
+
+- Offered to the CLI as `<server>__<tool>` beside the server's tools, with their
+  `_meta`, in `workspace` isolation only (like `bridge__attach_file`, they are
+  the machine's own; an `isolated` CLI never sees them). They run on the
+  bridge and **never** produce a `tool_call` frame.
+- `_meta.ui.visibility` (default `["model", "app"]`): a tool without `"model"`
+  is not offered to the CLI and is refused if called by name; a tool without
+  `"app"` is refused to a view.
+- The model gets the text content only (or the JSON of `structuredContent` when
+  there is no text). The whole `CallToolResult` goes to the host in
+  `tool_result.ui.result`, never into the turn.
+- Every secret the upstream's config resolved (see
+  [docs/mcp-upstreams.md](docs/mcp-upstreams.md)) is redacted from what goes
+  out: model text, `ui.result`, `mcp_result` and error messages.
+
+### `tool_result.ui`
+
+On the **first** `tool_result` stream event of a call to an upstream tool whose
+definition names a view (and only when the CLI sent its call id):
+
+```json
+{ "type": "stream", "request_id": "req_1", "event": "tool_result", "data": {
+  "tool_call_id": "toolu_01AbC", "content": "Shown 3",
+  "ui": {
+    "server": "weather",
+    "tool_name": "show_forecast",
+    "resource_uri": "ui://weather/view.html",
+    "arguments": { "city": "Utrecht" },
+    "result": { "content": [{ "type": "text", "text": "Shown 3" }], "structuredContent": { "...": "..." }, "_meta": {} }
+  } } }
+```
+
+`server` is the name to put in `mcp_request.server`; `tool_name` the tool's own
+name on that server (no prefix); `arguments` what the model passed; `result`
+the whole `CallToolResult`. The host sends the view `ui/notifications/tool-input`
+with `arguments` and `ui/notifications/tool-result` with `result`. Later chunks
+of the same call carry no `ui`. A view not taken within 10 minutes (a CLI that
+never reported the result) is dropped.
+
+### Server → Bridge: `mcp_request`
+
+A view's request, relayed by the host on behalf of the person looking at it.
+
+```json
+{ "type": "mcp_request", "id": "m_1", "server": "weather", "method": "resources/read", "params": { "uri": "ui://weather/view.html" } }
+{ "type": "mcp_request", "id": "m_2", "server": "weather", "method": "tools/call", "params": { "name": "refresh", "arguments": { "city": "Utrecht" } } }
+```
+
+| Field | Meaning |
+|-------|---------|
+| `id` | Chosen by the server; echoed on the answer. Required. |
+| `server` | The upstream, as `tool_result.ui.server` named it. |
+| `method` | `resources/read` (a `ui://` uri only) or `tools/call` (a tool whose visibility includes `"app"`). Nothing else is relayed. |
+| `params` | The MCP params of that method, unchanged. |
+
+### Bridge → Server: `mcp_result`
+
+Exactly one per `mcp_request`, with the same `id`: a `result`, or an `error`
+with a `code`.
+
+```json
+{ "type": "mcp_result", "id": "m_1", "result": { "contents": [ {
+  "uri": "ui://weather/view.html", "mimeType": "text/html;profile=mcp-app", "text": "<!doctype html>...",
+  "_meta": { "ui": { "csp": { "connectDomains": ["https://api.weather.example"], "resourceDomains": ["https://cdn.example"] },
+                     "permissions": { "geolocation": {} }, "domain": "...", "prefersBorder": true } } } ] } }
+{ "type": "mcp_result", "id": "m_2", "error": "refresh is not callable from a view", "code": "refused" }
+```
+
+`result` is the upstream's MCP result **unchanged** (apart from secret
+redaction). For `resources/read` that includes each content item's
+`_meta.ui` — `csp` (`connectDomains`, `resourceDomains`, `frameDomains`,
+`baseUriDomains`), `permissions` (`camera`, `microphone`, `geolocation`,
+`clipboardWrite`), `domain`, `prefersBorder` — exactly as the server declared
+them, so the host can show them to the person and ask for consent before
+widening the frame's CSP or `allow`. When a content item carries no `_meta.ui`,
+the bridge puts there the `_meta.ui` of that uri's `resources/list` entry: the
+spec's fallback, done once here so the host needs no second request. The bridge
+never grants, filters or rewrites a declaration; deciding is the host's.
+
+| `code` | Meaning |
+|--------|---------|
+| `unknown_server` | No upstream of that name on this bridge (or none at all). |
+| `unavailable` | Configured but not connected, and connecting now failed (process will not start, unreachable URL, a secret that could not be resolved). Retried in the background. |
+| `timeout` | The upstream did not answer within its `timeout_ms` (default 60 s). |
+| `refused` | Not something a view may do: a non-`ui://` uri, an unknown tool, a tool whose visibility leaves out `"app"`. |
+| `unsupported` | A method the bridge does not relay. |
+| `upstream_error` | The upstream answered with an error, or its connection broke mid-request (it is then reconnected). |
+
+A view's tools/call runs on the machine whose bridge made the original call; if
+that bridge is gone, the server has nobody to relay to.
+
+---
 
 ## Heartbeat
 
@@ -2169,6 +2297,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `stream` (done) | Response complete |
 | `stream` (error) | Error during streaming |
 | `tool_call` | CLI invoked a server-side tool (via callback) |
+| `mcp_result` | Answering an `mcp_request`: a result, or an error with a code |
 | `cancelled` | A turn stopped because the server asked |
 | `local_result` | Answering a `local_call`, run or refused |
 | `error` | Request-level error (non-streaming) |
@@ -2190,6 +2319,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `upload_abort` | Stop receiving an upload and remove what arrived |
 | `file_read` | Hand a recorded file back, by id, to a one-time URL |
 | `file_read_cancel` | Stop handing a file back |
+| `mcp_request` | A view asks its upstream MCP server for something (`resources/read`, `tools/call`) |
 
 ---
 
@@ -2239,6 +2369,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Person uploads and handing files back do not bump the version.** `hello.file_uploads`, `hello.file_downloads`, the four `upload_*` frames and the three `file_read*` frames are additive; a server must not send `upload_offer` to a bridge that did not advertise `file_uploads`.
 
 **Announcing the input's close does not bump the version.** `hello.input_closed` and the `input_closed` stream event are additive: a consumer ignores an event it does not know, and a server that does not see the flag learns the close the way it always did, from `turn_ending`.
+
+**MCP Apps do not bump the version.** `hello.mcp_apps`, `welcome.tools[]._meta`, `tool_call.provider_tool_call_id`, `tool_result.ui`, `mcp_request` and `mcp_result` are additive; their own shape is versioned by `hello.mcp_apps.revision`.
 
 **Self-update does not bump the version.** `welcome.desired_bridge_version` and `hello.self_update` are additive in both directions.
 

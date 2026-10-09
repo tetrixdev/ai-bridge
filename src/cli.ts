@@ -217,7 +217,7 @@ program
   )
   .option(
     '--mcp-upstreams <file>',
-    'PROTOTYPE: a JSON file of MCP servers to connect to and offer to the CLI beside the server\'s tools ({"name": {"command", "args"} | {"url"}}). Their MCP App views are passed on to the server. Or set AI_BRIDGE_MCP_UPSTREAMS.',
+    'A JSON file of MCP servers this bridge connects to and offers to the CLI beside the server\'s tools ({"mcpServers": {"name": {"command", "args", "env"} | {"url", "headers"}}}; secrets as {"env": "VAR"} or {"vault": {...}}, see docs/mcp-upstreams.md). Their MCP App views are passed on to the server. Or set AI_BRIDGE_MCP_UPSTREAMS.',
     process.env['AI_BRIDGE_MCP_UPSTREAMS'],
   )
   .option(
@@ -281,6 +281,18 @@ program
     if (!serverUrl) {
       log.error('Server URL is required. Use --server <url> or set AI_BRIDGE_SERVER. Use the wss:// address provided by your web application (e.g. wss://your-app.com/api/ai-bridge/ws).');
       process.exit(1);
+    }
+
+    // A bad upstreams file stops the bridge here, naming the server and the
+    // field, rather than leaving a server silently missing later.
+    let mcpUpstreams: ReturnType<typeof readUpstreamConfig> | undefined;
+    if (opts.mcpUpstreams) {
+      try {
+        mcpUpstreams = readUpstreamConfig(opts.mcpUpstreams);
+      } catch (err) {
+        log.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
     }
 
     // Validate server URL format
@@ -487,7 +499,7 @@ program
       keepAttachments: operatorPosture.keepAttachments,
       servedFilesPath: operatorPosture.servedFilesPath,
       allowNative: operatorPosture.allowNative,
-      ...(opts.mcpUpstreams ? { mcpUpstreams: readUpstreamConfig(opts.mcpUpstreams) } : {}),
+      ...(mcpUpstreams ? { mcpUpstreams } : {}),
     });
 
     // Lifecycle logging

@@ -16,7 +16,7 @@
  *   - Lifecycle event emission
  */
 
-import { UpstreamHub, type UpstreamConfig } from './mcp/upstream.js';
+import { MCP_APPS_BRIDGE_REVISION, MCP_APPS_SPEC, UpstreamError, UpstreamHub, type SecretRef, type UpstreamConfig } from './mcp/upstream.js';
 import { createReadStream, statSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { basename } from 'node:path';
@@ -100,7 +100,7 @@ const log = createLogger('Bridge');
 // ---------------------------------------------------------------------------
 
 export interface BridgeOptions {
-  /** PROTOTYPE (MCP Apps): MCP servers to connect to and offer to the CLI, by name. */
+  /** MCP Apps: MCP servers to connect to and offer to the CLI, by name (src/mcp/upstream.ts). */
   mcpUpstreams?: Record<string, UpstreamConfig>;
   /**
    * Following the server's desired version (src/selfupdate/). `enabled` is
@@ -480,8 +480,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly keepAttachments: boolean;
   /** Whether the operator permitted the server to select `native`. */
   private readonly allowNative: boolean;
-  /** PROTOTYPE (MCP Apps): MCP servers this bridge connects to itself (src/mcp/upstream.ts). */
+  /** MCP Apps: MCP servers this bridge connects to itself (src/mcp/upstream.ts). */
   private readonly upstream: UpstreamHub | null;
+  private upstreamStarted = false;
   /**
    * In-flight MCP server startup from the current handshake, if any.
    *
@@ -538,9 +539,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.servedFiles = new ServedFiles(options.servedFilesPath ?? null);
     this.allowNative = options.allowNative ?? false;
     this.upstream = options.mcpUpstreams && Object.keys(options.mcpUpstreams).length
-      ? new UpstreamHub(options.mcpUpstreams) : null;
-    // Started in the background; its tools join the bridge's own once it is up.
-    void this.upstream?.start().then(() => this.registerBridgeTools());
+      ? new UpstreamHub(options.mcpUpstreams, {
+          resolveSecret: (ref) => this.resolveUpstreamSecret(ref),
+          // A server connected, reconnected or changed its tools: the CLI's
+          // next tools/list sees the new set.
+          onToolsChanged: () => this.registerBridgeTools(),
+        })
+      : null;
     this.sessionWorkingDirs = new SessionWorkingDirs(
       undefined,
       options.sessionStorePath === undefined ? sessionStorePath() : options.sessionStorePath,
@@ -559,7 +564,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // tools/list but would still answer if invoked, and a server that
       // declares a tool of its own called `bridge__attach_file` would have it
       // silently hijacked into the bridge's uploader instead of round-tripping.
-      // PROTOTYPE (MCP Apps): a tool of an MCP server this bridge connects to
+      // MCP Apps: a tool of an MCP server this bridge connects to
       // itself. Run here; its view, if it names one, goes out with the
       // call's tool_result (see send()).
       if (this.upstream?.owns(toolName) && this.mcpServer.hasBridgeTool(toolName)) {
@@ -618,7 +623,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     const tools = this.cliIsolation === 'isolated'
       ? []
       : [ATTACH_FILE_TOOL_DEFINITION as unknown as import('./protocol/types.js').ToolDefinition,
-         // PROTOTYPE (MCP Apps): the operator's own upstream MCP servers.
+         // MCP Apps: the operator's own upstream MCP servers.
          ...(this.upstream?.definitions() ?? [])];
 
     this.mcpServer.setBridgeTools(tools);
@@ -986,6 +991,30 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * cache. From here an unreachable Engram and a revoked device look the same,
    * and the one that must not run is the revoked one.
    */
+  /**
+   * A value an upstream MCP server's config names instead of holding
+   * (src/mcp/upstream.ts): the bridge's own environment, or a sealed value
+   * from the Engram vault this device was handed, through the same cache and
+   * TTL as local tools.
+   */
+  private async resolveUpstreamSecret(ref: SecretRef): Promise<string> {
+    if ('env' in ref) {
+      const v = process.env[ref.env];
+      if (v === undefined || v === '') throw new Error(`environment variable ${ref.env} is not set`);
+      return (ref.prefix ?? '') + v;
+    }
+    if (!this.engram || !this.identity?.deviceId) {
+      throw new Error('a vault reference needs this bridge enrolled with Engram (--engram) and approved');
+    }
+    const store = await this.secretsFor([{ space_id: ref.vault.space_id, secret_id: ref.vault.secret_id }]);
+    const found = store.byId(ref.vault.space_id, ref.vault.secret_id);
+    if (!found) {
+      throw new Error(`this device holds no sealed value ${ref.vault.secret_id} in space ${ref.vault.space_id} ` +
+        `(hand it that space's key in the Vault page)`);
+    }
+    return (ref.prefix ?? '') + found.value;
+  }
+
   private async secretsFor(refs: SealedRef[]): Promise<SecretStore> {
     if (refs.length === 0) return new SecretStore();
     if (!this.engram || !this.identity?.deviceId) return this.secrets ?? new SecretStore();
@@ -1025,6 +1054,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
 
     this.startAttachmentSweeps();
+    // Once per process, like the sweeps: reconnects to the server come through
+    // here too, and the upstream connections outlive them. Started in the
+    // background; their tools join the bridge's own as each one comes up.
+    if (this.upstream && !this.upstreamStarted) {
+      this.upstreamStarted = true;
+      void this.upstream.start();
+    }
 
     // Keep token in query param for backward compatibility, but also send it
     // in the Authorization header as the primary (log-safe) channel.
@@ -1085,6 +1121,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     for (const read of this.fileReads.values()) read.abort();
     // App backends are the bridge's own children: they go with it.
     await this.appSupervisor.stopAll();
+    // Upstream MCP servers started over stdio are the bridge's children too.
+    await this.upstream?.close();
     await this.mcpServer.stop();
 
     // Cancel active requests
@@ -1188,17 +1226,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         this.handleUsageRequestMessage(message);
         break;
 
-      case 'mcp_request': {
-        // PROTOTYPE (MCP Apps): a view's request, relayed by the host.
-        const req = message as unknown as { id: string; server: string; method: string; params?: Record<string, unknown> };
-        const hub = this.upstream;
-        void (hub ? hub.request(req.server, req.method, req.params ?? {}) : Promise.reject(new Error('no upstream MCP servers on this bridge')))
-          .then(
-            (result) => this.send({ type: 'mcp_result', id: req.id, result }),
-            (err: unknown) => this.send({ type: 'mcp_result', id: req.id, error: err instanceof Error ? err.message : String(err) }),
-          );
+      case 'mcp_request':
+        this.handleMcpRequest(message);
         break;
-      }
       case 'app_call':
         void this.appSupervisor.handle(message).then(
           (result) => this.send(result),
@@ -1433,6 +1463,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       app_backends: true,
       // ...and hands a backend another linked item beside one request (app_call.use).
       app_items: true,
+      // MCP Apps: which spec revision and which revision of the bridge's own
+      // frames (mcp_request/mcp_result, tool_result.ui, welcome tool _meta,
+      // provider_tool_call_id). A server reads its absence as "too old".
+      mcp_apps: { spec: MCP_APPS_SPEC, revision: MCP_APPS_BRIDGE_REVISION },
       // Follows welcome.desired_bridge_version by itself (src/selfupdate/).
       self_update: this.selfUpdate?.enabled ?? false,
       // Advertise the operator's allow-list so the server can offer a picker
@@ -2518,8 +2552,33 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * The single serialisation point, and so the single place a frame's size can
    * be checked once for every field it carries — including fields added later.
    */
+  /**
+   * MCP Apps: a view's request, relayed by the host. Always answered, once,
+   * with `mcp_result` carrying the same id: a result, or an error with a code.
+   */
+  private handleMcpRequest(message: import('./protocol/types.js').McpRequestMessage): void {
+    const id = typeof message.id === 'string' ? message.id : '';
+    if (!id) {
+      log.warn('mcp_request without an id; ignored');
+      return;
+    }
+    const hub = this.upstream;
+    const work = hub
+      ? hub.request(String(message.server ?? ''), String(message.method ?? ''), (message.params ?? {}) as Record<string, unknown>)
+      : Promise.reject(new UpstreamError('unknown_server', `no upstream MCP servers on this bridge (server ${String(message.server)})`));
+    void work.then(
+      (result) => this.send({ type: 'mcp_result', id, result }),
+      (err: unknown) => {
+        const code = err instanceof UpstreamError ? err.code : 'upstream_error';
+        const text = err instanceof Error ? err.message : String(err);
+        log.info('mcp_request failed', { id, server: message.server, method: message.method, code, error: text });
+        this.send({ type: 'mcp_result', id, error: text, code });
+      },
+    );
+  }
+
   private send(message: BridgeToServerMessage): void {
-    // PROTOTYPE (MCP Apps): the first tool_result of a call whose upstream
+    // MCP Apps: the first tool_result of a call whose upstream
     // tool names a view carries what the host needs to draw it.
     if (this.upstream && message.type === 'stream' && (message as { event?: string }).event === 'tool_result') {
       const data = (message as unknown as { data: Record<string, unknown> }).data;

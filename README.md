@@ -164,6 +164,7 @@ are left where they are.
 | `--allow-native` | | Permit the server to select `native` isolation — the CLI's full local environment, including your own MCP servers, hooks, plugins and a shell. **Off unless you pass it.** Only for a bridge you run against your own machine |
 | `--no-self-update` | `AI_BRIDGE_SELF_UPDATE=0` | Do not follow the version the server asks for; pin `AI_BRIDGE_VERSION` by hand. See [Following the server's version](#following-the-servers-version) |
 | `--keep-attachments` | | Keep downloaded attachments after a turn instead of deleting them. Debugging aid |
+| `--mcp-upstreams <file>` | `AI_BRIDGE_MCP_UPSTREAMS` | MCP servers this bridge connects to itself and offers to the CLI, with their MCP Apps views passed to the web application. See [MCP servers of your own](#mcp-servers-of-your-own-mcp-apps) |
 
 ## Working in a repository
 
@@ -486,6 +487,34 @@ backends".
 ## Subagent prompt per request
 
 A server can add text to the system prompt of every subagent Claude starts in a turn with the optional `subagent_prompt` string on `ai_request` (next to `system_prompt`, which only reaches the main assistant). The Claude adapter writes it to a temp file, passes `--append-subagent-system-prompt-file <file>`, and deletes it when the turn ends. Nested subagents get it; forks do not (they reuse the main system prompt). Needs Claude Code 2.1.261+; on an older CLI the flag is skipped with a warning. Codex and Gemini ignore it. Details in [PROTOCOL.md](PROTOCOL.md#additive-field-subagent_prompt--text-for-every-subagent).
+
+## MCP servers of your own (MCP Apps)
+
+`--mcp-upstreams <file>` makes the bridge an MCP client of servers you choose
+(stdio or Streamable HTTP) and offers their tools to the CLI as
+`<server>__<tool>`, in `workspace` isolation. When a tool names an
+[MCP Apps](https://github.com/modelcontextprotocol/ext-apps) view
+(`_meta.ui.resourceUri`), the web application draws it next to the call: the
+bridge tells it which call has a view, hands it the whole result (the model
+only reads the text), and relays the view's own requests (reading its `ui://`
+resource, calling the tools it may call). The view's declared CSP and
+permissions reach the web application unchanged, for it to ask you before
+granting them.
+
+- Tools marked `visibility: ["app"]` are never offered to the model; tools
+  without `"app"` are refused to a view.
+- Secrets in the file are references, never values: `{"env": "NAME"}` or
+  `{"vault": {"space_id", "secret_id"}}` (an Engram sealed value, as for local
+  tools). A literal value under a credential-looking name is refused at start,
+  and every resolved value is redacted from what leaves the bridge.
+- A stdio server gets only a safe default environment plus what you name, never
+  the bridge's own (which holds its token).
+- A server that fails is retried with backoff; one that drops is reconnected on
+  next use. Its tools stay listed meanwhile.
+
+The file format, secrets and reconnect rules: [docs/mcp-upstreams.md](docs/mcp-upstreams.md).
+The wire frames (`hello.mcp_apps`, `tool_result.ui`, `mcp_request`/`mcp_result`):
+PROTOCOL.md, "MCP Apps".
 
 ## Supported Providers
 
