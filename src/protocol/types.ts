@@ -108,6 +108,11 @@ export interface ToolDefinition {
   network?: boolean | string[];
   /** local only. The command to run, and any arguments before the tool's own. */
   run?: { command: string; args?: string[] };
+  /**
+   * MCP Apps: the definition's MCP `_meta`, passed through unchanged to the
+   * CLI's tools/list. ext-apps puts `ui.resourceUri` and `ui.visibility` here.
+   */
+  _meta?: Record<string, unknown>;
 }
 
 /**
@@ -258,6 +263,14 @@ export interface HelloMessage {
    * it. Either way such a machine needs updating by hand.
    */
   self_update?: boolean;
+  /**
+   * MCP Apps (ext-apps): `spec` is the specification revision implemented
+   * ("2026-01-26"); `revision` the revision of this bridge's own MCP Apps
+   * frames (welcome tool `_meta`, `tool_call.provider_tool_call_id`,
+   * `tool_result.ui`, `mcp_request` / `mcp_result`). Absent from a bridge that
+   * predates them: a server tells the person to update it.
+   */
+  mcp_apps?: { spec: string; revision: number };
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -340,6 +353,27 @@ export interface ToolCallMessage {
   tool_call_id: string;
   tool_name: string;
   arguments: Record<string, unknown>;
+  /**
+   * The CLI's own id for the call, the one its stream later names in
+   * `tool_result` (Claude Code: `_meta["claudecode/toolUseId"]` on tools/call).
+   * Absent when the CLI did not send one. Lets a server join a call it is
+   * running to the call it sees in the stream.
+   */
+  provider_tool_call_id?: string;
+}
+
+/**
+ * MCP Apps: the answer to `mcp_request`, correlated by `id`. Exactly one per
+ * request: `result` (the MCP result, unchanged apart from secret redaction and
+ * the resources/list `_meta.ui` fallback) or `error` with its `code`.
+ */
+export interface McpResultMessage {
+  type: 'mcp_result';
+  id: string;
+  result?: unknown;
+  error?: string;
+  /** With `error`: why, for the host to act on without parsing the words. */
+  code?: 'unknown_server' | 'unavailable' | 'timeout' | 'refused' | 'unsupported' | 'upstream_error';
 }
 
 /** Non-streaming error response. */
@@ -485,6 +519,7 @@ export interface UsageLimitFrame {
 }
 
 export type BridgeToServerMessage =
+  | McpResultMessage
   | HelloMessage
   | AiRequestAckMessage
   | StreamMessage
@@ -1049,7 +1084,22 @@ export interface UsageRequestMessage {
   provider?: string;
 }
 
+/**
+ * MCP Apps: a view the server hosts asks its MCP server for
+ * something, on behalf of the person looking at it. Only `resources/read` (a
+ * ui:// resource) and `tools/call` (a tool its server lets an app call).
+ */
+export interface McpRequestMessage {
+  type: 'mcp_request';
+  id: string;
+  /** The upstream server, as the `ui.server` of the call's tool_result named it. */
+  server: string;
+  method: 'resources/read' | 'tools/call';
+  params: Record<string, unknown>;
+}
+
 export type ServerToBridgeMessage =
+  | McpRequestMessage
   | WelcomeMessage
   | AiRequestMessage
   | ToolResolveMessage
@@ -1158,6 +1208,19 @@ export interface ToolResultData {
    * chunked result, like `is_error`. See BlockStartData.parent_tool_use_id.
    */
   parent_tool_use_id?: string;
+  /**
+   * MCP Apps: the call was to an MCP server the bridge connects
+   * to itself (--mcp-upstreams) and its tool names a view. What the host needs
+   * to draw it; the model only got `result`. On the first chunk only.
+   */
+  ui?: {
+    server: string;
+    tool_name: string;
+    resource_uri: string;
+    arguments: Record<string, unknown>;
+    /** The whole CallToolResult: content, structuredContent, _meta. */
+    result: unknown;
+  };
 }
 
 /**

@@ -55,6 +55,8 @@ export type ToolCallHandler = (
   requestId: string,
   toolName: string,
   args: Record<string, unknown>,
+  /** The CLI's own id for this call (Claude Code: `_meta["claudecode/toolUseId"]`), when it sent one. */
+  providerToolCallId?: string,
 ) => Promise<unknown>;
 
 /** AsyncLocalStorage payload — the request id resolved from the bearer token. */
@@ -126,6 +128,8 @@ export class BridgeMcpServer {
           name: t.name,
           description: t.description,
           inputSchema: this.normalizeInputSchema(t.parameters),
+          // MCP Apps: the definition's _meta (ui.resourceUri) reaches the CLI.
+          ...(t._meta ? { _meta: t._meta } : {}),
         })),
       };
     });
@@ -148,7 +152,11 @@ export class BridgeMcpServer {
       log.info('MCP tools/call', { requestId: ctx.requestId, name });
 
       try {
-        const result = await this.handleCall(ctx.requestId, name, args);
+        const meta = (request.params as { _meta?: Record<string, unknown> })._meta;
+        const providerId = typeof meta?.['claudecode/toolUseId'] === 'string' ? meta['claudecode/toolUseId'] as string : undefined;
+        const result = providerId
+          ? await this.handleCall(ctx.requestId, name, args, providerId)
+          : await this.handleCall(ctx.requestId, name, args);
         const text = typeof result === 'string' ? result : JSON.stringify(result);
         log.info('MCP tool resolved', {
           requestId: ctx.requestId,
