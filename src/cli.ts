@@ -12,7 +12,7 @@
 
 import { readUpstreamConfig } from './mcp/upstream.js';
 import { realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
@@ -151,8 +151,9 @@ program
   )
   .option(
     '--device-label <label>',
-    'How this machine appears when you approve it in the browser.',
-    'A bridge',
+    'How this machine appears when you approve it in the browser. Defaults to its hostname. ' +
+      'Ignored when the bridge token is for a machine already paired for chat: the key goes onto ' +
+      'that machine, under the name it was paired with.',
   )
   .option(
     '--device-mode <mode>',
@@ -228,7 +229,7 @@ program
   .action(async (opts: {
     token?: string; server?: string; debug: boolean; test: boolean; logFile?: string;
     localTools: boolean; engram?: string; engramToken?: string;
-    deviceLabel: string; deviceMode: string; identityFile: string; localDataDir: string;
+    deviceLabel?: string; deviceMode: string; identityFile: string; localDataDir: string;
     allowDir: string[]; api?: string; keepAttachments: boolean; allowNative: boolean;
     envFile?: string; installName?: string; selfUpdate: boolean; mcpUpstreams?: string;
   } & AttachmentOptionValues) => {
@@ -395,7 +396,10 @@ program
         engram = { baseUrl: opts.engram, token: opts.engramToken ?? token };
         if (!identity.deviceId) {
           const mode = opts.deviceMode === 'isolated' ? 'isolated' : 'transcript';
-          const result = await enrol(engram, identity, opts.deviceLabel, mode);
+          // The hostname goes as a label of its own as well, so a server can
+          // name the device after the machine even when a label was not given.
+          const host = hostname();
+          const result = await enrol(engram, identity, opts.deviceLabel?.trim() || host, mode, host);
           identity.deviceId = result.deviceId;
           await saveIdentity(opts.identityFile, identity);
           log.info('enrolled with Engram; approve this device in the browser');
@@ -403,7 +407,7 @@ program
           // compare it against what the browser shows, and a log line scrolls.
           process.stdout.write(
             `\n  This device is waiting to be approved.\n` +
-            `  Open Engram, go to Vault, and check these five groups match:\n\n` +
+            `  Open Engram, go to Vault, find "${result.label}", and check these five groups match:\n\n` +
             `      ${result.fingerprint}\n\n` +
             `  If they differ, do not approve it.\n\n`,
           );

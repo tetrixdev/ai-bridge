@@ -37,6 +37,8 @@ async function call<T>(cfg: EngramConfig, path: string, init?: RequestInit): Pro
 export interface Enrolled {
   deviceId: string;
   fingerprint: string;
+  /** The name Engram shows this device under, beside the fingerprint. */
+  label: string;
 }
 
 /**
@@ -49,10 +51,11 @@ export async function enrol(
   identity: Identity,
   label: string,
   mode: 'transcript' | 'isolated',
+  hostname?: string,
 ): Promise<Enrolled> {
-  const { device } = await call<{ device: { id: string; fingerprint: string } }>(cfg, '/devices/enrol', {
+  const { device } = await call<{ device: { id: string; fingerprint: string; label?: string } }>(cfg, '/devices/enrol', {
     method: 'POST',
-    body: JSON.stringify({ label, publicKey: identity.publicKey, mode }),
+    body: JSON.stringify({ label, publicKey: identity.publicKey, mode, ...(hostname ? { hostname } : {}) }),
   });
 
   // Engram derives the fingerprint from the key it stored. Deriving it again
@@ -67,7 +70,9 @@ export async function enrol(
       `Do not approve it. Something between here and the server changed the key.`,
     );
   }
-  return { deviceId: device.id, fingerprint: local };
+  // The name the device is shown under, which is the paired machine's own name
+  // when the token was issued for one (Engram puts the key on that machine).
+  return { deviceId: device.id, fingerprint: local, label: device.label ?? label };
 }
 
 /** One decrypted sealed value, and where it belongs. */
