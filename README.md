@@ -147,7 +147,7 @@ are left where they are.
 | `--local-tools` | | Allow the server to run tools **on this machine, as you**. Off unless you pass it |
 | `--engram <url>` | `ENGRAM_URL` | Engram base URL, for resolving secrets into local tools |
 | `--engram-token <token>` | `ENGRAM_TOKEN` | Bearer credential for Engram. Defaults to `--token` |
-| `--device-label <label>` | | How this machine appears when you approve it |
+| `--device-label <label>` | hostname | How this machine appears when you approve it. Ignored when the token is for a machine paired for chat: the key goes onto that machine, under its paired name |
 | `--device-mode <mode>` | | `transcript` or `isolated`. Self-reported |
 | `--identity-file <path>` | `ENGRAM_IDENTITY` | Where the device keypair lives (default `~/.engram/device.json`) |
 | `--local-data-dir <path>` | `AI_BRIDGE_DATA_DIR` | Where npm packages for local tools are installed, one directory per space (default `~/.ai-bridge`) |
