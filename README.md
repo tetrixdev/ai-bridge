@@ -582,6 +582,8 @@ Session mappings are persisted to `~/.ai-bridge/sessions.json` so conversations 
 
 See [PROTOCOL.md](./PROTOCOL.md) for the full wire format specification.
 
+All other documentation (architecture, isolation, MCP upstreams, decision records) is listed in [docs/README.md](docs/README.md).
+
 ## License
 
 MIT
