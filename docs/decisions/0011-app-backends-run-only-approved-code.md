@@ -27,8 +27,9 @@ a working-copy file, with its text on disk), `Module.wrap`/`wrapper` (checked,
 since Node defines them so they cannot be locked), a `module.registerHooks`
 load hook that admits only `node:` built-ins and files whose real path is in
 the working copy, `module.registerHooks`/`register` after it,
-`module.enableCompileCache`, and compiling WebAssembly (Node's own `fetch`
-parser is compiled before the lock). A folder the manifest may write that
+`module.enableCompileCache`, and compiling WebAssembly other than the modules
+embedded in Node itself (the bridge lists their sha256 from that Node's
+built-in sources; `fetch` compiles one, llhttp, on its first connection). A folder the manifest may write that
 overlaps the bridge's app data is refused. A Node without
 `module.registerHooks` (before 22.15) does not start a backend.
 
@@ -49,5 +50,7 @@ overlaps the bridge's app data is refused. A Node without
 - **Lock functions only, no loader hook**: `data:` imports and files written
   to a writable folder go through the ES loader, which has no public function
   to lock.
-- **A WebAssembly allowlist by hash of Node's own modules**: the bytes are not
-  reachable under the permission model; compiling before the lock is simpler.
+- **Compile Node's own WebAssembly before the lock** (load undici early): Node
+  24's undici compiles llhttp only on its first connection, so a lock then
+  broke fetch. Nor is a check of the caller's stack sound: an app can hand
+  `WebAssembly.compile` to Node code as a callback.

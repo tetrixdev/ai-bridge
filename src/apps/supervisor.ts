@@ -30,7 +30,7 @@
  * with local tools.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, rename, rm, writeFile, readFile } from 'node:fs/promises';
@@ -253,8 +253,10 @@ export class AppSupervisor {
     env.ENGRAM_NETWORK = JSON.stringify({
       ports: egress.ports,
       hosts: [...hostsOf(call.backend), api.hostname.replace(/^\[|\]$/g, ''), ...(publicImages ? [IMAGE_HOST] : [])],
-      // The only folder it may load code from (guard.ts, "code").
+      // The only folder it may load code from, and the only WebAssembly it may
+      // compile: Node's own (guard.ts, "code").
       app_dir: dir,
+      wasm: await nodeWasmHashes(this.options.nodePath ?? process.execPath),
     });
 
     let child: ChildProcess;
@@ -461,6 +463,36 @@ export class AppSupervisor {
 }
 
 const sha256 = (b: Buffer) => createHash('sha256').update(b).digest('hex');
+
+/**
+ * The sha256 of every WebAssembly module embedded in a Node binary's own code
+ * (undici's HTTP parser, llhttp, among them), which the code fence lets a
+ * backend compile and nothing else (guard.ts). Read from that Node's built-in
+ * sources, outside any backend and without the permission model, once per
+ * binary. An empty list (a Node that no longer lists its sources) refuses all
+ * WebAssembly, fetch's parser included, so it is logged.
+ */
+const NODE_WASM_SCRIPT = `const c = require('crypto'); const out = new Set();
+for (const src of Object.values(process.binding('natives'))) {
+  for (const m of String(src).matchAll(/AGFzbQ[A-Za-z0-9+\\/=]{8,}/g)) out.add(c.createHash('sha256').update(Buffer.from(m[0], 'base64')).digest('hex'));
+}
+process.stdout.write(JSON.stringify([...out]));`;
+const wasmHashes = new Map<string, Promise<string[]>>();
+export function nodeWasmHashes(node: string): Promise<string[]> {
+  let found = wasmHashes.get(node);
+  if (!found) {
+    found = new Promise<string[]>((done) => {
+      execFile(node, ['--no-deprecation', '-e', NODE_WASM_SCRIPT], { maxBuffer: 1024 * 1024, timeout: 15_000, env: { PATH: process.env.PATH ?? '' } }, (err, stdout) => {
+        let list: string[] = [];
+        try { if (!err) list = (JSON.parse(stdout) as unknown[]).filter((h): h is string => typeof h === 'string' && SHA256.test(h)); } catch { /* below */ }
+        if (!list.length) log.warn('could not list the WebAssembly built into Node; app backends compile none, so their fetch() fails', { node, error: err?.message });
+        done(list);
+      });
+    });
+    wasmHashes.set(node, found);
+  }
+  return found;
+}
 
 /** Which items filled which roles, as one string: the process holds their values in its environment. */
 function fillFingerprint(fill: ItemFill[] | undefined): string {

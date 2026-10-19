@@ -488,7 +488,7 @@ roles), before the bridge is ever asked to run it.
   by Node itself (`--disallow-code-generation-from-strings`), and the `vm`
   module, `Module.prototype._compile`, loading a module from anywhere but its
   own files (`data:`, `http(s):`, a file it wrote to a folder it may write)
-  and compiling WebAssembly by a fence loaded before its code. Needs Node
+  and compiling WebAssembly (other than Node's own) by a fence loaded before its code. Needs Node
   22.15 or later. What this does not hold: an approved file that interprets
   data it downloads, and any program it starts.
 - **Vault values** reach it as `ENGRAM_<ROLE>_<FIELD>`, like local tools, and

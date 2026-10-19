@@ -56,18 +56,18 @@
  *     file, including one in a folder the manifest lets it write, are refused;
  *     module.registerHooks and module.register are refused after it;
  *   - module.enableCompileCache (a code cache is bytes the engine trusts);
- *   - WebAssembly: Module (and its prototype's constructor), compile,
- *     compileStreaming, instantiateStreaming, and instantiate of bytes. Node's
- *     own fetch compiles its HTTP parser (llhttp) from WebAssembly the first
- *     time undici loads, so undici is loaded before the lock, and instantiate
- *     still takes a module that already exists (checked by the engine's own
- *     brand check, not by prototype).
+ *   - WebAssembly: Module (and its prototype's constructor), compile and
+ *     instantiate take only bytes whose sha256 is one of the modules embedded
+ *     in this Node's own code (Node's fetch compiles its HTTP parser, llhttp,
+ *     on its first connection), listed by the bridge; compileStreaming and
+ *     instantiateStreaming are refused; instantiate still takes a module that
+ *     already exists (checked by the engine's own brand check).
  *
  * A Node without module.registerHooks (before 22.15) cannot hold the loader,
  * so the fence refuses to start rather than run a backend half-held.
  *
  * Plain JavaScript with no dependency, written to run on Node 22.15 and later.
- * It reads its settings from ENGRAM_NETWORK ({ports, hosts, app_dir}) and
+ * It reads its settings from ENGRAM_NETWORK ({ports, hosts, app_dir, wasm}) and
  * removes that variable.
  */
 
@@ -389,27 +389,57 @@ export const GUARD_SOURCE = String.raw`'use strict';
     if (hasOwn(vm, key)) lock(vm, key, function refusedVmModule() { throw codeError('vm.' + key); });
   }
 
-  // WebAssembly: Node's own fetch compiles its HTTP parser (llhttp) the first
-  // time undici loads, so undici is loaded now, before the lock; a module that
-  // already exists may be instantiated again, new bytes may not be compiled.
+  // WebAssembly: only Node's own modules compile. Node's fetch (undici)
+  // compiles its HTTP parser, llhttp, from WebAssembly embedded in Node, on
+  // its first connection; the bridge reads the sha256 of every module embedded
+  // in this Node's own code (supervisor.ts, nodeWasmHashes) and hands them
+  // over as wasm. Any other bytes are refused, and a compiled module may be
+  // instantiated again (checked by the engine's own brand check, not by its
+  // prototype, which bytes can wear).
   const W = globalThis.WebAssembly;
   if (W) {
-    try { globalThis.fetch('data:,').catch(() => {}); } catch {}
-    const moduleExports = W.Module.exports;
-    const isModule = (m) => { try { ReflectApply(moduleExports, W.Module, [m]); return true; } catch { return false; } };
+    const hashOf = require('crypto').hash;
+    const types = require('util').types;
+    const isAnyArrayBuffer = types.isAnyArrayBuffer;
+    const isView = types.isArrayBufferView;
+    const U8 = Uint8Array;
+    const ReflectConstruct = Reflect.construct;
+    const allowedWasm = create(null);
+    if (config && Array.isArray(config.wasm)) for (const h of config.wasm) if (typeof h === 'string') allowedWasm[h] = true;
+    freeze(allowedWasm);
+    // Hashed as the engine will read them: a view's bytes through its internal
+    // slots (crypto reads them natively), never a getter the app could replace.
+    const nodeOwn = (src) => {
+      let bytes = src;
+      if (isAnyArrayBuffer(src)) bytes = new U8(src);
+      else if (!isView(src)) return false;
+      try { return hasOwn(allowedWasm, hashOf('sha256', bytes)); } catch { return false; }
+    };
+    const OrigModule = W.Module;
+    const moduleExports = OrigModule.exports;
+    const isModule = (m) => { try { ReflectApply(moduleExports, OrigModule, [m]); return true; } catch { return false; } };
+    const compile = W.compile;
     const instantiate = W.instantiate;
-    function WasmModule() { throw codeError('compiling WebAssembly'); }
-    WasmModule.prototype = W.Module.prototype;
-    for (const k of ['exports', 'imports', 'customSections']) if (hasOwn(W.Module, k)) defineProperty(WasmModule, k, { value: W.Module[k], writable: false, configurable: false, enumerable: false });
-    lock(W.Module.prototype, 'constructor', WasmModule);
+    const refusedWasm = () => codeError('compiling WebAssembly that is not part of Node');
+    function WasmModule(bytes) {
+      if (new.target === undefined) throw new TypeErrorCtor("Constructor WebAssembly.Module requires 'new'");
+      if (!nodeOwn(bytes)) throw refusedWasm();
+      return ReflectConstruct(OrigModule, [bytes], new.target === WasmModule ? OrigModule : new.target);
+    }
+    WasmModule.prototype = OrigModule.prototype;
+    for (const k of ['exports', 'imports', 'customSections']) if (hasOwn(OrigModule, k)) defineProperty(WasmModule, k, { value: OrigModule[k], writable: false, configurable: false, enumerable: false });
+    lock(OrigModule.prototype, 'constructor', WasmModule);
     lock(W, 'Module', WasmModule);
-    lock(W, 'compile', function compile() { return PromiseCtor.reject(codeError('compiling WebAssembly')); });
-    lock(W, 'compileStreaming', function compileStreaming() { return PromiseCtor.reject(codeError('compiling WebAssembly')); });
-    lock(W, 'instantiateStreaming', function instantiateStreaming() { return PromiseCtor.reject(codeError('compiling WebAssembly')); });
-    lock(W, 'instantiate', function instantiate_(source, imports) {
-      if (!isModule(source)) return PromiseCtor.reject(codeError('compiling WebAssembly'));
-      return ReflectApply(instantiate, W, [source, imports]);
+    lock(W, 'compile', function compile_(bytes, options) {
+      if (!nodeOwn(bytes)) return PromiseCtor.reject(refusedWasm());
+      return ReflectApply(compile, W, arguments);
     });
+    lock(W, 'instantiate', function instantiate_(source, imports) {
+      if (!isModule(source) && !nodeOwn(source)) return PromiseCtor.reject(refusedWasm());
+      return ReflectApply(instantiate, W, arguments);
+    });
+    lock(W, 'compileStreaming', function compileStreaming() { return PromiseCtor.reject(refusedWasm()); });
+    lock(W, 'instantiateStreaming', function instantiateStreaming() { return PromiseCtor.reject(refusedWasm()); });
   }
 })();
 `;
