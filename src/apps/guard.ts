@@ -376,6 +376,16 @@ export const GUARD_SOURCE = String.raw`'use strict';
   });
 
   const vm = require('vm');
+  // Node builds one internal realm of its own, lazily, through the public
+  // vm.runInNewContext (internal/util, getInternalGlobal), the first time its
+  // web streams, fs or URL code needs a regex from it: closing the body of a
+  // fetch() that sent one is the commonest. Once vm is refused below, that
+  // first use would throw inside Node and fetch() would fail. Releasing a
+  // stream reader's lock builds and caches that realm now, with vm still
+  // Node's own; it runs no code but Node's.
+  if (typeof ReadableStream === 'function') {
+    try { new ReadableStream().getReader().releaseLock(); } catch { say('could not build Node\'s internal realm before the code fence; fetch() with a body may fail'); }
+  }
   function Script() { throw codeError('compiling code with vm.Script'); }
   if (vm.Script && vm.Script.prototype) {
     Script.prototype = vm.Script.prototype;

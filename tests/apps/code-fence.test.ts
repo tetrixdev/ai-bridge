@@ -235,6 +235,7 @@ describe('the code fence of an app backend', () => {
     ok('ok_create_require', 'ok: 42');
     it('ok_builtins', async () => expect(await attempt('ok_builtins')).toMatch(/^ok: [0-9a-f]{8},function$/));
     ok('ok_fetch', 'ok: hello from a declared host');
+    ok('ok_fetch_post', 'ok: hello from a declared host');
     ok('ok_read_folder', `ok: ${`module.exports = '${MARK}'`.length} bytes read as data`);
     ok('ok_wasm_validate', 'ok: true');
   });

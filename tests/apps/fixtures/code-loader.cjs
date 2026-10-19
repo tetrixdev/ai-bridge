@@ -144,6 +144,9 @@ async function attempt(b) {
       case 'ok_create_require': return `ok: ${Module.createRequire(path.join(DIR, 'lib', 'x.js'))('./data.json').answer}`;
       case 'ok_builtins': return `ok: ${[require('node:crypto').createHash('sha256').update('x').digest('hex').slice(0, 8), typeof require('node:zlib').gzipSync].join(',')}`;
       case 'ok_fetch': return `ok: ${await text('/hello')}`;
+      // A request with a body: closing its stream makes Node build its
+      // internal realm through vm.runInNewContext (internal/util).
+      case 'ok_fetch_post': return `ok: ${await (await fetch(BASE + '/hello', { method: 'POST', body: '{"a":1}', headers: { 'content-type': 'application/json' } })).text()}`;
       case 'ok_read_folder': return `ok: ${fs.readFileSync(path.join(b.folder, 'planted.cjs'), 'utf8').length} bytes read as data`;
       case 'ok_wasm_validate': return `ok: ${WebAssembly.validate(await bytes('/code.wasm'))}`;
       default: return `unknown op ${b.op}`;
