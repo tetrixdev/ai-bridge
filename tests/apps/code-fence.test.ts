@@ -64,6 +64,7 @@ function payloads(req: IncomingMessage, res: ServerResponse): void {
   if (req.url === '/code.mjs') { res.writeHead(200, { 'content-type': 'text/javascript' }); res.end(`export default '${MARK}'`); return; }
   if (req.url === '/code.wasm') { res.writeHead(200, { 'content-type': 'application/wasm' }); res.end(WASM); return; }
   if (req.url === '/hello') { res.end('hello from a declared host'); return; }
+  if (req.url === '/json') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"answer":42}'); return; }
   res.writeHead(404); res.end();
 }
 
@@ -235,6 +236,9 @@ describe('the code fence of an app backend', () => {
     ok('ok_create_require', 'ok: 42');
     it('ok_builtins', async () => expect(await attempt('ok_builtins')).toMatch(/^ok: [0-9a-f]{8},function$/));
     ok('ok_fetch', 'ok: hello from a declared host');
+    ok('ok_fetch_json', 'ok: 42');
+    ok('ok_stream_release', 'ok: released');
+    ok('ok_buffer_ctor', 'ok: 3');
     ok('ok_read_folder', `ok: ${`module.exports = '${MARK}'`.length} bytes read as data`);
     ok('ok_wasm_validate', 'ok: true');
   });
