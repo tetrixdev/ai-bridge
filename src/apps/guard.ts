@@ -376,6 +376,18 @@ export const GUARD_SOURCE = String.raw`'use strict';
   });
 
   const vm = require('vm');
+  // Node itself calls vm.runInNewContext, lazily, for a tamper-proof realm:
+  // internal/util's getInternalGlobal (web streams, when a reader is released)
+  // and getStructuredStack (the Buffer() deprecation check). Both keep what
+  // they made, so they are made now, before the lock; otherwise a stream's
+  // release, under fetch's response.json(), throws.
+  try { new ReadableStream().getReader().releaseLock(); } catch {}
+  {
+    const quiet = process.noDeprecation;
+    process.noDeprecation = true;
+    try { Buffer(0); } catch {}
+    process.noDeprecation = quiet;
+  }
   function Script() { throw codeError('compiling code with vm.Script'); }
   if (vm.Script && vm.Script.prototype) {
     Script.prototype = vm.Script.prototype;

@@ -144,6 +144,10 @@ async function attempt(b) {
       case 'ok_create_require': return `ok: ${Module.createRequire(path.join(DIR, 'lib', 'x.js'))('./data.json').answer}`;
       case 'ok_builtins': return `ok: ${[require('node:crypto').createHash('sha256').update('x').digest('hex').slice(0, 8), typeof require('node:zlib').gzipSync].join(',')}`;
       case 'ok_fetch': return `ok: ${await text('/hello')}`;
+      // Node runs vm itself for these (internal/util), lazily: fetch's json() releases a stream reader.
+      case 'ok_fetch_json': { const r = await fetch(`${BASE}/json`); return `ok: ${(await r.json()).answer}`; }
+      case 'ok_stream_release': { const s = new ReadableStream({ start(c) { c.close(); } }); const rd = s.getReader(); await rd.read(); rd.releaseLock(); return 'ok: released'; }
+      case 'ok_buffer_ctor': return `ok: ${new Buffer(3).length}`;
       case 'ok_read_folder': return `ok: ${fs.readFileSync(path.join(b.folder, 'planted.cjs'), 'utf8').length} bytes read as data`;
       case 'ok_wasm_validate': return `ok: ${WebAssembly.validate(await bytes('/code.wasm'))}`;
       default: return `unknown op ${b.op}`;
