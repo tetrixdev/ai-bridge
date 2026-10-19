@@ -483,6 +483,14 @@ roles), before the bridge is ever asked to run it.
   address. What this does not hold: what is said inside TLS to a declared host
   (a shared front end serving other sites), data sent to a declared host
   itself, and any program it starts with `shell` or `programs`.
+- **Its code (0.33.0):** only the files of the version you approved. Code it
+  fetches later from a host it may reach is refused: eval and `new Function`
+  by Node itself (`--disallow-code-generation-from-strings`), and the `vm`
+  module, `Module.prototype._compile`, loading a module from anywhere but its
+  own files (`data:`, `http(s):`, a file it wrote to a folder it may write)
+  and compiling WebAssembly by a fence loaded before its code. Needs Node
+  22.15 or later. What this does not hold: an approved file that interprets
+  data it downloads, and any program it starts.
 - **Vault values** reach it as `ENGRAM_<ROLE>_<FIELD>`, like local tools, and
   are scrubbed from what it answers. These are the DEFAULT items you linked to
   the app. For a role that takes several (one account per client), a request

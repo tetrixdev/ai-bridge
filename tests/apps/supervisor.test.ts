@@ -166,7 +166,7 @@ describe('app backends', () => {
     expect(json(await s.handle(call(v, '/noisy'))).path).toBe('/noisy');
     expect(json(await s.handle(call(v, '/escape'))).read).toBe('ERR_ACCESS_DENIED');
     expect(permissionFlags('/w', { main: 's.js', folders: [{ path: '/data/in', write: false }, { path: '/data/out', write: true }], shell: false, programs: [] }))
-      .toEqual(['--permission', '--allow-fs-read=/w', '--allow-fs-read=/data/in', '--allow-fs-read=/data/out', '--allow-fs-write=/data/out']);
+      .toEqual(['--permission', '--disallow-code-generation-from-strings', '--allow-fs-read=/w', '--allow-fs-read=/data/in', '--allow-fs-read=/data/out', '--allow-fs-write=/data/out']);
     expect(permissionFlags('/w', { main: 's.js', programs: ['git'] })).toContain('--allow-child-process');
     expect(() => permissionFlags('/w', { main: 's.js', folders: [{ path: '/', write: true }] })).toThrow(/whole disk/);
   });

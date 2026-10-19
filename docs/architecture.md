@@ -57,7 +57,7 @@ All on the operator's machine, inside or started by one Node process:
 | Bridge MCP server | HTTP MCP on `127.0.0.1`, per-spawn bearer token; exposes the server's tools, bridge tools and upstream tools to the CLI | `src/mcp/server.ts` |
 | Upstream MCP clients | stdio or HTTP connections to operator-configured MCP servers, with OAuth | `src/mcp/upstream.ts`, `src/mcp/oauth.ts` |
 | Local tool runs | Short-lived processes under `node --permission` and `unshare -rn`, vault values as env, output scrubbed | `src/local/` |
-| App backend processes | One long-running process per Engram app version, Node permission model, network through the bridge's egress relay | `src/apps/` |
+| App backend processes | One long-running process per Engram app version, Node permission model, network through the bridge's egress relay, code held to the version's own files (decision 0011) | `src/apps/` |
 | Local stores | `~/.ai-bridge` (keys, OAuth tokens, apps), `~/.cache/ai-bridge` (attachments, session directories, update lock), allowed folders (uploads, space files) | `src/attachments/`, `src/workspace/`, `src/spacefiles/` |
 | Service units | systemd user service or launch agent per installed bridge, pinned to a version | `src/service/` |
 
