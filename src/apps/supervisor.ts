@@ -30,9 +30,9 @@
  * with local tools.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, rename, rm, writeFile, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
@@ -253,12 +253,16 @@ export class AppSupervisor {
     env.ENGRAM_NETWORK = JSON.stringify({
       ports: egress.ports,
       hosts: [...hostsOf(call.backend), api.hostname.replace(/^\[|\]$/g, ''), ...(publicImages ? [IMAGE_HOST] : [])],
+      // The only folder it may load code from, and the only WebAssembly it may
+      // compile: Node's own (guard.ts, "code").
+      app_dir: dir,
+      wasm: await nodeWasmHashes(this.options.nodePath ?? process.execPath),
     });
 
     let child: ChildProcess;
     try {
       const guard = await this.guardFile();
-      const args = permissionFlags(dir, call.backend, guard);
+      const args = permissionFlags(dir, call.backend, guard, this.dataDir);
       args.push(join(dir, ...call.backend.main.split('/')));
       child = spawn(this.options.nodePath ?? process.execPath, args, {
         cwd: dir, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
@@ -460,6 +464,36 @@ export class AppSupervisor {
 
 const sha256 = (b: Buffer) => createHash('sha256').update(b).digest('hex');
 
+/**
+ * The sha256 of every WebAssembly module embedded in a Node binary's own code
+ * (undici's HTTP parser, llhttp, among them), which the code fence lets a
+ * backend compile and nothing else (guard.ts). Read from that Node's built-in
+ * sources, outside any backend and without the permission model, once per
+ * binary. An empty list (a Node that no longer lists its sources) refuses all
+ * WebAssembly, fetch's parser included, so it is logged.
+ */
+const NODE_WASM_SCRIPT = `const c = require('crypto'); const out = new Set();
+for (const src of Object.values(process.binding('natives'))) {
+  for (const m of String(src).matchAll(/AGFzbQ[A-Za-z0-9+\\/=]{8,}/g)) out.add(c.createHash('sha256').update(Buffer.from(m[0], 'base64')).digest('hex'));
+}
+process.stdout.write(JSON.stringify([...out]));`;
+const wasmHashes = new Map<string, Promise<string[]>>();
+export function nodeWasmHashes(node: string): Promise<string[]> {
+  let found = wasmHashes.get(node);
+  if (!found) {
+    found = new Promise<string[]>((done) => {
+      execFile(node, ['--no-deprecation', '-e', NODE_WASM_SCRIPT], { maxBuffer: 1024 * 1024, timeout: 15_000, env: { PATH: process.env.PATH ?? '' } }, (err, stdout) => {
+        let list: string[] = [];
+        try { if (!err) list = (JSON.parse(stdout) as unknown[]).filter((h): h is string => typeof h === 'string' && SHA256.test(h)); } catch { /* below */ }
+        if (!list.length) log.warn('could not list the WebAssembly built into Node; app backends compile none, so their fetch() fails', { node, error: err?.message });
+        done(list);
+      });
+    });
+    wasmHashes.set(node, found);
+  }
+  return found;
+}
+
 /** Which items filled which roles, as one string: the process holds their values in its environment. */
 function fillFingerprint(fill: ItemFill[] | undefined): string {
   return JSON.stringify((fill ?? []).map((f) => [f.role, f.item_id, Object.entries(f.fields ?? {}).sort(),
@@ -496,8 +530,10 @@ const NODE_NET_PERMISSION = process.allowedNodeEnvironmentFlags.has('--allow-net
  * network permission of its own, `--allow-net` lets the process open those
  * connections at all; the fence still decides where they go.
  */
-export function permissionFlags(dir: string, backend: AppCallMessage['backend'], guard?: string): string[] {
-  const flags = ['--permission', `--allow-fs-read=${dir}`];
+export function permissionFlags(dir: string, backend: AppCallMessage['backend'], guard?: string, dataDir?: string): string[] {
+  // eval and new Function: refused by the engine. The rest of what runs code
+  // that is not one of the version's files is closed by the fence (guard.ts).
+  const flags = ['--permission', '--disallow-code-generation-from-strings', `--allow-fs-read=${dir}`];
   // The network only with the fence in front of it: without one, a Node that
   // has a network permission keeps it denied.
   if (guard) {
@@ -506,11 +542,24 @@ export function permissionFlags(dir: string, backend: AppCallMessage['backend'],
   }
   for (const f of backend.folders ?? []) {
     const path = expandFolder(f.path);
+    // A folder it may write that holds (or is inside) the bridge's app data
+    // would let it change its own files, or the fence, before loading them.
+    if (f.write && dataDir && overlaps(path, resolve(dataDir))) {
+      throw new Error(`the folder "${f.path}" holds the bridge's copies of app versions, so an app may not write to it`);
+    }
     flags.push(`--allow-fs-read=${path}`);
     if (f.write) flags.push(`--allow-fs-write=${path}`);
   }
   if (backend.shell || (backend.programs ?? []).length) flags.push('--allow-child-process');
   return flags;
+}
+
+/** Whether one folder is the other or holds it, after symlinks where they exist. */
+function overlaps(a: string, b: string): boolean {
+  const real = (p: string) => { try { return realpathSync.native(p); } catch { return p; } };
+  const [x, y] = [real(a), real(b)];
+  const within = (p: string, q: string) => p === q || p.startsWith(q.endsWith(sep) ? q : q + sep);
+  return within(x, y) || within(y, x);
 }
 
 function validate(m: AppCallMessage): AppCallMessage {

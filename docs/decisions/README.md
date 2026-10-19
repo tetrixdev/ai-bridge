@@ -18,3 +18,4 @@ history. Format: Engram documentation standard v1, section 3.
 | [0008](0008-upstream-tools-only-in-workspace.md) | Upstream MCP tools are offered only in workspace isolation | accepted | 2026-10-09 |
 | [0009](0009-views-call-only-app-visible-tools.md) | A view may call only tools whose _meta.ui.visibility includes app | accepted | 2026-10-09 |
 | [0010](0010-upstream-oauth-code-relayed-tokens-stay-local.md) | Upstream OAuth: the web app relays the code; tokens and the PKCE verifier stay on the bridge | accepted | 2026-10-16 |
+| [0011](0011-app-backends-run-only-approved-code.md) | An app backend runs only the files of the version the person approved | accepted | 2026-10-19 |

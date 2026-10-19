@@ -37,9 +37,43 @@
  * `v8.setFlagsFromString` is not covered by it and is refused here, because
  * flags such as --allow-natives-syntax are a way under JavaScript's rules.
  *
- * Plain JavaScript with no dependency, written to run on Node 22 and later.
- * It reads its settings from ENGRAM_NETWORK and removes that variable.
+ * THE CODE FENCE (0.33.0, the last section of the source). A backend runs
+ * only the files of the version the person approved: code it fetches later
+ * from a host it may reach is refused, however it is handed to the engine.
+ * eval and new Function are refused by the engine itself
+ * (--disallow-code-generation-from-strings, supervisor.ts). Closed here:
+ *
+ *   - the vm module: Script (and its prototype's constructor),
+ *     runInThisContext, runInContext, runInNewContext, compileFunction;
+ *   - Module.prototype._compile, which runs only a file of the working copy,
+ *     with exactly the text that file holds on disk;
+ *   - Module.wrap and Module.wrapper, which Node defines so they cannot be
+ *     locked: they are checked to be Node's own before every load and compile;
+ *   - every module load, ES or CommonJS, through a module.registerHooks load
+ *     hook registered first (so it runs last, on whatever another hook would
+ *     have produced): a node: built-in, or a file whose real path (after
+ *     symlinks) is inside the working copy. data:, http(s): and any other
+ *     file, including one in a folder the manifest lets it write, are refused;
+ *     module.registerHooks and module.register are refused after it;
+ *   - module.enableCompileCache (a code cache is bytes the engine trusts);
+ *   - WebAssembly: Module (and its prototype's constructor), compile and
+ *     instantiate take only bytes whose sha256 is one of the modules embedded
+ *     in this Node's own code (Node's fetch compiles its HTTP parser, llhttp,
+ *     on its first connection), listed by the bridge; compileStreaming and
+ *     instantiateStreaming are refused; instantiate still takes a module that
+ *     already exists (checked by the engine's own brand check).
+ *
+ * A Node without module.registerHooks (before 22.15) cannot hold the loader,
+ * so the fence refuses to start rather than run a backend half-held.
+ *
+ * Plain JavaScript with no dependency, written to run on Node 22.15 and later.
+ * It reads its settings from ENGRAM_NETWORK ({ports, hosts, app_dir, wasm}) and
+ * removes that variable.
  */
+
+/** `hello.app_code`: the revision of the code fence, raised when what it holds changes. */
+export const APP_CODE_REVISION = 1;
+
 export const GUARD_SOURCE = String.raw`'use strict';
 (function engramNetworkFence() {
   const ReflectApply = Reflect.apply;
@@ -222,5 +256,190 @@ export const GUARD_SOURCE = String.raw`'use strict';
   lock(require('v8'), 'setFlagsFromString', function setFlagsFromString() {
     throw new ErrorCtor('Engram: an app backend may not change V8 flags');
   });
+
+  /* ---------- code: only the approved version's own files ---------- */
+  // eval and new Function are refused by --disallow-code-generation-from-strings
+  // (supervisor.ts); what that flag does not cover is closed here: the vm
+  // module, Module.prototype._compile, the CommonJS wrapper, loader hooks, the
+  // compile cache, WebAssembly, and loading a module from anywhere but the
+  // working copy (data:, other files, a symlink out of it).
+  const Module = require('module');
+  const fs = require('fs');
+  const pathSep = require('path').sep;
+  const realpath = fs.realpathSync.native;
+  const readFile = fs.readFileSync;
+  const decode = decodeURIComponent;
+  const indexOf = uncurry(String.prototype.indexOf);
+  const replaceAll = uncurry(String.prototype.replaceAll);
+  const startsWith = uncurry(String.prototype.startsWith);
+  const charCodeAt = uncurry(String.prototype.charCodeAt);
+  const isBuffer = Buffer.isBuffer;
+  const bufToString = uncurry(Buffer.prototype.toString);
+  const isWindows = process.platform === 'win32';
+  const NOT_APPROVED = 'Engram: an app backend runs only the files of the version the person approved';
+  const codeError = (what) => {
+    say('refused: ' + what);
+    const e = new ErrorCtor(NOT_APPROVED + '; ' + what + ' is refused');
+    e.code = 'ERR_ENGRAM_CODE_FENCE';
+    return e;
+  };
+
+  if (typeof Module.registerHooks !== 'function') {
+    throw new ErrorCtor('Engram app fence: this Node (' + process.version + ') has no module.registerHooks, which holds an app backend to its own files; app backends need Node 22.15 or later');
+  }
+  let appDir = null;
+  try {
+    if (config && typeof config.app_dir === 'string' && config.app_dir) appDir = realpath(config.app_dir);
+  } catch {}
+  // A path inside the working copy, after every symlink; null when it is not.
+  const inside = (p) => {
+    if (appDir === null || typeof p !== 'string' || indexOf(p, '\0') >= 0) return null;
+    let real;
+    try { real = realpath(p); } catch { return null; }
+    return real === appDir || startsWith(real, appDir + pathSep) ? real : null;
+  };
+  // file:///a/b?x#y -> /a/b, by hand: URL and its prototype belong to the app too.
+  const fileUrlPath = (url) => {
+    if (!startsWith(url, 'file:///')) return null;
+    let rest = slice(url, 7);
+    let cut = indexOf(rest, '?');
+    if (cut >= 0) rest = slice(rest, 0, cut);
+    cut = indexOf(rest, '#');
+    if (cut >= 0) rest = slice(rest, 0, cut);
+    try { rest = decode(rest); } catch { return null; }
+    if (isWindows) {
+      if (rest.length > 2 && charCodeAt(rest, 2) === 58 /* : */) rest = slice(rest, 1);
+      rest = replaceAll(rest, '/', '\\');
+    }
+    return rest;
+  };
+  const stripBom = (t) => (charCodeAt(t, 0) === 0xfeff ? slice(t, 1) : t);
+  // Module.wrap and Module.wrapper are code the CommonJS loader puts around
+  // every file it runs. Node defines them so they cannot be locked (a setter
+  // that cannot be removed), so whether they are still Node's own is checked
+  // before every module is loaded and every file compiled.
+  const wrap = Module.wrap;
+  const wrapper = Module.wrapper;
+  const wrapper0 = wrapper[0];
+  const wrapper1 = wrapper[1];
+  // Read as descriptors, not values: a getter put on an element could answer
+  // this check with Node's text and the loader with other code.
+  const dataIs = (o, k, v) => { const d = getOwnDescriptor(o, k); return d !== undefined && hasOwn(d, 'value') && d.value === v; };
+  const wrapIntact = () => {
+    if (Module.wrap !== wrap) throw codeError('loading code after Module.wrap was changed');
+    if (Module.wrapper !== wrapper || !dataIs(wrapper, 0, wrapper0) || !dataIs(wrapper, 1, wrapper1)) {
+      throw codeError('loading code after Module.wrapper was changed');
+    }
+  };
+
+  // Every module, ES or CommonJS, is loaded through this hook: a built-in, or a
+  // file of the working copy. Registered first, so it runs last, on what any
+  // other hook would have produced; and registering another is refused below.
+  Module.registerHooks({
+    load(url, context, nextLoad) {
+      if (typeof url !== 'string') throw codeError('loading a module with no address');
+      wrapIntact();
+      if (startsWith(url, 'node:')) return nextLoad(url, context);
+      const p = fileUrlPath(url);
+      if (p === null || inside(p) === null) {
+        throw codeError('loading ' + (startsWith(url, 'data:') ? 'code from a data: address' : startsWith(url, 'file:') ? '"' + (p === null ? url : p) + '", which is not one of its files' : 'code from ' + slice(url, 0, 80)));
+      }
+      return nextLoad(url, context);
+    },
+  });
+  const refuseHooks = function registerHooks() { throw codeError('registering module loader hooks'); };
+  lock(Module, 'registerHooks', refuseHooks);
+  lock(Module, 'register', function register() { throw codeError('registering module loader hooks'); });
+  // The V8 code cache is bytes the engine trusts; one the app wrote could carry other code.
+  const compileCacheStatus = Module.constants && Module.constants.compileCacheStatus;
+  lock(Module, 'enableCompileCache', function enableCompileCache() {
+    say('refused: the module compile cache');
+    return { status: compileCacheStatus ? compileCacheStatus.DISABLED : 3, message: 'Engram: the compile cache is off for app backends' };
+  });
+
+  // _compile is how the CommonJS loader runs a file it read; called by hand it
+  // runs any string. It runs here only a file of the working copy, as it is on disk.
+  const compile = Module.prototype._compile;
+  lock(Module.prototype, '_compile', function _compile(content, filename) {
+    wrapIntact();
+    const real = inside(filename);
+    if (real === null) throw codeError('compiling "' + String(filename) + '", which is not one of its files');
+    let text;
+    if (typeof content === 'string') text = content;
+    else if (isBuffer(content)) text = bufToString(content, 'utf8');
+    else throw codeError('compiling something that is not the text of a file');
+    let disk;
+    try { disk = readFile(real, 'utf8'); } catch { throw codeError('compiling "' + filename + '", which cannot be read'); }
+    if (stripBom(text) !== stripBom(disk)) throw codeError('compiling text that is not what "' + filename + '" holds');
+    // arguments, not a spread: a spread runs Array.prototype[Symbol.iterator], which the app can replace.
+    return ReflectApply(compile, this, arguments);
+  });
+
+  const vm = require('vm');
+  function Script() { throw codeError('compiling code with vm.Script'); }
+  if (vm.Script && vm.Script.prototype) {
+    Script.prototype = vm.Script.prototype;
+    lock(vm.Script.prototype, 'constructor', Script);
+  }
+  lock(vm, 'Script', Script);
+  for (const key of ['runInThisContext', 'runInContext', 'runInNewContext', 'compileFunction', 'createScript']) {
+    if (hasOwn(vm, key)) lock(vm, key, function refusedVm() { throw codeError('running code with vm.' + key); });
+  }
+  for (const key of ['SourceTextModule', 'SyntheticModule', 'Module']) {
+    if (hasOwn(vm, key)) lock(vm, key, function refusedVmModule() { throw codeError('vm.' + key); });
+  }
+
+  // WebAssembly: only Node's own modules compile. Node's fetch (undici)
+  // compiles its HTTP parser, llhttp, from WebAssembly embedded in Node, on
+  // its first connection; the bridge reads the sha256 of every module embedded
+  // in this Node's own code (supervisor.ts, nodeWasmHashes) and hands them
+  // over as wasm. Any other bytes are refused, and a compiled module may be
+  // instantiated again (checked by the engine's own brand check, not by its
+  // prototype, which bytes can wear).
+  const W = globalThis.WebAssembly;
+  if (W) {
+    const hashOf = require('crypto').hash;
+    const types = require('util').types;
+    const isAnyArrayBuffer = types.isAnyArrayBuffer;
+    const isView = types.isArrayBufferView;
+    const U8 = Uint8Array;
+    const ReflectConstruct = Reflect.construct;
+    const allowedWasm = create(null);
+    if (config && Array.isArray(config.wasm)) for (const h of config.wasm) if (typeof h === 'string') allowedWasm[h] = true;
+    freeze(allowedWasm);
+    // Hashed as the engine will read them: a view's bytes through its internal
+    // slots (crypto reads them natively), never a getter the app could replace.
+    const nodeOwn = (src) => {
+      let bytes = src;
+      if (isAnyArrayBuffer(src)) bytes = new U8(src);
+      else if (!isView(src)) return false;
+      try { return hasOwn(allowedWasm, hashOf('sha256', bytes)); } catch { return false; }
+    };
+    const OrigModule = W.Module;
+    const moduleExports = OrigModule.exports;
+    const isModule = (m) => { try { ReflectApply(moduleExports, OrigModule, [m]); return true; } catch { return false; } };
+    const compile = W.compile;
+    const instantiate = W.instantiate;
+    const refusedWasm = () => codeError('compiling WebAssembly that is not part of Node');
+    function WasmModule(bytes) {
+      if (new.target === undefined) throw new TypeErrorCtor("Constructor WebAssembly.Module requires 'new'");
+      if (!nodeOwn(bytes)) throw refusedWasm();
+      return ReflectConstruct(OrigModule, [bytes], new.target === WasmModule ? OrigModule : new.target);
+    }
+    WasmModule.prototype = OrigModule.prototype;
+    for (const k of ['exports', 'imports', 'customSections']) if (hasOwn(OrigModule, k)) defineProperty(WasmModule, k, { value: OrigModule[k], writable: false, configurable: false, enumerable: false });
+    lock(OrigModule.prototype, 'constructor', WasmModule);
+    lock(W, 'Module', WasmModule);
+    lock(W, 'compile', function compile_(bytes, options) {
+      if (!nodeOwn(bytes)) return PromiseCtor.reject(refusedWasm());
+      return ReflectApply(compile, W, arguments);
+    });
+    lock(W, 'instantiate', function instantiate_(source, imports) {
+      if (!isModule(source) && !nodeOwn(source)) return PromiseCtor.reject(refusedWasm());
+      return ReflectApply(instantiate, W, arguments);
+    });
+    lock(W, 'compileStreaming', function compileStreaming() { return PromiseCtor.reject(refusedWasm()); });
+    lock(W, 'instantiateStreaming', function instantiateStreaming() { return PromiseCtor.reject(refusedWasm()); });
+  }
 })();
 `;

@@ -298,6 +298,17 @@ export interface HelloMessage {
    */
   app_network?: number;
   /**
+   * This bridge runs an app backend's code only from the version the person
+   * approved: eval and new Function are refused by the engine, and the vm
+   * module, Module.prototype._compile, loading a module from anywhere but the
+   * version's own files (data:, other files, a folder it may write) and
+   * compiling WebAssembly are refused by the fence. The number is the
+   * revision (1). Absent from a bridge that predates it (before 0.33.0),
+   * where a backend can run code it downloads from a host it may reach. Like
+   * app_network, it ends where a child process starts (shell, programs).
+   */
+  app_code?: number;
+  /**
    * The values `options.effort` takes: `["low","medium","high","xhigh","max"]`,
    * passed to Claude as `--effort <level>`. Claude only; Codex and Gemini ignore
    * the option. Absent from a bridge that predates it, which drops the option

@@ -73,7 +73,7 @@ Node 22 or newer (CI runs 22 and 24).
 | `src/workspace/` | `--allow-dir` allow-list, `working_dir` resolution, session directories |
 | `src/attachments/` | Fetching, caching, uploads and files handed back |
 | `src/local/` | Local tools: Engram device client, vault decryption, sandbox, scrubbing |
-| `src/apps/` | Engram app backends: supervisor, network fence and egress relay |
+| `src/apps/` | Engram app backends: supervisor, network and code fence, egress relay |
 | `src/spacefiles/` | Space files kept on this machine |
 | `src/selfupdate/` | Following `desired_bridge_version` under systemd |
 | `src/service/` | Installing bridges as systemd user services / launch agents |
@@ -93,6 +93,7 @@ Node 22 or newer (CI runs 22 and 24).
 - 0008 Upstream MCP tools are offered only in `workspace` isolation.
 - 0009 A view may call only tools whose `_meta.ui.visibility` includes `app`.
 - 0010 Upstream OAuth: the web app relays the code; tokens and the PKCE verifier stay on the bridge.
+- 0011 An app backend runs only the files of the version the person approved.
 
 Full records and status: [docs/decisions/README.md](docs/decisions/README.md).
 Before changing what one covers, read it; if your change contradicts an

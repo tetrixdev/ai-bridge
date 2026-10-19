@@ -303,6 +303,14 @@ This bridge keeps a server's [space files](#space-files) (`files_write`, `files_
 
 This bridge holds every app backend to the hosts its manifest declares, plus Engram's own API, and honours `backend.public_images` ([The network fence](#the-network-fence-0290)); the number is the fence's revision. Absent from a bridge that predates it (before 0.29.0), where `backend.network` is shown to the person but not enforced: a server says so rather than claiming it is held.
 
+#### Additive field: `app_code`
+
+```json
+{ "type": "hello", "...": "...", "app_code": 1 }
+```
+
+This bridge runs an app backend's code only from the files of the version the person approved ([The code fence](#the-code-fence-0330)); the number is the fence's revision. Absent from a bridge that predates it (before 0.33.0), where a backend can fetch code from a host it may reach and run it: a server says so rather than claiming the approval covers everything that runs.
+
 #### Additive field: `input_closed`
 
 ```json
@@ -745,7 +753,7 @@ An Engram app may have a backend: code in the app's versioned files, run on the 
 What the bridge does with it (`src/apps/supervisor.ts`):
 
 1. **Working copy.** Keyed on `app.hash`. Each file is fetched as `files.base + sha256`, checked against that hash, and cached by hash under `<local data dir>/apps/blobs/`, so a file unchanged across versions is fetched once. The copy is built beside its final folder and renamed into place. `files.base` and `engram.api` must be on the origin of the server this bridge is connected to (or `--api`), https unless loopback; a path in `tree` is plain segments, never `..`.
-2. **The process.** One per app version on this machine: `node --permission --allow-fs-read=<copy> --allow-fs-read=<fence> --require <fence> [--allow-net on a Node that has it] [--allow-fs-read=<folder>] [--allow-fs-write=<folder with write>] [--allow-child-process when shell or programs] <copy>/<main>`, cwd the copy. Its environment is the same short allowlist local tools get (never the bridge's tokens, never a proxy variable), the vault roles as `ENGRAM_<ROLE>_<FIELD>` exactly as for [`local_call`](#local-calls), and `ENGRAM_APP_DIR`, `ENGRAM_APP_NAME`, `ENGRAM_APP_VERSION` (and `ENGRAM_IMAGE_FETCH` with `public_images`). A different item chosen for a role, or a different host list, restarts the process. The network is held to `backend.network`, see [The network fence](#the-network-fence-0290).
+2. **The process.** One per app version on this machine: `node --permission --disallow-code-generation-from-strings --allow-fs-read=<copy> --allow-fs-read=<fence> --require <fence> [--allow-net on a Node that has it] [--allow-fs-read=<folder>] [--allow-fs-write=<folder with write>] [--allow-child-process when shell or programs] <copy>/<main>`, cwd the copy. Its environment is the same short allowlist local tools get (never the bridge's tokens, never a proxy variable), the vault roles as `ENGRAM_<ROLE>_<FIELD>` exactly as for [`local_call`](#local-calls), and `ENGRAM_APP_DIR`, `ENGRAM_APP_NAME`, `ENGRAM_APP_VERSION` (and `ENGRAM_IMAGE_FETCH` with `public_images`). A different item chosen for a role, or a different host list, restarts the process. The network is held to `backend.network`, see [The network fence](#the-network-fence-0290), and the code to the copy, see [The code fence](#the-code-fence-0330). A folder with `write` that is, holds or lies inside the bridge's own app data (`<local data dir>/apps`) is refused (0.33.0): writing there would change the copy or the fence before they are loaded.
 3. **Lifetime.** Started by the first request, kept while used, stopped after 10 minutes with no request, stopped with the bridge. A crash fails the requests in flight with the exit status and the tail of its stderr; the next request starts a fresh process. Three crashes within a minute refuse starts for 30 seconds.
 4. **The request.** One JSON line on the process's stdin: `{ "id", "method", "path", "headers", "body", "engram": { "api", "token" }, "vault"? }`. The process answers with one JSON line on stdout: `{ "id", "status", "headers", "body" }` (body a string, at most 256 KB). Requests may overlap; ids match them. A stdout line that is not a response is ignored (logs belong on stderr). No answer in 55 seconds fails the request, not the process.
 
@@ -770,7 +778,7 @@ Advertised as `hello.app_network: 1`. A bridge without it does not enforce `back
 
 A backend reaches the hosts in `backend.network` on ports 443 and 80, and Engram's own API host on its exact port, and nothing else. Two halves (`src/apps/guard.ts`, `src/apps/egress.ts`):
 
-- **In the backend**, a fence loaded with `--require` before the app's own code replaces the native methods every connection ends in, on their prototypes, non-writable and non-configurable: a TCP connect goes to a loopback relay in the bridge for the port asked for (another port is refused); UDP, Unix sockets and named pipes, listening, and wrapping a descriptor as a TCP or UDP socket are refused; `dns.lookup` answers only declared names (with a stand-in address) and never asks a resolver; `dns.resolve*` is refused; `v8.setFlagsFromString` is refused. `process.binding`, addons, workers, WASI, the inspector and loader hooks are closed by the permission model itself.
+- **In the backend**, a fence loaded with `--require` before the app's own code replaces the native methods every connection ends in, on their prototypes, non-writable and non-configurable: a TCP connect goes to a loopback relay in the bridge for the port asked for (another port is refused); UDP, Unix sockets and named pipes, listening, and wrapping a descriptor as a TCP or UDP socket are refused; `dns.lookup` answers only declared names (with a stand-in address) and never asks a resolver; `dns.resolve*` is refused; `v8.setFlagsFromString` is refused. `process.binding`, addons, workers, WASI, the inspector and `module.register`'s hooks thread are closed by the permission model itself; in-thread hooks (`module.registerHooks`) and the rest of what runs code are the [code fence](#the-code-fence-0330)'s.
 - **In the bridge**, the relay decides where a connection goes. TLS: by the server name in the client hello (no name, or two, is refused); then it only copies bytes. Anything else is parsed as HTTP/1.1 request by request: each request is checked by its own Host header and forwarded on its own, so a kept-alive connection cannot switch hosts; CONNECT, an absolute-URL request target and anything that is not HTTP are refused. The relay resolves the name itself and connects to the address it checked; a declared name that resolves only to loopback, private, link-local, CGNAT or other non-public addresses is refused (Engram's own host is exempt). A refusal is a 403 with `x-engram-refused: network` over HTTP, an `unrecognized_name` alert over TLS, and a line in the bridge's log.
 
 The replaced functions on the modules themselves (`dns.lookup`, `dns.promises.lookup`, `v8.setFlagsFromString` and the like) keep their enumerability, so a backend written as ES modules still imports them by name (`import { lookup } from 'node:dns/promises'`) and gets the fenced one. In 0.29.0 they were made non-enumerable, which Node reads as "not an export": such an import failed to link and the backend exited at start; fixed in 0.29.1.
@@ -778,6 +786,23 @@ The replaced functions on the modules themselves (`dns.lookup`, `dns.promises.lo
 **`backend.public_images: true`** (the manifest's `"public_images": true`): the backend gets `ENGRAM_IMAGE_FETCH` (`http://engram-images.invalid/`) and may ask the bridge to fetch one image: `GET <ENGRAM_IMAGE_FETCH>?url=<http or https address>`. The bridge makes the request itself: GET with no body and none of the app's headers, ports 443 and 80, public addresses only, at most 4 redirects each checked the same way, an `image/*` content type, 3 MB, 10 seconds. The answer is the image (200, its content type) or a 4xx/502 with `x-engram-refused: images` and a sentence. The address itself still reaches the image's host, which is what loading an image from any host means; nothing else of the app's does.
 
 **What it does not hold.** Inside TLS the relay sees nothing: a request to a declared host whose front end also serves other sites (a shared CDN) can name another site in its inner Host header ("domain fronting"); most large front ends refuse a mismatch, but the bridge cannot check it. Data can go out to a declared host itself. A child process (`shell`, `programs`) runs without the fence. The relay's loopback ports can be reached by other programs on the machine, which gets them only this app's declared hosts.
+
+### The code fence (0.33.0)
+
+Advertised as `hello.app_code: 1`. A bridge without it lets a backend run code it did not ship with: approving a version then does not cover what it downloads later.
+
+A backend runs only the files of the version it was started for (`src/apps/guard.ts`, "code", loaded with the network fence):
+
+- **eval, `new Function`** and the other function constructors are refused by the engine: the process runs with `--disallow-code-generation-from-strings`, and `v8.setFlagsFromString` (which could turn it off) is refused.
+- **The `vm` module**: `Script` (and `vm.Script.prototype.constructor`), `runInThisContext`, `runInContext`, `runInNewContext` and `compileFunction` throw.
+- **Loading a module**, ES or CommonJS: a `module.registerHooks` load hook, registered before the app runs, allows a `node:` built-in and a `file:` whose real path (after symlinks) is inside the working copy, and refuses everything else: `data:` (plain or base64), `http(s):`, and any other file, including one the backend wrote to a folder it may write or one in a folder it may read. `module.registerHooks` and `module.register` are refused after it, so no hook of the app's runs after this one.
+- **`Module.prototype._compile`** runs only a file of the working copy, with the text that file holds on disk. `Module.wrap` and `Module.wrapper` (code put around every CommonJS file) cannot be locked, so a load or compile after either was changed is refused.
+- **`module.enableCompileCache`** answers `DISABLED`: a code cache is bytes the engine trusts.
+- **WebAssembly**: `new WebAssembly.Module` (and its prototype's constructor), `compile` and `instantiate` take only bytes whose sha256 is one of the modules embedded in this Node's own code, which the bridge reads from that Node's built-in sources (Node's `fetch` compiles its HTTP parser, llhttp, on its first connection); other bytes are refused, and so are `compileStreaming` and `instantiateStreaming`. `instantiate` of a module that already exists still works (the engine's own brand check, not the prototype). `validate` works.
+
+A refusal throws an error with `code: 'ERR_ENGRAM_CODE_FENCE'` and a message naming what was refused, and the bridge's log has a line. Every replaced function is non-writable and non-configurable. The settings arrive with the network fence's, in `ENGRAM_NETWORK` (`app_dir`, `wasm`), which the fence removes. Needs Node 22.15 or later (`module.registerHooks`); on an older Node the fence refuses to start the backend rather than run it half-held.
+
+**What it does not hold.** An approved file can still interpret data it downloads (a small interpreter written in JavaScript is code like any other); the fence stops downloaded code from reaching the engine, not an approved program from obeying instructions. `node:repl` does not load (it uses `vm` itself). A child process (`shell`, `programs`) runs without the fence.
 
 ## Subscription Usage
 
@@ -2745,6 +2770,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Self-update does not bump the version.** `welcome.desired_bridge_version` and `hello.self_update` are additive in both directions.
 
 **App backends do not bump the version.** `hello.app_backends`, `app_call` and `app_result` are additive; a server must not send `app_call` to a bridge that did not advertise `app_backends`. `hello.app_items` and `app_call.use` are additive the same way.
+
+**The network and code fences do not bump the version.** `hello.app_network` and `hello.app_code` only say what a bridge holds; nothing is sent differently, and an older server ignores them.
 
 **Workspaces, attachments and `workspace` isolation do not bump the version.** They stay on `0.1`, deliberately. Every one of them is optional in both directions — `hello.workspaces`, `ai_request.working_dir`, `ai_request.attachments`, the `attachment` stream event and the `workspace` value of `cli_isolation` are all additive, and both ends already ignore fields they do not recognise. Only the major number is enforced, so a bump would refuse every bridge already installed in exchange for nothing.
 

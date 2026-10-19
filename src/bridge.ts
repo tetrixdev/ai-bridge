@@ -92,6 +92,7 @@ import { assertAllowedAttachmentUrl, resolveApiOrigin } from './attachments/orig
 import { FileReadRefusal, openRecorded, resolveRange, ServedFiles } from './attachments/served.js';
 import { FilesRefusal, SPACE_FILES_REVISION, SpaceFiles } from './spacefiles/store.js';
 import { APP_NETWORK_REVISION } from './apps/egress.js';
+import { APP_CODE_REVISION } from './apps/guard.js';
 import { CLAUDE_EFFORT_LEVELS } from './providers/claude-effort.js';
 import { Readable } from 'node:stream';
 import { receiveUpload, type UploadOffer, type UploadSent } from './attachments/receive.js';
@@ -1535,6 +1536,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       space_files: SPACE_FILES_REVISION,
       // App backends reach only their declared hosts (apps/guard.ts, apps/egress.ts).
       app_network: APP_NETWORK_REVISION,
+      // App backends run only the files of the approved version (apps/guard.ts, "code").
+      app_code: APP_CODE_REVISION,
       // The levels `options.effort` takes (Claude only; others ignore the option).
       effort_levels: [...CLAUDE_EFFORT_LEVELS],
       // Follows welcome.desired_bridge_version by itself (src/selfupdate/).
