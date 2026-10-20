@@ -93,6 +93,9 @@ import { FileReadRefusal, openRecorded, resolveRange, ServedFiles } from './atta
 import { FilesRefusal, SPACE_FILES_REVISION, SpaceFiles } from './spacefiles/store.js';
 import { APP_NETWORK_REVISION } from './apps/egress.js';
 import { APP_CODE_REVISION } from './apps/guard.js';
+
+/** Revision of per-turn isolation (`ai_request.cli_isolation`), advertised as `hello.turn_isolation`. */
+export const TURN_ISOLATION_REVISION = 1;
 import { CLAUDE_EFFORT_LEVELS } from './providers/claude-effort.js';
 import { Readable } from 'node:stream';
 import { receiveUpload, type UploadOffer, type UploadSent } from './attachments/receive.js';
@@ -1538,6 +1541,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       app_network: APP_NETWORK_REVISION,
       // App backends run only the files of the approved version (apps/guard.ts, "code").
       app_code: APP_CODE_REVISION,
+      // One turn held to the server's tools (ai_request.cli_isolation, turnPosture).
+      turn_isolation: TURN_ISOLATION_REVISION,
       // The levels `options.effort` takes (Claude only; others ignore the option).
       effort_levels: [...CLAUDE_EFFORT_LEVELS],
       // Follows welcome.desired_bridge_version by itself (src/selfupdate/).
@@ -2272,8 +2277,16 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       }
     }
 
+    // The posture THIS turn runs under: the connection's, or narrower when the
+    // request asks (`ai_request.cli_isolation`). Decided before the MCP token,
+    // which carries it; a refusal is thrown inside the try below so the token
+    // is revoked like on every other refusal.
+    const posture = turnPosture(this.cliIsolation, request, adapter);
+    const turnIsolation = posture.refusal ? this.cliIsolation : posture.isolation;
+    const serverToolsOnly = request.cli_isolation !== undefined && !posture.refusal;
+
     const mcpEnabled = this.mcpServer.hasTools() && this.mcpServer.isRunning();
-    const mcpToken = mcpEnabled ? this.mcpServer.issueToken(request_id) : null;
+    const mcpToken = mcpEnabled ? this.mcpServer.issueToken(request_id, { serverToolsOnly }) : null;
     const mcp = mcpEnabled && mcpToken
       ? { url: this.mcpServer.getBaseUrl(), bearerToken: mcpToken }
       : null;
@@ -2299,6 +2312,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // part-downloaded attachments on disk.
     let turnDeadline: { at: number } | null = null;
     try {
+      if (posture.refusal) throw posture.refusal;
+      if (serverToolsOnly) {
+        log.info('Turn held to the server\'s tools only', { requestId: request_id, connection: this.cliIsolation });
+      }
       // Where this turn runs. A refusal here throws and the turn never spawns:
       // there is deliberately no fallback to the scratch directory, because a
       // turn that runs in the wrong place looks exactly like one that worked.
@@ -2398,7 +2415,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         requestId: request_id,
         tools: this.currentTools,
         mcp,
-        cliIsolation: this.cliIsolation,
+        cliIsolation: turnIsolation,
         workingDir,
         signal,
         requestTimeoutSeconds: this.serverConfig.request_timeout,
@@ -2917,4 +2934,43 @@ function upstreamRedirectUri(message: WelcomeMessage): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * The isolation posture one turn runs under.
+ *
+ * The connection's posture, unless the request narrows it with
+ * `cli_isolation: "isolated"` (PROTOCOL.md, "Per-turn isolation"): then the
+ * turn is launched exactly as an `isolated` one, holding it to the server's
+ * own tools. A request can only narrow. Anything it cannot have is refused
+ * with a reason, never quietly run with the connection's wider posture:
+ *
+ * - a value other than `isolated` (`isolation_not_narrowing`);
+ * - a provider whose `isolated` launch does not deny every built-in tool
+ *   (`isolation_unsupported`; Codex's read-only sandbox still has a shell,
+ *   Gemini has no lever at all);
+ * - a `working_dir` beside it (`isolation_conflict`): a folder is for file
+ *   tools the turn does not have, and a session made in a checkout would be
+ *   refused on its next resume anyway.
+ */
+export function turnPosture(
+  connection: CliIsolation,
+  request: Pick<AiRequestMessage, 'cli_isolation' | 'working_dir' | 'provider'>,
+  adapter: Pick<ProviderAdapter, 'enforcesServerToolsOnly' | 'providerName'>,
+): { isolation: CliIsolation; refusal: RequestRefusal | null } {
+  const asked = (request as { cli_isolation?: unknown }).cli_isolation;
+  if (asked === undefined || asked === null) return { isolation: connection, refusal: null };
+  if (asked !== 'isolated') {
+    return { isolation: connection, refusal: new RequestRefusal('isolation_not_narrowing',
+      `This turn asked for \`${String(asked)}\` isolation, and a request may only narrow the connection's posture to \`isolated\`. It was not run.`) };
+  }
+  if (!adapter.enforcesServerToolsOnly) {
+    return { isolation: connection, refusal: new RequestRefusal('isolation_unsupported',
+      `This turn must use the server's tools only, and the ${adapter.providerName} CLI cannot be held to that on this machine. It was not run.`) };
+  }
+  if (request.working_dir) {
+    return { isolation: connection, refusal: new RequestRefusal('isolation_conflict',
+      'This turn must use the server\'s tools only, which have no use for a working folder, and it named one. It was not run.') };
+  }
+  return { isolation: 'isolated', refusal: null };
 }

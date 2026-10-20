@@ -33,6 +33,19 @@ And gating `workspace` alone would have been theatre, because `native` is
 strictly broader: a server refused the shell one way would ask for it the other
 way and get the operator's MCP servers, hooks and plugins along with it.
 
+## One turn narrower than the connection
+
+A server may hold a single turn to `isolated` with `ai_request.cli_isolation:
+"isolated"` (advertised as `hello.turn_isolation`), whatever posture the
+connection adopted: for work nobody watches, such as a scheduled job that
+should reach the server's tools and nothing on this machine. It can only
+narrow; the turn is launched with exactly the `isolated` flags below, its MCP
+token lists only the server-declared tools (the bridge's uploader and any
+upstream server are withheld and refused by name), and it is **refused, never
+run wider**, on a provider that cannot be held to it (Codex keeps a read-only
+shell, Gemini has no lever) or when it also names a working folder. The
+decision is `turnPosture()` in `src/bridge.ts`.
+
 ## How `isolated` is actually enforced
 
 This is the part that is easy to get wrong, and was wrong here until it was

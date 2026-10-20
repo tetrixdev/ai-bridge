@@ -309,6 +309,15 @@ export interface HelloMessage {
    */
   app_code?: number;
   /**
+   * This bridge honours `ai_request.cli_isolation: "isolated"`: one turn held
+   * to the server's tools only, whatever the connection's posture, or refused
+   * when that cannot be enforced. The number is the revision (1). Absent from
+   * a bridge that predates it (before 0.33.0), which ignores the field and
+   * would run the turn with the connection's posture: a server must not send
+   * such a turn to it.
+   */
+  turn_isolation?: number;
+  /**
    * The values `options.effort` takes: `["low","medium","high","xhigh","max"]`,
    * passed to Claude as `--effort <level>`. Claude only; Codex and Gemini ignore
    * the option. Absent from a bridge that predates it, which drops the option
@@ -992,6 +1001,20 @@ export interface AiRequestMessage {
    * Deleted when the turn terminates.
    */
   attachments?: AttachmentRef[];
+  /**
+   * Narrow THIS turn to the server's tools only (bridge 0.33.0+, advertised as
+   * `hello.turn_isolation`). The one value is `"isolated"`: the turn is
+   * launched exactly as in the `isolated` posture (no shell, file, web or
+   * helper tools, none of the operator's MCP servers or the bridge's own
+   * tools), whatever posture the connection adopted. It can only narrow:
+   * any other value is refused with `isolation_not_narrowing`, never honoured.
+   *
+   * Refused, never run wider, when the provider cannot be held to it
+   * (`isolation_unsupported`: only Claude can) or when the request also names
+   * a `working_dir` (`isolation_conflict`: a folder is for file tools this turn
+   * does not have). Absent means the connection's posture, as before.
+   */
+  cli_isolation?: 'isolated';
   /**
    * Environment keys to set or unset on the spawned CLI for this turn.
    *
