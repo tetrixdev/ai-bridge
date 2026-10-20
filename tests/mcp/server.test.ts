@@ -138,3 +138,47 @@ describe('BridgeMcpServer', () => {
     }
   });
 });
+
+describe('BridgeMcpServer: a turn held to the server\'s tools', () => {
+  let server: BridgeMcpServer;
+  let handler: ToolCallHandler;
+
+  beforeEach(async () => {
+    handler = vi.fn(async () => 'ok') as unknown as ToolCallHandler;
+    server = new BridgeMcpServer(handler);
+    server.setTools([{ name: 'memory_query', description: 'Ask memory', parameters: { type: 'object', properties: {} } }]);
+    server.setBridgeTools([{ name: 'bridge__attach_file', description: 'Upload a file from this disk', parameters: { type: 'object', properties: {} } }]);
+    await server.start();
+  });
+
+  afterEach(async () => {
+    await server.stop();
+  });
+
+  it('lists only the server tools to that turn, and every tool to an ordinary one', async () => {
+    const held = await buildClient(server.getBaseUrl(), server.issueToken('req-held', { serverToolsOnly: true }));
+    const open = await buildClient(server.getBaseUrl(), server.issueToken('req-open'));
+    try {
+      expect((await held.listTools()).tools.map((t) => t.name)).toEqual(['memory_query']);
+      expect((await open.listTools()).tools.map((t) => t.name)).toEqual(['memory_query', 'bridge__attach_file']);
+    } finally {
+      await held.close();
+      await open.close();
+    }
+  });
+
+  it('refuses a bridge tool called by name from that turn, without reaching the handler', async () => {
+    const held = await buildClient(server.getBaseUrl(), server.issueToken('req-held', { serverToolsOnly: true }));
+    try {
+      const refused = await held.callTool({ name: 'bridge__attach_file', arguments: { path: '/etc/passwd' } });
+      expect(refused.isError).toBe(true);
+      expect(JSON.stringify(refused.content)).toContain('server\'s own tools only');
+      expect(handler).not.toHaveBeenCalled();
+      const allowed = await held.callTool({ name: 'memory_query', arguments: {} });
+      expect(allowed.isError).toBeFalsy();
+      expect(handler).toHaveBeenCalledWith('req-held', 'memory_query', {});
+    } finally {
+      await held.close();
+    }
+  });
+});

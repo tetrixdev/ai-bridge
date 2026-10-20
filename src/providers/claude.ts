@@ -107,6 +107,8 @@ const log = createLogger('ClaudeAdapter');
 
 export class ClaudeAdapter extends ProviderAdapter {
   readonly providerName = 'claude';
+  /** Measured: an `isolated` launch denies Bash, Read, Write, WebFetch and every other built-in (docs/isolation.md). */
+  override readonly enforcesServerToolsOnly = true;
 
   async execute(context: ExecutionContext, emit: (event: AdapterStreamEvent) => void): Promise<string | null> {
     // Every emission resets the silence clock, so the wrapper goes HERE rather

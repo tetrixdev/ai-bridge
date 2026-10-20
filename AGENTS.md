@@ -94,6 +94,7 @@ Node 22 or newer (CI runs 22 and 24).
 - 0009 A view may call only tools whose `_meta.ui.visibility` includes `app`.
 - 0010 Upstream OAuth: the web app relays the code; tokens and the PKCE verifier stay on the bridge.
 - 0011 An app backend runs only the files of the version the person approved.
+- 0012 A request may narrow its own turn to `isolated`, never widen it.
 
 Full records and status: [docs/decisions/README.md](docs/decisions/README.md).
 Before changing what one covers, read it; if your change contradicts an

@@ -62,6 +62,14 @@ export type ToolCallHandler = (
 /** AsyncLocalStorage payload — the request id resolved from the bearer token. */
 interface McpCallContext {
   requestId: string;
+  /** The turn is held to the server's tools only (`ai_request.cli_isolation`). */
+  serverToolsOnly: boolean;
+}
+
+/** What a per-spawn token stands for. */
+interface TokenGrant {
+  requestId: string;
+  serverToolsOnly: boolean;
 }
 
 /**
@@ -96,7 +104,7 @@ export class BridgeMcpServer {
   private bridgeTools: ToolDefinition[] = [];
   private readonly handleCall: ToolCallHandler;
   /** Per-spawn bearer tokens → AI request_id they map to. */
-  private readonly tokens = new Map<string, string>();
+  private readonly tokens = new Map<string, TokenGrant>();
   /** Propagates the resolved requestId from the HTTP handler down to the tool handler. */
   private readonly callContext = new AsyncLocalStorage<McpCallContext>();
 
@@ -118,13 +126,14 @@ export class BridgeMcpServer {
 
     server.setRequestHandler(ListToolsRequestSchema, async (): Promise<ListToolsResult> => {
       const ctx = this.callContext.getStore();
+      const offered = this.offeredTo(ctx);
       log.info('MCP tools/list', {
         requestId: ctx?.requestId,
-        toolCount: this.tools.length + this.bridgeTools.length,
-        tools: [...this.tools, ...this.bridgeTools].map((t) => t.name),
+        toolCount: offered.length,
+        tools: offered.map((t) => t.name),
       });
       return {
-        tools: [...this.tools, ...this.bridgeTools].map((t) => ({
+        tools: offered.map((t) => ({
           name: t.name,
           description: t.description,
           inputSchema: this.normalizeInputSchema(t.parameters),
@@ -150,6 +159,18 @@ export class BridgeMcpServer {
       // INFO (not debug) so it shows up without --debug — live tests need to
       // see at-a-glance whether the CLI is actually reaching the MCP server.
       log.info('MCP tools/call', { requestId: ctx.requestId, name });
+
+      // A turn held to the server's tools reaches nothing else by name either:
+      // not the bridge's uploader (it reads a file off this disk), not an
+      // operator's upstream server. Withheld from tools/list above AND refused
+      // here, because a model can call a name it was never offered.
+      if (ctx.serverToolsOnly && !this.tools.some((t) => t.name === name)) {
+        log.warn('MCP tool refused: turn is held to the server\'s tools', { requestId: ctx.requestId, name });
+        return {
+          content: [{ type: 'text', text: `${name} is not available: this turn may use the server's own tools only.` }],
+          isError: true,
+        };
+      }
 
       try {
         const meta = (request.params as { _meta?: Record<string, unknown> })._meta;
@@ -317,10 +338,15 @@ export class BridgeMcpServer {
    * request completes, the caller calls `revokeToken()` so the token can no
    * longer be used.
    */
-  issueToken(requestId: string): string {
+  issueToken(requestId: string, opts: { serverToolsOnly?: boolean } = {}): string {
     const token = randomBytes(24).toString('hex');
-    this.tokens.set(token, requestId);
+    this.tokens.set(token, { requestId, serverToolsOnly: opts.serverToolsOnly === true });
     return token;
+  }
+
+  /** The tools one caller may see: the server's, plus the bridge's own unless its turn is held to the server's. */
+  private offeredTo(ctx: McpCallContext | undefined): ToolDefinition[] {
+    return ctx?.serverToolsOnly ? [...this.tools] : [...this.tools, ...this.bridgeTools];
   }
 
   /** Drop a per-spawn token. Idempotent. */
@@ -348,8 +374,8 @@ export class BridgeMcpServer {
     const auth = req.headers['authorization'] ?? '';
     const match = /^Bearer\s+(.+)$/.exec(auth);
     const token = match ? match[1] : null;
-    const requestId = token ? this.tokens.get(token) : undefined;
-    if (!token || !requestId) {
+    const grant = token ? this.tokens.get(token) : undefined;
+    if (!token || !grant) {
       // WARN (not debug) — a 401 here means either a CLI is misconfigured or
       // a per-spawn token was revoked before the CLI finished its turn.
       // Visible without --debug because it's actionable.
@@ -377,7 +403,7 @@ export class BridgeMcpServer {
     // Enter an AsyncLocalStorage frame keyed by this HTTP request — the
     // tools/call handler reads `requestId` from it without us having to
     // thread it through the SDK's request/response shape.
-    await this.callContext.run({ requestId }, async () => {
+    await this.callContext.run({ requestId: grant.requestId, serverToolsOnly: grant.serverToolsOnly }, async () => {
       await transport.handleRequest(req, res);
     });
   }

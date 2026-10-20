@@ -311,6 +311,14 @@ This bridge holds every app backend to the hosts its manifest declares, plus Eng
 
 This bridge runs an app backend's code only from the files of the version the person approved ([The code fence](#the-code-fence-0330)); the number is the fence's revision. Absent from a bridge that predates it (before 0.33.0), where a backend can fetch code from a host it may reach and run it: a server says so rather than claiming the approval covers everything that runs.
 
+#### Additive field: `turn_isolation`
+
+```json
+{ "type": "hello", "...": "...", "turn_isolation": 1 }
+```
+
+Since ai-bridge 0.33.0. This bridge honours [`ai_request.cli_isolation`](#additive-field-cli_isolation--one-turn-held-to-the-servers-tools): one turn held to the server's tools only, whatever posture the connection adopted, or refused when that cannot be enforced. The number is the revision (1). Absent from a bridge that predates it, which ignores the field and runs the turn with the connection's posture: **a server must not send such a turn to it**, and should say the bridge needs updating instead.
+
 #### Additive field: `input_closed`
 
 ```json
@@ -1105,6 +1113,20 @@ A string the bridge appends to the system prompt of every subagent (helper) the 
 - **Codex / Gemini**: ignored (debug log). Neither CLI has subagents to give it to.
 - **Absent, `null`, empty or whitespace-only**: no flag, today's behaviour. A non-string is ignored with a warning, never the turn.
 - **Isolation is unchanged.** It is prompt text only; it grants nothing. Subagents run under the turn's permission posture as before.
+
+#### Additive field: `cli_isolation` — one turn held to the server's tools
+
+```json
+"cli_isolation": "isolated"
+```
+
+Narrows THIS turn to the [`isolated`](#cli_isolation) posture, whatever the connection adopted on `welcome`: for a turn nobody watches, such as a scheduled job, that should reach the server's own tools and nothing on the machine. Advertised as [`hello.turn_isolation`](#additive-field-turn_isolation).
+
+- **Launched exactly as an `isolated` turn**: on Claude `--strict-mcp-config`, `--allowedTools mcp__bridge__*` and `--permission-mode manual`, so the shell, file, web and helper tools are denied by the CLI itself. Measured against Claude 2.1.283: a turn asked to write a file with Bash was denied and nothing was written.
+- **The bridge's own tools are withheld too**: the turn's MCP token lists only the server-declared tools, and a call to any other name (`bridge__attach_file`, an operator's upstream server) is refused with `isError` without leaving the bridge.
+- **It can only narrow.** The only value is `isolated`; anything else is refused with `isolation_not_narrowing` and the turn does not run. A request cannot widen what the connection adopted, and never what the operator allowed.
+- **Refused rather than run wider** when it cannot be held: `isolation_unsupported` on a provider whose `isolated` launch still leaves a tool open (Codex keeps a read-only shell; Gemini has no lever), and `isolation_conflict` when the request also names a `working_dir` (a folder is for file tools the turn does not have).
+- **Absent** means the connection's posture, as before. Send it on every turn that should have it, resumes included: like the launch flags it is per invocation.
 
 ### Bridge → Server: `ai_request_ack`
 
@@ -2526,6 +2548,9 @@ The server also tracks heartbeats. If no `ping` is received for 2x the heartbeat
 | `attachment_refused` | An attachment URL is not on the connected server's origin, or is not HTTPS | Server fixes the URL (or the operator sets `--api`). Terminal: `done` follows |
 | `attachment_too_large` | An attachment exceeds the per-file, per-request or count cap (all three are reported in `hello` as `attachment_limits`) | Server sends a smaller file, or the operator raises `--attachment-max-mb` / `--attachment-total-mb` / `--attachment-max-count`. Terminal: `done` follows |
 | `attachment_failed` | An attachment could not be downloaded — including one that stalled or ran past the per-file ceiling — or failed its size/checksum verification | Retry; for a stall or ceiling on a slow link, the operator raises `--attachment-stall-seconds` / `--attachment-timeout-minutes`. Terminal: `done` follows |
+| `isolation_not_narrowing` | `ai_request.cli_isolation` named something other than `isolated`: a request may only narrow the connection's posture | Server sends `isolated` or nothing. Terminal: `done` follows |
+| `isolation_unsupported` | The turn must use the server's tools only, and its provider cannot be held to that (only Claude can) | Server uses Claude for such turns, or does not narrow. Terminal: `done` follows |
+| `isolation_conflict` | The turn must use the server's tools only and also named a `working_dir` | Server leaves `working_dir` out of such turns. Terminal: `done` follows |
 | `gemini_working_dir_unavailable` | Gemini cannot use this working directory: the repository already has a `.gemini/settings.json`, or another Gemini turn is running in it | Move the file aside, use Claude or Codex, or wait for the other turn. Terminal: `done` follows |
 
 All of the above are **refusals**: they carry their own code and are followed by `done`, which ends the turn. They are deliberately not reported as `session_lost` — that code tells the server to wipe the session and silently re-issue the turn, which for a refusal would retry it forever and never surface the reason.
@@ -2770,6 +2795,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Self-update does not bump the version.** `welcome.desired_bridge_version` and `hello.self_update` are additive in both directions.
 
 **App backends do not bump the version.** `hello.app_backends`, `app_call` and `app_result` are additive; a server must not send `app_call` to a bridge that did not advertise `app_backends`. `hello.app_items` and `app_call.use` are additive the same way.
+
+**Per-turn isolation does not bump the version.** `hello.turn_isolation` and `ai_request.cli_isolation` are additive; a server must not send the field to a bridge that did not advertise `turn_isolation`, since an older one ignores it and runs the turn with the connection's posture.
 
 **The network and code fences do not bump the version.** `hello.app_network` and `hello.app_code` only say what a bridge holds; nothing is sent differently, and an older server ignores them.
 

@@ -290,6 +290,18 @@ export abstract class ProviderAdapter {
   abstract readonly providerName: string;
 
   /**
+   * Whether this adapter can hold ONE turn to the server's tools only when the
+   * server narrows it with `ai_request.cli_isolation: "isolated"`: no shell, no
+   * file tools, no web, nothing but the bridge MCP namespace. Only an adapter
+   * whose `isolated` launch is measured to deny every built-in tool says yes
+   * (Claude: --allowedTools mcp__bridge__* with --permission-mode manual). The
+   * bridge refuses such a turn on any other provider rather than running it
+   * with whatever its `isolated` happens to leave open: Codex's read-only
+   * sandbox still has a shell, and Gemini has no lever at all.
+   */
+  readonly enforcesServerToolsOnly: boolean = false;
+
+  /**
    * Execute an AI request by invoking the local CLI.
    *
    * The adapter should call `onEvent` for each streaming chunk produced
