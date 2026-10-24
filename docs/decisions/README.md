@@ -20,3 +20,4 @@ history. Format: Engram documentation standard v1, section 3.
 | [0010](0010-upstream-oauth-code-relayed-tokens-stay-local.md) | Upstream OAuth: the web app relays the code; tokens and the PKCE verifier stay on the bridge | accepted | 2026-10-16 |
 | [0011](0011-app-backends-run-only-approved-code.md) | An app backend runs only the files of the version the person approved | accepted | 2026-10-19 |
 | [0012](0012-a-request-may-narrow-its-turn-never-widen.md) | A request may narrow its own turn to isolated, never widen it | accepted | 2026-10-20 |
+| [0013](0013-token-only-in-the-authorization-header.md) | The connection token travels only in the Authorization header | accepted | 2026-10-24 |

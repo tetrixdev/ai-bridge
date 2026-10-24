@@ -72,13 +72,19 @@ package's dedicated WebSocket server listens on its own port and serves the
 connection at the origin root, so the address is an origin rather than a path:
 
 ```
-wss://{host}:{port}?token={connection_token}
+wss://{host}:{port}
+Authorization: Bearer {connection_token}
 ```
 
-The exact value comes from the server (`ai-bridge.server.public_url` when set,
+The exact address comes from the server (`ai-bridge.server.public_url` when set,
 otherwise `ws://{host}:{port}`) and is whatever the operator passes to
-`--server`. The token also travels as an `Authorization: Bearer` header; the
-query parameter is kept for servers that have not adopted the header.
+`--server`. The token travels **only** in the `Authorization: Bearer` header of
+the upgrade request. Bridges before 0.35.0 also appended it to the URL as
+`?token=`; 0.35.0 stopped, because a URL is written to every access log on the
+way (a reverse proxy's in particular) and the token ended up there in plain
+text. A server may keep accepting `?token=` from older bridges for a while, but
+should log that it did (never the token) and must not need it: every bridge
+since 0.14.0 sends the header.
 
 The `connection_token` is a short-lived JWT obtained by the user through the web application's settings page. It encodes:
 
@@ -2799,6 +2805,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Per-turn isolation does not bump the version.** `hello.turn_isolation` and `ai_request.cli_isolation` are additive; a server must not send the field to a bridge that did not advertise `turn_isolation`, since an older one ignores it and runs the turn with the connection's posture.
 
 **The network and code fences do not bump the version.** `hello.app_network` and `hello.app_code` only say what a bridge holds; nothing is sent differently, and an older server ignores them.
+
+**Dropping `?token=` does not bump the version.** From 0.35.0 the token travels only in the `Authorization` header, which bridges have sent since 0.14.0 and which both server halves read (Engram's `/bridge` never read anything else); a server that still accepts the query parameter simply stops seeing it.
 
 **Workspaces, attachments and `workspace` isolation do not bump the version.** They stay on `0.1`, deliberately. Every one of them is optional in both directions — `hello.workspaces`, `ai_request.working_dir`, `ai_request.attachments`, the `attachment` stream event and the `workspace` value of `cli_isolation` are all additive, and both ends already ignore fields they do not recognise. Only the major number is enforced, so a bump would refuse every bridge already installed in exchange for nothing.
 
