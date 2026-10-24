@@ -374,7 +374,8 @@ program
 
     // -----------------------------------------------------------------------
     // Create and connect bridge
-    // Token goes in the URL query param (?token=...), NOT in the hello body
+    // The token goes in the Authorization header only, never in the URL
+    // (access logs keep URLs) nor in the hello body
     // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------

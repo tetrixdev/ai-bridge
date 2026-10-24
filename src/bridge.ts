@@ -126,9 +126,9 @@ export interface BridgeOptions {
    * `desired_bridge_version`, undefined when it carried none.
    */
   selfUpdate?: { enabled: boolean; onDesired: (version: unknown) => void };
-  /** WebSocket server URL (wss://...) — token is appended as ?token= */
+  /** WebSocket server URL (wss://...). The token never goes in it: see connect(). */
   serverUrl: string;
-  /** Authentication token (placed in URL query param, NOT in hello body) */
+  /** Authentication token, sent as an Authorization: Bearer header (never in the URL or hello) */
   token: string;
   /** Detected provider capabilities */
   providers: ProviderCapability[];
@@ -1091,10 +1091,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   /**
    * Initiate the WebSocket connection to the server.
    *
-   * The token is sent as an Authorization: Bearer header so it does NOT appear
-   * in server/proxy access logs.  It is also kept in the URL query parameter as
-   * a backward-compatible fallback for servers that have not yet adopted the
-   * header-based flow.
+   * The token is sent as an Authorization: Bearer header and nowhere else.
+   * Until 0.35.0 it also went in the URL as ?token=, and a URL is written to
+   * every access log on the way (a reverse proxy's in particular), so tokens
+   * ended up in plain text in logs. Every server half reads the header
+   * (Engram's /bridge only ever did; laravel-ai-bridge prefers it).
    *
    * NOTE: When passing --token on the command line the value is still visible
    * in process listings (ps aux).  Prefer the AI_BRIDGE_TOKEN environment
@@ -1115,18 +1116,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       void this.upstream.start();
     }
 
-    // Keep token in query param for backward compatibility, but also send it
-    // in the Authorization header as the primary (log-safe) channel.
-    const url = new URL(this.serverUrl);
-    url.searchParams.set('token', this.token);
-    const wsUrl = url.toString();
-
     log.info('Connecting to server', { url: this.serverUrl });
 
-    this.ws = new WebSocket(wsUrl, {
+    this.ws = new WebSocket(this.serverUrl, {
       headers: {
         'User-Agent': `ai-bridge/${BRIDGE_VERSION}`,
-        // Send token via Authorization header (not visible in proxy logs)
+        // The only place the token travels: never the URL, which access logs keep.
         'Authorization': `Bearer ${this.token}`,
       },
       // Limit incoming message size to 10MB to prevent memory exhaustion
@@ -1499,7 +1494,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   /**
    * Send hello message per PROTOCOL.md:
    * { type: "hello", version, bridge_version, providers[] }
-   * NO token field — token is in the URL query param.
+   * NO token field — the token is in the Authorization header.
    * NO id field on providers — just name.
    */
   private sendHello(): void {
