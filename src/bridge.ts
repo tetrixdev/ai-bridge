@@ -530,6 +530,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   constructor(options: BridgeOptions) {
     super();
     this.selfUpdate = options.selfUpdate;
+    // Refused rather than stripped (decision 0013): a token in --server would be
+    // logged here and sent in the URL, which every access log on the way keeps.
+    let carriesToken = false;
+    try { carriesToken = new URL(options.serverUrl).searchParams.has('token'); } catch { /* cli.ts validates the URL itself */ }
+    if (carriesToken) {
+      throw new Error('--server must not carry a token= query parameter: pass the token with --token or AI_BRIDGE_TOKEN, which sends it in the Authorization header instead of the address that access logs keep');
+    }
     this.serverUrl = options.serverUrl;
     this.token = options.token;
     this.providers = options.providers;

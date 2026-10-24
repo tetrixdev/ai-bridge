@@ -23,7 +23,9 @@ the URL.
 From 0.35.0 `Bridge.connect()` puts the token in the `Authorization` header
 only and connects to `--server` exactly as given. `tests/bridge/connect-auth.test.ts`
 holds both halves: the header is sent, and the URL the server sees carries no
-token.
+token. A `--server` that itself carries `token=` is refused at startup (the CLI
+and the `Bridge` constructor), not stripped: it would otherwise be logged and
+sent as given.
 
 ## Consequences
 - A server that reads only `?token=` refuses a 0.35.0 bridge. Neither server

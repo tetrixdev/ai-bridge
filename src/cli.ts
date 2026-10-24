@@ -315,6 +315,10 @@ program
         log.error('Server URL must not contain username or password components');
         process.exit(1);
       }
+      if (parsedUrl.searchParams.has('token')) {
+        log.error('Server URL must not carry a token= parameter: pass the token with --token or AI_BRIDGE_TOKEN (it travels in the Authorization header; a URL ends up in access logs)');
+        process.exit(1);
+      }
     } catch {
       log.error('Server URL is not a valid URL');
       process.exit(1);

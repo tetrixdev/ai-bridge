@@ -58,3 +58,29 @@ describe('connecting', () => {
     expect(req.url).toBe('/ws');
   });
 });
+
+describe('a server address that carries a token', () => {
+  it('is refused, rather than logged and sent where access logs keep it', () => {
+    expect(() => new Bridge({
+      serverUrl: 'wss://example.com/bridge?device=abc&token=eng_in-the-url',
+      token: 'eng_secret-token-value',
+      providers: [],
+      adapters: new Map<string, ProviderAdapter>(),
+      sessionStorePath: null,
+      allowedRoots: [],
+    })).toThrow(/--server.*token/);
+  });
+
+  it('says so without repeating the token', () => {
+    try {
+      new Bridge({
+        serverUrl: 'wss://example.com/ws?token=eng_in-the-url',
+        token: 't', providers: [], adapters: new Map<string, ProviderAdapter>(), sessionStorePath: null, allowedRoots: [],
+      });
+    } catch (err) {
+      expect(String(err)).not.toContain('eng_in-the-url');
+      return;
+    }
+    throw new Error('expected a refusal');
+  });
+});
