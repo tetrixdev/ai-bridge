@@ -25,7 +25,10 @@ export function supported(): Supported | null {
  *  node is usually somewhere only the former knows about. */
 function npxPath(): string {
   try {
-    return execFileSync('command', ['-v', 'npx'], { shell: true, encoding: 'utf8' }).trim()
+    // `command` is a shell builtin, so a shell runs it: as sh's own script,
+    // not as arguments handed to the `shell` option, which Node 24 warns about
+    // (DEP0190) on every install.
+    return execFileSync('sh', ['-c', 'command -v npx'], { encoding: 'utf8' }).trim()
       || 'npx';
   } catch {
     return 'npx';
