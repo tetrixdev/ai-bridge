@@ -13,7 +13,7 @@
 import { readUpstreamConfig } from './mcp/upstream.js';
 import { realpathSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { Bridge, FatalBridgeError } from './bridge.js';
@@ -29,6 +29,7 @@ import { loadOrCreateIdentity, saveIdentity, fingerprint, type Identity } from '
 import { buildAllowedRoots, type AllowedRoot } from './workspace/allowlist.js';
 import { resolveApiOrigin } from './attachments/origin.js';
 import { enrol, type EngramConfig } from './local/engram.js';
+import { loadClaudeToken } from './providers/claude-token.js';
 import { installBridge, listBridges, pathsFor, readEnvFile, uninstallBridge } from './service/index.js';
 import { SelfUpdater } from './selfupdate/updater.js';
 import { detect as detectService, pinVersion, prefetch } from './selfupdate/service.js';
@@ -145,6 +146,11 @@ program
     process.env['ENGRAM_URL'],
   )
   .option(
+    '--claude-env <file>',
+    'A file holding CLAUDE_CODE_OAUTH_TOKEN=<token> from `claude setup-token`, for a machine nobody signs into interactively (or set AI_BRIDGE_CLAUDE_ENV). Must be readable only by you (chmod 600). A token already in the environment wins.',
+    process.env['AI_BRIDGE_CLAUDE_ENV'] || undefined,
+  )
+  .option(
     '--engram-token <token>',
     'Bearer credential for Engram (or set ENGRAM_TOKEN). Defaults to --token.',
     process.env['ENGRAM_TOKEN'],
@@ -228,7 +234,7 @@ program
   )
   .action(async (opts: {
     token?: string; server?: string; debug: boolean; test: boolean; logFile?: string;
-    localTools: boolean; engram?: string; engramToken?: string;
+    localTools: boolean; engram?: string; engramToken?: string; claudeEnv?: string;
     deviceLabel?: string; deviceMode: string; identityFile: string; localDataDir: string;
     allowDir: string[]; api?: string; keepAttachments: boolean; allowNative: boolean;
     envFile?: string; installName?: string; selfUpdate: boolean; mcpUpstreams?: string;
@@ -243,6 +249,8 @@ program
       opts.server ??= fromFile.server;
       opts.token ??= fromFile.token;
       opts.installName ??= fromFile.name;
+      opts.engram ??= fromFile.engram;
+      opts.claudeEnv ??= fromFile.claudeEnv;
       if (fromFile.allowDir && (!opts.allowDir || opts.allowDir.length === 0)) {
         opts.allowDir = [fromFile.allowDir];
       }
@@ -268,6 +276,19 @@ program
 
     if (opts.test) {
       log.info('Running in TEST MODE — AI requests will receive mock responses');
+    }
+
+    // A long-lived Claude token, before anything spawns a CLI: every Claude
+    // turn inherits this process's environment. Said out loud either way,
+    // because a service that silently lost its token answers every question
+    // with "Not logged in" and nothing on the machine says why.
+    if (opts.claudeEnv) {
+      const outcome = loadClaudeToken(opts.claudeEnv);
+      if (outcome.status === 'loaded') log.info('Claude signs in with the long-lived token', { file: outcome.path });
+      else if (outcome.status === 'already_set') log.info('Claude signs in with CLAUDE_CODE_OAUTH_TOKEN from the environment; --claude-env not read');
+      else if (outcome.status === 'too_open') log.warn(`not using ${outcome.path}: others can read it (mode ${outcome.mode}). chmod 600 it and restart; until then Claude uses its own sign-in, if any`);
+      else if (outcome.status === 'no_token') log.warn(`${outcome.path} has no CLAUDE_CODE_OAUTH_TOKEN= line; Claude uses its own sign-in, if any`);
+      else log.warn(`could not read the Claude token file ${outcome.path}: ${outcome.reason}; Claude uses its own sign-in, if any`);
     }
 
     // Validate required options
@@ -626,6 +647,8 @@ const installCommand = program
   .option('--force', 'Replace an install of this name even if it is paired to a different server or machine', false)
   .option('--allow-native', 'Pass --allow-native to the service (see the main options)', false)
   .option('--local-tools', 'Pass --local-tools to the service (see the main options)', false)
+  .option('--engram <url>', 'Engram\'s address (https://...), recorded as ENGRAM_URL so the service enrols this machine for vault secrets. Needs --local-tools.')
+  .option('--claude-env <file>', 'A 0600 file holding CLAUDE_CODE_OAUTH_TOKEN=<token> (from `claude setup-token`) for the service to sign Claude in with. Kept on a reinstall that does not name it; pass "" to drop it.')
   .option('--no-self-update', 'Do not follow the version the server asks for; stay on the installed one until you change AI_BRIDGE_VERSION by hand');
 // The same attachment settings as a direct run, recorded in the service's env
 // file. Left out, a reinstall keeps whatever the install it replaces had.
@@ -635,10 +658,12 @@ for (const option of ATTACHMENT_OPTIONS) {
 installCommand
   .action((opts: {
     server: string; token: string; allowDir?: string; name?: string; force: boolean;
-    allowNative: boolean; localTools: boolean; selfUpdate: boolean;
+    allowNative: boolean; localTools: boolean; selfUpdate: boolean; engram?: string; claudeEnv?: string;
   } & AttachmentOptionValues) => {
     try {
       validateAttachmentOptions(opts);
+      const engram = opts.engram === undefined ? undefined : checkEngramUrl(opts.engram, opts.localTools, opts.server);
+      const claudeEnv = opts.claudeEnv === undefined || opts.claudeEnv === '' ? opts.claudeEnv : checkClaudeEnv(opts.claudeEnv);
       const settings: Record<string, string> = {};
       for (const option of ATTACHMENT_OPTIONS) {
         const value = opts[option.key];
@@ -646,7 +671,7 @@ installCommand
       }
       const { name, replaced } = installBridge({
         server: opts.server, token: opts.token, allowDir: opts.allowDir,
-        name: opts.name, force: opts.force, settings,
+        name: opts.name, force: opts.force, settings, engram, claudeEnv,
         flags: [
           ...(opts.allowNative ? ['--allow-native'] : []),
           ...(opts.localTools ? ['--local-tools'] : []),
@@ -663,6 +688,12 @@ installCommand
         console.log(`  logs:    journalctl --user -u ${paths.label} -f`);
         console.log(`  stop:    ai-bridge uninstall ${name}`);
       }
+      if (engram) {
+        console.log(`\nVault: this machine enrols with ${engram} when the service starts.`);
+        console.log(`  Its log shows five groups of letters. In Engram, open Vault, find this machine,`);
+        console.log(`  check the groups match, and give it the keys of the spaces it should use.`);
+      }
+      if (claudeEnv) console.log(`\nClaude signs in with the long-lived token in ${claudeEnv}.`);
       // A user service stops when you log out, which on a machine reached over
       // SSH means it stops the moment you disconnect.
       if (process.platform === 'linux') {
@@ -674,6 +705,34 @@ installCommand
       process.exit(1);
     }
   });
+
+/** An Engram address an install may record: http(s), nothing else. */
+function checkEngramUrl(raw: string, localTools: boolean, server: string): string {
+  if (!localTools) throw new Error('--engram needs --local-tools: without it the service never opens the vault, so the address would do nothing.');
+  let url: URL;
+  try { url = new URL(raw); } catch { throw new Error(`--engram must be Engram's address, such as https://engram.example.com, not "${raw}"`); }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error(`--engram must start with https://, not ${url.protocol}`);
+  // The bridge token is the Engram credential too, so plain http is accepted
+  // only where the server connection is plain already (a local test server),
+  // never as a downgrade from wss://.
+  if (url.protocol === 'http:' && !server.startsWith('ws://')) {
+    throw new Error(`--engram must be https:// when the server is ${server.split(':')[0]}://; http:// is only for a test server reached over ws://`);
+  }
+  return url.origin;
+}
+
+/** A Claude token file an install may point the service at: absolute, there,
+ *  holding a token, and readable by its owner only. Refused here rather than
+ *  found out by a service that answers "Not logged in". */
+function checkClaudeEnv(raw: string): string {
+  const path = resolve(raw);
+  const probe: NodeJS.ProcessEnv = {};
+  const outcome = loadClaudeToken(path, probe);
+  if (outcome.status === 'too_open') throw new Error(`${path} can be read by others (mode ${outcome.mode}). Run: chmod 600 ${path}`);
+  if (outcome.status === 'unreadable') throw new Error(`cannot read ${path}: ${outcome.reason}`);
+  if (outcome.status === 'no_token') throw new Error(`${path} has no CLAUDE_CODE_OAUTH_TOKEN=<token> line`);
+  return path;
+}
 
 program
   .command('uninstall')

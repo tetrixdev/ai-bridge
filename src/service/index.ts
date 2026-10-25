@@ -26,12 +26,15 @@ export { deviceOf, readConfig } from './config.js';
  *  perfectly ordinary run look broken. */
 export function readEnvFile(path: string): {
   server?: string; token?: string; allowDir?: string; name?: string; settings?: Record<string, string>;
+  engram?: string; claudeEnv?: string;
 } {
   const config = readConfig(path);
   if (!config) return {};
   return {
     server: config.server, token: config.token, allowDir: config.allowDir,
     name: config.name, settings: config.settings ?? {},
+    ...(config.engram ? { engram: config.engram } : {}),
+    ...(config.claudeEnv ? { claudeEnv: config.claudeEnv } : {}),
   };
 }
 
@@ -74,6 +77,12 @@ export function configForInstall(req: InstallRequest, name: string, existing: Br
     allowDir: req.allowDir,
     name,
     settings: { ...existing?.settings, ...req.settings },
+    // Engram's address goes with --local-tools, which is given again on every
+    // install or taken away; so is this. The Claude token file is carried
+    // over: a reinstall to change a folder must not sign the service out.
+    // An empty string given on purpose removes it.
+    engram: req.engram || undefined,
+    claudeEnv: (req.claudeEnv ?? existing?.claudeEnv) || undefined,
     // The version doing the install is the version installed. From here on
     // the server's desired version moves it (src/selfupdate/), or a person
     // edits this one line.

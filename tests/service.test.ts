@@ -152,6 +152,41 @@ describe('settings an install carries', () => {
   });
 });
 
+describe('vault and Claude token, recorded for the service', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'bridge-test-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  test('Engram\'s address and the token file round trip as ENGRAM_URL and AI_BRIDGE_CLAUDE_ENV', () => {
+    // systemd's EnvironmentFile hands both to the bridge; --env-file reads
+    // them on macOS. The token itself is never written here, only its file.
+    const path = join(dir, 'v.env');
+    writeConfig(path, { server: 'wss://h/bridge', token: 't', engram: 'https://h', claudeEnv: '/home/me/.config/ai-bridge/claude.env' });
+    const text = readFileSync(path, 'utf8');
+    expect(text).toContain('ENGRAM_URL=https://h\n');
+    expect(text).toContain('AI_BRIDGE_CLAUDE_ENV=/home/me/.config/ai-bridge/claude.env\n');
+    expect(text).not.toContain('CLAUDE_CODE_OAUTH_TOKEN');
+    expect(readConfig(path)).toMatchObject({ engram: 'https://h', claudeEnv: '/home/me/.config/ai-bridge/claude.env' });
+  });
+
+  test('a reinstall keeps the token file it is not given again, and drops Engram with --local-tools', () => {
+    const existing = { server: 'wss://h/bridge', token: 'old', engram: 'https://h', claudeEnv: '/c.env' };
+    const next = configForInstall({ server: 'wss://h/bridge', token: 'new' }, 'h', existing);
+    // Changing a folder must not sign the service out of Claude...
+    expect(next.claudeEnv).toBe('/c.env');
+    // ...while Engram's address belongs to --local-tools, given again or gone.
+    expect(next.engram).toBeUndefined();
+    expect(configForInstall({ server: 'wss://h/bridge', token: 'new', claudeEnv: '' }, 'h', existing).claudeEnv).toBeUndefined();
+  });
+
+  test('a value with a line break is refused, so it cannot write a second key', () => {
+    expect(() => writeConfig(join(dir, 'x.env'), { server: 'wss://h/bridge', token: 't', engram: 'https://h\nAI_BRIDGE_TOKEN=evil' }))
+      .toThrow(/line break/);
+    expect(() => writeConfig(join(dir, 'y.env'), { server: 'wss://h/bridge', token: 't', settings: { AI_BRIDGE_ATTACHMENT_MAX_MB: '5\nAI_BRIDGE_TOKEN=evil' } }))
+      .toThrow(/line break/);
+  });
+});
+
 describe('a pinned service', () => {
   test('the systemd unit starts the version in the env file, with the flags asked for, and restarts', async () => {
     const { systemdUnit } = await import('../src/service/platform.js');

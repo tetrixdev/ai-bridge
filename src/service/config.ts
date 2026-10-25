@@ -36,11 +36,26 @@ export interface BridgeConfig {
    * one thing to change to move it, and what self-update rewrites.
    */
   version?: string | undefined;
+  /**
+   * Engram's base address, as ENGRAM_URL: where a bridge started with
+   * `--local-tools` enrols this machine's vault key and fetches space keys.
+   * In the file rather than on the command line so the unit never carries a
+   * value somebody typed (the flags there are a fixed short list).
+   */
+  engram?: string | undefined;
+  /**
+   * A file holding CLAUDE_CODE_OAUTH_TOKEN (a long-lived token from
+   * `claude setup-token`), as AI_BRIDGE_CLAUDE_ENV. A path, never the token:
+   * the token stays in one 0600 file of its own, so renewing it is one edit
+   * and a restart, and this file never holds a second copy.
+   */
+  claudeEnv?: string | undefined;
 }
 
 /** Keys this module writes. Anything else in the file belongs to somebody else. */
 const OWN_KEYS = new Set([
   'AI_BRIDGE_SERVER', 'AI_BRIDGE_TOKEN', 'AI_BRIDGE_ALLOW_DIR', 'AI_BRIDGE_NAME', 'AI_BRIDGE_VERSION',
+  'ENGRAM_URL', 'AI_BRIDGE_CLAUDE_ENV',
   ...ATTACHMENT_ENV_KEYS,
 ]);
 
@@ -79,11 +94,21 @@ export function readConfig(path: string): BridgeConfig | null {
     allowDir: out['AI_BRIDGE_ALLOW_DIR'] || undefined,
     name: out['AI_BRIDGE_NAME'] || undefined,
     version: out['AI_BRIDGE_VERSION'] || undefined,
+    ...(out['ENGRAM_URL'] ? { engram: out['ENGRAM_URL'] } : {}),
+    ...(out['AI_BRIDGE_CLAUDE_ENV'] ? { claudeEnv: out['AI_BRIDGE_CLAUDE_ENV'] } : {}),
     ...(Object.keys(settings).length > 0 ? { settings } : {}),
   };
 }
 
 export function writeConfig(path: string, config: BridgeConfig): void {
+  // One value per line is the file's whole grammar, so a line break inside a
+  // value would write a second key of the caller's choosing.
+  for (const [key, value] of Object.entries(config)) {
+    if (typeof value === 'string' && /[\r\n]/.test(value)) throw new Error(`${key} must not contain a line break`);
+  }
+  for (const [key, value] of Object.entries(config.settings ?? {})) {
+    if (/[\r\n]/.test(value)) throw new Error(`${key} must not contain a line break`);
+  }
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   // Lines this module does not own are carried over as they were. A setup
   // script that added a variable of its own to this file would otherwise lose
@@ -103,6 +128,8 @@ export function writeConfig(path: string, config: BridgeConfig): void {
     ...(config.allowDir ? [`AI_BRIDGE_ALLOW_DIR=${config.allowDir}`] : []),
     ...(config.name ? [`AI_BRIDGE_NAME=${config.name}`] : []),
     ...(config.version ? [`AI_BRIDGE_VERSION=${config.version}`] : []),
+    ...(config.engram ? [`ENGRAM_URL=${config.engram}`] : []),
+    ...(config.claudeEnv ? [`AI_BRIDGE_CLAUDE_ENV=${config.claudeEnv}`] : []),
     ...settings,
     ...foreign,
     '',

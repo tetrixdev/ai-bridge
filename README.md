@@ -122,7 +122,20 @@ from an env file, so those bridges report `self_update: false` and are updated
 by reinstalling with the version you want (`npx @tetrixdev/ai-bridge@<v> install …`).
 
 `install` also takes `--allow-native` and `--local-tools`, written into the
-unit, for a host that needs them.
+unit, for a host that needs them. With `--local-tools`, `--engram <url>` records
+Engram's address (as `ENGRAM_URL` in the credentials file), so the service
+enrols this machine for the vault on its first start.
+
+**A server nobody signs into in a browser.** Give the service a long-lived
+Claude token instead of an interactive login, which can run out unattended:
+run `claude setup-token`, put `CLAUDE_CODE_OAUTH_TOKEN=<token>` in a file only
+you can read (`chmod 600`), and install with `--claude-env <that file>`. The
+credentials file records the file's path, never the token; the bridge puts the
+token into Claude's environment at start, refuses a file others can read, and
+logs which sign-in it used. A token already in the environment wins. A
+reinstall that does not name the file keeps it; `--claude-env ""` drops it. To
+renew, replace the line in the file and restart the service. The token reaches
+the Claude CLI the bridge starts, like any login it has.
 
 `--env-file` is available on its own, too, for anyone running the bridge some
 other way. A flag or an environment variable still wins over the file, so a
@@ -146,6 +159,7 @@ are left where they are.
 | `--log-file <path>` | `AI_BRIDGE_LOG_FILE` | Also append logs to this file. Rotates once past 5 MB, keeping one previous copy (`<path>.1`) |
 | `--local-tools` | | Allow the server to run tools **on this machine, as you**. Off unless you pass it |
 | `--engram <url>` | `ENGRAM_URL` | Engram base URL, for resolving secrets into local tools |
+| `--claude-env <file>` | `AI_BRIDGE_CLAUDE_ENV` | A 0600 file holding `CLAUDE_CODE_OAUTH_TOKEN=<token>` (from `claude setup-token`) for Claude to sign in with. A token already in the environment wins |
 | `--engram-token <token>` | `ENGRAM_TOKEN` | Bearer credential for Engram. Defaults to `--token` |
 | `--device-label <label>` | hostname | How this machine appears when you approve it. Ignored when the token is for a machine paired for chat: the key goes onto that machine, under its paired name |
 | `--device-mode <mode>` | | `transcript` or `isolated`. Self-reported |
