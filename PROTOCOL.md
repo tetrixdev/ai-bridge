@@ -934,7 +934,7 @@ When the server needs an AI response (triggered by a user message in the browser
 
 **`message`**: The new user message to send.
 
-**`system_prompt`**: The system prompt. May be `null`.
+**`system_prompt`**: The system prompt. May be `null`. Applies to this turn, resumes included: send it on every turn. Since 0.36.0 the bridge passes it to Claude (with its addendum) as a file, so its size is not bounded by the 128 KiB per-argument limit, and with `--system-prompt-snapshot off`, so a resumed turn uses the prompt sent with it rather than the session's first one (Claude Code 2.1.257+ otherwise reuses the first until compaction). Decision 0014.
 
 **`subagent_prompt`** *(optional)*: Text appended to the system prompt of every subagent the assistant starts this turn. See [Additive field: `subagent_prompt`](#additive-field-subagent_prompt--text-for-every-subagent).
 

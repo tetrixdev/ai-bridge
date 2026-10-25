@@ -6,7 +6,8 @@
  * CLI invocation:
  *   New session:    claude -p --output-format stream-json --verbose "user message"
  *   Resume session: claude -p --resume <UUID> --output-format stream-json --verbose "user message"
- *   System prompt:  Passed via --system-prompt flag on first message
+ *   System prompt:  Passed as a file (--system-prompt-file) on every turn, with
+ *                   --system-prompt-snapshot off so a resume uses it
  *
  * Output format (NDJSON):
  *   {"type":"system","subtype":"init","session_id":"...","model":"..."}
@@ -67,7 +68,8 @@ import { createLogger, isDebugEnabled } from '../utils/logger.js';
 import { stopTurn, stoppedByUs } from './stop.js';
 import { userMessageFrame } from './turn-input.js';
 import { createTaskOutputWatch, outputPathFrom } from './task-output-watch.js';
-import { prepareClaudeSubagentPrompt, type SubagentPromptFileHandle } from './subagent-prompt.js';
+import { prepareClaudeSubagentPrompt } from './subagent-prompt.js';
+import { prepareClaudeSystemPrompt } from './claude-system-prompt.js';
 import { resolveClaudeEffort } from './claude-effort.js';
 
 /**
@@ -189,30 +191,34 @@ export class ClaudeAdapter extends ProviderAdapter {
     // CLAUDE.md out — only user-level ~/.claude/CLAUDE.md still applies.
     // Tracked in tasks/open/cli-isolation-layer-b.md.
 
-    // Add the system prompt on EVERY invocation, including resumes. Claude's
-    // `--system-prompt` is per-invocation and is NOT retained across `--resume`
-    // (Anthropic CLI docs) — a resumed turn that omits it runs with no system
-    // prompt, so the model loses its instructions after the first turn. We
-    // therefore re-send it each turn (matching the working pocket-dev pattern).
-    // resolveSystemPrompt() returns the server-supplied prompt, or null when
-    // there is none, and then Claude keeps its own default prompt.
-    const systemPrompt = resolveSystemPrompt(request.system_prompt, context.cliIsolation);
-    if (systemPrompt !== null) {
-      args.push('--system-prompt', systemPrompt);
-    }
-
-    // The bridge's lifecycle addendum rides BESIDE the server's prompt, never
-    // instead of it. Putting the server's prompt on `--append-system-prompt`
-    // too would look equivalent and is not: it would keep the CLI's built-in
-    // coding-agent persona in front of a prompt the server meant to replace it.
-    // With no server prompt, the addendum is appended to the CLI's own default.
+    // The system prompt goes on EVERY invocation, resumes included, and the
+    // CLI is told to use it: `--system-prompt-snapshot off` (2.1.257+), because
+    // by default a resumed session resends the prompt of its FIRST request and
+    // ignores what this launch passes, until compaction. With it off, each
+    // request is rendered from this launch's flags, so a server that rebuilds
+    // its prompt per turn is heard on every turn. resolveSystemPrompt() returns
+    // the server-supplied prompt, or null when there is none, and then Claude
+    // keeps its own default prompt.
     //
-    // Both flags in one invocation is verified to work — the model obeys both.
-    // Re-sent every turn for the same reason as --system-prompt above: neither
-    // is retained across --resume.
-    if (context.bridgeAddendum !== null) {
-      args.push('--append-system-prompt', context.bridgeAddendum);
-    }
+    // The bridge's lifecycle addendum rides BESIDE the server's prompt, never
+    // instead of it. Putting the server's prompt on the append flag too would
+    // look equivalent and is not: it would keep the CLI's built-in coding-agent
+    // persona in front of a prompt the server meant to replace it. With no
+    // server prompt, the addendum is appended to the CLI's own default. Both
+    // in one invocation is verified to work — the model obeys both.
+    //
+    // Both go as 0600 files (`--system-prompt-file`, `--append-system-prompt-
+    // file`), not argv: Linux refuses one argv string over 128 KiB, and a large
+    // prompt then died at spawn with E2BIG. An older or unknown CLI version
+    // falls back to the argv flags. See claude-system-prompt.ts, decision 0014.
+    const promptFiles: Array<{ release(): void }> = [];
+    const releasePromptFiles = (): void => {
+      for (const f of promptFiles) f.release();
+    };
+    const systemPrompt = resolveSystemPrompt(request.system_prompt, context.cliIsolation);
+    const systemPromptArgs = prepareClaudeSystemPrompt(systemPrompt, context.bridgeAddendum, log);
+    if (systemPromptArgs.files !== null) promptFiles.push(systemPromptArgs.files);
+    args.push(...systemPromptArgs.args);
 
     // Messages as NDJSON on stdin, and each one echoed back on stdout at the
     // moment the CLI takes it in. The echo is what `user_input` is made from:
@@ -314,14 +320,12 @@ export class ClaudeAdapter extends ProviderAdapter {
 
     // Server text appended to every subagent's system prompt (nested ones
     // too; forks reuse the main prompt and do not get it). Written to a 0600
-    // file because the flag takes a path, and re-sent every turn like
-    // --system-prompt: it is per-invocation and not retained across --resume.
-    // Gated on the detected CLI version (an unknown flag is fatal); removed
-    // when the process closes.
-    let subagentPromptFile: SubagentPromptFileHandle | null = null;
+    // file because the flag takes a path, and sent every turn: it is
+    // per-invocation. Gated on the detected CLI version (an unknown flag is
+    // fatal); removed when the process closes.
     const subagentPrompt = prepareClaudeSubagentPrompt(request.subagent_prompt, log);
     if (subagentPrompt !== null) {
-      subagentPromptFile = subagentPrompt.file;
+      promptFiles.push(subagentPrompt.file);
       args.push(...subagentPrompt.args);
       log.debug('Passing subagent prompt to claude', { requestId });
     }
@@ -494,7 +498,7 @@ export class ClaudeAdapter extends ProviderAdapter {
           ? this.spawnCli('claude', args, env, userMessageFrame(userMessage), context.workingDir, { keepStdinOpen: true })
           : this.spawnCli('claude', args, env, userMessage, context.workingDir);
       } catch (err) {
-        subagentPromptFile?.release();
+        releasePromptFiles();
         throw err;
       }
 
@@ -1413,7 +1417,7 @@ export class ClaudeAdapter extends ProviderAdapter {
 
       child.on('error', (err: NodeJS.ErrnoException) => {
         log.error('Failed to spawn claude', { error: err.message });
-        subagentPromptFile?.release();
+        releasePromptFiles();
         // Provide user-friendly message for ENOENT
         const errorMessage = err.code === 'ENOENT'
           ? 'claude CLI not found. Install it or ensure it is on your PATH.'
@@ -1453,7 +1457,7 @@ export class ClaudeAdapter extends ProviderAdapter {
           });
         }
         clearRequestTimeout(timeoutTimer);
-        subagentPromptFile?.release();
+        releasePromptFiles();
         // The CLI is gone, whether or not we closed its input: nothing more
         // can reach it.
         port?.end();

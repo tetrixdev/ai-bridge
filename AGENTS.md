@@ -95,6 +95,8 @@ Node 22 or newer (CI runs 22 and 24).
 - 0010 Upstream OAuth: the web app relays the code; tokens and the PKCE verifier stay on the bridge.
 - 0011 An app backend runs only the files of the version the person approved.
 - 0012 A request may narrow its own turn to `isolated`, never widen it.
+- 0013 The connection token travels only in the Authorization header.
+- 0014 Claude gets the system prompt by file, rendered fresh on every turn.
 
 Full records and status: [docs/decisions/README.md](docs/decisions/README.md).
 Before changing what one covers, read it; if your change contradicts an
