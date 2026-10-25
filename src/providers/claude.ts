@@ -319,11 +319,13 @@ export class ClaudeAdapter extends ProviderAdapter {
     }
 
     // Server text appended to every subagent's system prompt (nested ones
-    // too; forks reuse the main prompt and do not get it). Written to a 0600
+    // too; forks reuse the main prompt and do not get it), followed by the
+    // bridge's helper section: a subagent never sees the main prompt, so this
+    // is the only way the session's facts reach it (decision 0015). Written to a 0600
     // file because the flag takes a path, and sent every turn: it is
     // per-invocation. Gated on the detected CLI version (an unknown flag is
     // fatal); removed when the process closes.
-    const subagentPrompt = prepareClaudeSubagentPrompt(request.subagent_prompt, log);
+    const subagentPrompt = prepareClaudeSubagentPrompt(request.subagent_prompt, log, undefined, context.bridgeHelperAddendum ?? null);
     if (subagentPrompt !== null) {
       promptFiles.push(subagentPrompt.file);
       args.push(...subagentPrompt.args);

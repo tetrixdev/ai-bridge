@@ -1089,7 +1089,7 @@ A key the bridge does not allow is **dropped and named in the ack**, not refused
 |---|---|
 | `default` | Bridge addendum only. The default for every project that says nothing. |
 | `off` | No addendum at all. The project owns the whole prompt and takes on explaining the lifecycle itself. |
-| `append` | Bridge addendum, then the project's text. The expected way to add project-specific rules. |
+| `append` | Bridge addendum, then the project's text. The expected way to add project-specific rules. Claude subagents get the bridge's helper section followed by the same text (see `subagent_prompt`). |
 | `replace` | The project's text instead of the bridge addendum. |
 
 Validation is strict, and a contradictory spec is refused with `bridge_prompt_invalid` rather than guessed at — a chat whose instructions are not what either side believes is worse than a refused turn:
@@ -1114,10 +1114,11 @@ A string the bridge appends to the system prompt of every subagent (helper) the 
 "subagent_prompt": "Answer in Dutch. Never quote vault values back."
 ```
 
-- **Claude**: written to a `0600` file in a per-turn temp directory and passed as `--append-subagent-system-prompt-file <file>`; the file is removed when the CLI exits. Claude Code appends it to every subagent's system prompt, **nested subagents included**. **Forks do not get it**: a fork reuses the main assistant's system prompt, so whatever a fork must know belongs in `system_prompt`. Like `system_prompt`, it is per-invocation and **not retained across `--resume`** — send it on every turn that should have it.
+- **Claude**: written to a `0600` file in a per-turn temp directory and passed as `--append-subagent-system-prompt-file <file>`; the file is removed when the CLI exits. Claude Code appends it to every subagent's system prompt, **nested subagents included**. **Forks do not get it**: a fork reuses the main assistant's system prompt, so whatever a fork must know belongs in `system_prompt`. It is per-invocation — send it on every turn that should have it.
 - **Needs Claude Code 2.1.261+.** An older CLI exits on the unknown flag, so the bridge checks the version it detected at startup (`claude --version`) and, on an older or unknown version, **skips the flag with a warning** and runs the turn without it. Verified on 2.1.283 (a `general-purpose` subagent obeyed the appended text; the main assistant did not see it).
+- **The bridge's helper section follows it in the same file** (since 0.36.0): "How this session runs" worded for a subagent (it reports to the assistant that started it; finish or stop what it started in the background; no detaching; command timeouts; parallel calls), then the `bridge_prompt` text in `append` mode. A subagent never sees the main system prompt, so without it these reached the main assistant only. Under `bridge_prompt` `off` and `replace` there is no helper section (a server that replaces the bridge's words gives its helpers their version in `subagent_prompt`). The bridge writes the file for its section even when the server sends no `subagent_prompt`. Decision 0015.
 - **Codex / Gemini**: ignored (debug log). Neither CLI has subagents to give it to.
-- **Absent, `null`, empty or whitespace-only**: no flag, today's behaviour. A non-string is ignored with a warning, never the turn.
+- **Absent, `null`, empty or whitespace-only**: no server text; the file then holds only the bridge's helper section, if any. A non-string is ignored with a warning, never the turn.
 - **Isolation is unchanged.** It is prompt text only; it grants nothing. Subagents run under the turn's permission posture as before.
 
 #### Additive field: `cli_isolation` — one turn held to the server's tools

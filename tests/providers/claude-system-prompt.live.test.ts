@@ -26,7 +26,7 @@ import { ClaudeAdapter } from '../../src/providers/claude.js';
 import { noteDetectedClaudeVersion } from '../../src/providers/subagent-prompt.js';
 import type { AdapterStreamEvent, ExecutionContext } from '../../src/providers/base.js';
 import type { AiRequestMessage } from '../../src/protocol/types.js';
-import { startFakeAnthropic, type FakeAnthropic } from './support/fake-anthropic.js';
+import { HELPER_TASK, SPAWN_HELPER, startFakeAnthropic, type FakeAnthropic } from './support/fake-anthropic.js';
 
 function claudeVersion(): string | null {
   if (process.env['AI_BRIDGE_SKIP_CLAUDE_LIVE']) return null;
@@ -71,7 +71,10 @@ describe.skipIf(version === null)(`real claude ${version ?? ''} against a fake A
     rmSync(configDir, { recursive: true, force: true });
   });
 
-  async function turn(systemPrompt: string, message: string, cliSessionId: string | null): Promise<{ sessionId: string | null; errors: string[] }> {
+  async function turn(
+    systemPrompt: string, message: string, cliSessionId: string | null,
+    extra: { subagentPrompt?: string; helperAddendum?: string; isolation?: ExecutionContext['cliIsolation'] } = {},
+  ): Promise<{ sessionId: string | null; errors: string[] }> {
     const request = {
       type: 'ai_request',
       request_id: `req_${message}`,
@@ -81,13 +84,14 @@ describe.skipIf(version === null)(`real claude ${version ?? ''} against a fake A
       system_prompt: systemPrompt,
       options: {},
       cli_session_id: cliSessionId,
+      ...(extra.subagentPrompt !== undefined ? { subagent_prompt: extra.subagentPrompt } : {}),
     } as AiRequestMessage;
     const context: ExecutionContext = {
       request,
       requestId: request.request_id,
       tools: [],
       mcp: null,
-      cliIsolation: 'isolated',
+      cliIsolation: extra.isolation ?? 'isolated',
       workingDir,
       signal: new AbortController().signal,
       requestTimeoutSeconds: 90,
@@ -96,6 +100,7 @@ describe.skipIf(version === null)(`real claude ${version ?? ''} against a fake A
       attachmentDir: null,
       bridgeEnv: {},
       bridgeAddendum: 'BRIDGE-ADDENDUM-MARKER',
+      bridgeHelperAddendum: extra.helperAddendum ?? null,
     };
     const errors: string[] = [];
     let sessionId: string | null = null;
@@ -143,5 +148,22 @@ describe.skipIf(version === null)(`real claude ${version ?? ''} against a fake A
     const sent = requestsFor('big-message-xyz');
     expect(sent.length).toBeGreaterThan(0);
     expect(sent[0]!.system).toContain(big);
+  }, 180_000);
+
+  it('gives a real subagent the server subagent_prompt AND the bridge helper section', async () => {
+    const result = await turn('MAIN-PROMPT-MARKER', `${SPAWN_HELPER} helper-turn-xyz`, null, {
+      subagentPrompt: 'SERVER-SUBAGENT-MARKER',
+      helperAddendum: 'BRIDGE-HELPER-SECTION-MARKER',
+      isolation: 'native',
+    });
+    expect(result.errors).toEqual([]);
+    const helper = api.requests.filter((r) => r.userText.includes(HELPER_TASK) && !r.userText.includes(SPAWN_HELPER));
+    expect(helper.length).toBeGreaterThan(0);
+    expect(helper[0]!.system).toContain('SERVER-SUBAGENT-MARKER');
+    expect(helper[0]!.system).toContain('BRIDGE-HELPER-SECTION-MARKER');
+    // The server text comes first, the bridge's section after it.
+    expect(helper[0]!.system.indexOf('SERVER-SUBAGENT-MARKER')).toBeLessThan(helper[0]!.system.indexOf('BRIDGE-HELPER-SECTION-MARKER'));
+    // A subagent has its own prompt: the main one is not in it.
+    expect(helper[0]!.system).not.toContain('MAIN-PROMPT-MARKER');
   }, 180_000);
 });

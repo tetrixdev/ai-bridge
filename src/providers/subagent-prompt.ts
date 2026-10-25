@@ -105,22 +105,34 @@ export function writeSubagentPromptFile(text: string): SubagentPromptFileHandle 
 /**
  * For Claude: write the file and return the args to add, or skip.
  *
- * Returns null (and no file) when there is no prompt, or when the detected
- * CLI is older than SUBAGENT_PROMPT_MIN_VERSION or of unknown version — in
- * that case with a warning naming the version, because the server asked for
- * something this turn will not do.
+ * The file holds the server's `subagent_prompt` and then the bridge's helper
+ * section (`helperAddendum`, see buildHelperAddendum in env.ts), either of
+ * which may be absent; with neither there is no file. The helper section is
+ * the bridge's own, so a turn writes the file even when the server sent no
+ * subagent_prompt.
+ *
+ * Returns null (and no file) when there is nothing to pass, or when the
+ * detected CLI is older than SUBAGENT_PROMPT_MIN_VERSION or of unknown
+ * version: then with a warning naming the version when the server asked for
+ * a subagent_prompt (it asked for something this turn will not do), at debug
+ * level when only the bridge's section is dropped.
  */
 export function prepareClaudeSubagentPrompt(
   raw: unknown,
   log: Logger,
   version: string | null = detectedClaudeVersion,
+  helperAddendum: string | null = null,
 ): { args: string[]; file: SubagentPromptFileHandle } | null {
-  const text = resolveSubagentPrompt(raw, log);
-  if (text === null) return null;
+  const serverText = resolveSubagentPrompt(raw, log);
+  const addendum = helperAddendum !== null && helperAddendum.trim().length > 0 ? helperAddendum : null;
+  if (serverText === null && addendum === null) return null;
   if (!isVersionAtLeast(version, SUBAGENT_PROMPT_MIN_VERSION)) {
-    log.warn(`Skipping subagent_prompt: claude ${version ?? '(unknown version)'} has no ${SUBAGENT_PROMPT_FLAG} (needs ${SUBAGENT_PROMPT_MIN_VERSION}+)`);
+    const message = `Skipping subagent_prompt: claude ${version ?? '(unknown version)'} has no ${SUBAGENT_PROMPT_FLAG} (needs ${SUBAGENT_PROMPT_MIN_VERSION}+)`;
+    if (serverText !== null) log.warn(message);
+    else log.debug(message);
     return null;
   }
+  const text = serverText !== null && addendum !== null ? `${serverText}\n\n${addendum}` : (serverText ?? addendum)!;
   const file = writeSubagentPromptFile(text);
   return { args: [SUBAGENT_PROMPT_FLAG, file.path], file };
 }

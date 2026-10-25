@@ -501,6 +501,67 @@ function buildInputTurnAddendum(values: Record<string, string | null>): string {
 }
 
 /**
+ * The bridge's section for a SUBAGENT (helper) of this turn.
+ *
+ * A Claude Code subagent gets its own system prompt and never sees the main
+ * one, so without this the facts above (non-interactive, bounded commands, no
+ * detaching, parallel calls) and the server's `bridge_prompt` text reached
+ * the main assistant only. Measured in Engram: helpers gave a description on
+ * 32% of their shell commands against 99.9% in the main chat, the line asking
+ * for it being in the main prompt alone. Decision 0015.
+ *
+ * Worded for a helper rather than copied: it reports to the assistant that
+ * started it, not to the person, and receives no messages while it runs. The
+ * same in both turn modes, since a helper's own life is the same in both;
+ * only whether background commands exist follows the environment.
+ */
+export function buildHelperAddendum(values: Record<string, string | null>): string {
+  const lines: string[] = [
+    "## How this session runs",
+    "",
+    "You are a non-interactive subagent, started by the assistant of this turn,",
+    "inside its CLI process. What you return goes to that assistant, not to the",
+    "person. When the turn ends the process exits, and nothing you started",
+    "survives it.",
+    "",
+  ];
+
+  if (backgroundTasksEnabled(values)) {
+    lines.push(
+      "- **Finish what you start in the background before you return.** Wait for",
+      "  every background command or subagent you started to end, or stop it, and",
+      "  read its result yourself. Never return a result one has not reported yet.",
+    );
+  } else {
+    lines.push(
+      "- **Background shell commands are disabled here.** Run commands in the",
+      "  foreground.",
+    );
+  }
+
+  lines.push(
+    "- **Do not detach work from the turn with `&`, `nohup`, `disown` or",
+    "  `setsid`.** A detached process is re-parented to init, nothing reaps it, and",
+    "  nobody is told it exists.",
+    "- **Anything that must outlive the turn has to run as a service managed",
+    "  outside this session.** How to do that is specific to this machine: follow",
+    "  its own instructions, and report back rather than improvise one.",
+    "- **Every command is bounded by its timeout** (when you set none, the tool's",
+    "  own: 2 minutes, 10 at most). A command that sits waiting for input burns",
+    "  that whole budget and then fails, so use the non-interactive form of every",
+    "  tool: `-y`, `--force`, `--no-input`.",
+    "",
+    "## Parallel tool calls",
+    "",
+    "Issuing independent calls together is your main throughput lever. Before",
+    "sending a single tool call, ask whether the next two or three depend on its",
+    "result. If they do not, send them in the same block.",
+  );
+
+  return lines.join('\n');
+}
+
+/**
  * Check a server's `bridge_prompt` before anything acts on it.
  *
  * Rejected at the protocol boundary rather than guessed at: a server sending a
@@ -546,6 +607,11 @@ export function validateBridgePrompt(spec?: BridgePromptSpec | null): string | n
 export interface ResolvedBridgePrompt {
   /** Text to append to the system prompt, or null to append nothing. */
   text: string | null;
+  /**
+   * Text to append to every subagent's prompt, or null: the helper section
+   * (buildHelperAddendum) under the same mode, the server's text included.
+   */
+  helperText: string | null;
   /** The mode actually applied. */
   mode: BridgePromptMode;
   /** Whether the server supplied text of its own. */
@@ -570,15 +636,21 @@ export function resolveBridgeAddendum(
   const serverText = serverTextRaw !== null && serverTextRaw !== '';
   const addendum = buildBridgeAddendum(values, turn);
 
+  const helper = buildHelperAddendum(values);
+
+  // `append` text is an addition about how the session runs, and a helper runs
+  // commands in it too, so it rides after the helper section. `replace` text
+  // was written for the main assistant in place of the bridge's words; a
+  // server taking those over words its helpers' version in `subagent_prompt`.
   switch (mode) {
     case 'off':
-      return { text: null, mode, serverText };
+      return { text: null, helperText: null, mode, serverText };
     case 'replace':
-      return { text: serverTextRaw, mode, serverText };
+      return { text: serverTextRaw, helperText: null, mode, serverText };
     case 'append':
-      return { text: `${addendum}\n\n${serverTextRaw}`, mode, serverText };
+      return { text: `${addendum}\n\n${serverTextRaw}`, helperText: `${helper}\n\n${serverTextRaw}`, mode, serverText };
     default:
-      return { text: addendum, mode: 'default', serverText };
+      return { text: addendum, helperText: helper, mode: 'default', serverText };
   }
 }
 

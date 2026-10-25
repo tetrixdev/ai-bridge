@@ -2426,6 +2426,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         attachmentDir: saved.length > 0 ? attachmentDirFor(request_id) : null,
         bridgeEnv: bridgeEnvResolution.values,
         bridgeAddendum: bridgePrompt.text,
+        bridgeHelperAddendum: bridgePrompt.helperText,
         turnInput,
       };
 
