@@ -662,7 +662,7 @@ installCommand
   } & AttachmentOptionValues) => {
     try {
       validateAttachmentOptions(opts);
-      const engram = opts.engram === undefined ? undefined : checkEngramUrl(opts.engram, opts.localTools);
+      const engram = opts.engram === undefined ? undefined : checkEngramUrl(opts.engram, opts.localTools, opts.server);
       const claudeEnv = opts.claudeEnv === undefined || opts.claudeEnv === '' ? opts.claudeEnv : checkClaudeEnv(opts.claudeEnv);
       const settings: Record<string, string> = {};
       for (const option of ATTACHMENT_OPTIONS) {
@@ -707,11 +707,17 @@ installCommand
   });
 
 /** An Engram address an install may record: http(s), nothing else. */
-function checkEngramUrl(raw: string, localTools: boolean): string {
+function checkEngramUrl(raw: string, localTools: boolean, server: string): string {
   if (!localTools) throw new Error('--engram needs --local-tools: without it the service never opens the vault, so the address would do nothing.');
   let url: URL;
   try { url = new URL(raw); } catch { throw new Error(`--engram must be Engram's address, such as https://engram.example.com, not "${raw}"`); }
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error(`--engram must start with https:// (or http:// for a local test), not ${url.protocol}`);
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error(`--engram must start with https://, not ${url.protocol}`);
+  // The bridge token is the Engram credential too, so plain http is accepted
+  // only where the server connection is plain already (a local test server),
+  // never as a downgrade from wss://.
+  if (url.protocol === 'http:' && !server.startsWith('ws://')) {
+    throw new Error(`--engram must be https:// when the server is ${server.split(':')[0]}://; http:// is only for a test server reached over ws://`);
+  }
   return url.origin;
 }
 

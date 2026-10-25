@@ -106,6 +106,9 @@ export function writeConfig(path: string, config: BridgeConfig): void {
   for (const [key, value] of Object.entries(config)) {
     if (typeof value === 'string' && /[\r\n]/.test(value)) throw new Error(`${key} must not contain a line break`);
   }
+  for (const [key, value] of Object.entries(config.settings ?? {})) {
+    if (/[\r\n]/.test(value)) throw new Error(`${key} must not contain a line break`);
+  }
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   // Lines this module does not own are carried over as they were. A setup
   // script that added a variable of its own to this file would otherwise lose

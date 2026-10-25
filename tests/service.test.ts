@@ -182,6 +182,8 @@ describe('vault and Claude token, recorded for the service', () => {
   test('a value with a line break is refused, so it cannot write a second key', () => {
     expect(() => writeConfig(join(dir, 'x.env'), { server: 'wss://h/bridge', token: 't', engram: 'https://h\nAI_BRIDGE_TOKEN=evil' }))
       .toThrow(/line break/);
+    expect(() => writeConfig(join(dir, 'y.env'), { server: 'wss://h/bridge', token: 't', settings: { AI_BRIDGE_ATTACHMENT_MAX_MB: '5\nAI_BRIDGE_TOKEN=evil' } }))
+      .toThrow(/line break/);
   });
 });
 
