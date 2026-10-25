@@ -313,8 +313,16 @@ export class ClaudeAdapter extends ProviderAdapter {
       args.push('--allowedTools', allowed.join(','));
     }
 
+    // The two writes below can throw (a full or unwritable temp dir) after the
+    // prompt files exist; release those before the error leaves.
     if (context.mcp) {
-      const configPath = writeClaudeMcpConfig(context.mcp);
+      let configPath: string;
+      try {
+        configPath = writeClaudeMcpConfig(context.mcp);
+      } catch (err) {
+        releasePromptFiles();
+        throw err;
+      }
       args.push('--mcp-config', configPath);
     }
 
@@ -325,7 +333,13 @@ export class ClaudeAdapter extends ProviderAdapter {
     // file because the flag takes a path, and sent every turn: it is
     // per-invocation. Gated on the detected CLI version (an unknown flag is
     // fatal); removed when the process closes.
-    const subagentPrompt = prepareClaudeSubagentPrompt(request.subagent_prompt, log, undefined, context.bridgeHelperAddendum ?? null);
+    let subagentPrompt: ReturnType<typeof prepareClaudeSubagentPrompt>;
+    try {
+      subagentPrompt = prepareClaudeSubagentPrompt(request.subagent_prompt, log, undefined, context.bridgeHelperAddendum ?? null);
+    } catch (err) {
+      releasePromptFiles();
+      throw err;
+    }
     if (subagentPrompt !== null) {
       promptFiles.push(subagentPrompt.file);
       args.push(...subagentPrompt.args);

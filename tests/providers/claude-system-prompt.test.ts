@@ -8,7 +8,8 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { Readable, Writable } from 'node:stream';
 import { ClaudeAdapter } from '../../src/providers/claude.js';
@@ -90,10 +91,6 @@ async function launch(opts: { systemPrompt: string | null; addendum: string | nu
   return recorded;
 }
 
-function promptDirs(): string[] {
-  return readdirSync(tmpdir()).filter((d) => d.startsWith('ai-bridge-system-claude-'));
-}
-
 const PROMPT = 'You are helpful. SERVER-PROMPT-MARKER\nSecond line.';
 const ADDENDUM = 'LIFECYCLE-ADDENDUM-MARKER';
 
@@ -135,11 +132,21 @@ describe('claude system prompt by file', () => {
 
   it('writes no file when there is nothing to say', async () => {
     noteDetectedClaudeVersion('2.1.310');
-    const before = promptDirs().length;
-    const { args } = await launch({ systemPrompt: null, addendum: null });
-    expect(args).not.toContain(SYSTEM_PROMPT_FILE_FLAG);
-    expect(args).not.toContain(APPEND_SYSTEM_PROMPT_FILE_FLAG);
-    expect(promptDirs().length).toBe(before);
+    // A private temp dir, so another test writing prompt files at the same
+    // moment cannot make this pass or fail.
+    const own = mkdtempSync(join(tmpdir(), 'sysprompt-none-'));
+    const saved = process.env['TMPDIR'];
+    process.env['TMPDIR'] = own;
+    try {
+      const { args } = await launch({ systemPrompt: null, addendum: null });
+      expect(args).not.toContain(SYSTEM_PROMPT_FILE_FLAG);
+      expect(args).not.toContain(APPEND_SYSTEM_PROMPT_FILE_FLAG);
+      expect(readdirSync(own).filter((d) => d.startsWith('ai-bridge-system-claude-'))).toEqual([]);
+    } finally {
+      if (saved === undefined) delete process.env['TMPDIR'];
+      else process.env['TMPDIR'] = saved;
+      rmSync(own, { recursive: true, force: true });
+    }
   });
 
   it('works on exactly the first verified version', async () => {
