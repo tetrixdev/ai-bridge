@@ -16,6 +16,7 @@ import {
   BRIDGE_ENV_KEYS,
   MAX_BRIDGE_PROMPT_BYTES,
   buildBridgeAddendum,
+  buildHelperAddendum,
   buildSpawnEnv,
   joinSystemPrompt,
   resolveBridgeAddendum,
@@ -298,6 +299,38 @@ describe('resolveBridgeAddendum()', () => {
 
   it('adds nothing at all with off', () => {
     expect(resolveBridgeAddendum({ mode: 'off' }, values).text).toBeNull();
+  });
+});
+
+describe('the helper section (bridge_prompt for subagents)', () => {
+  const values = resolveBridgeEnv().values;
+
+  it('is worded for a subagent: it reports to the assistant, not the person', () => {
+    const text = buildHelperAddendum(values);
+    expect(text).toContain('## How this session runs');
+    expect(text).toContain('subagent');
+    expect(text).toContain('## Parallel tool calls');
+    expect(text).toContain('`setsid`');
+    // Main-assistant facts a helper must not act on.
+    expect(text).not.toContain('further messages');
+    expect(text).not.toContain('free to answer the person');
+  });
+
+  it('follows whether background commands exist', () => {
+    expect(buildHelperAddendum({ ...values, [BACKGROUND]: '1' })).toContain('disabled here');
+    const on = buildHelperAddendum({ ...values, [BACKGROUND]: null });
+    expect(on).toContain('Finish what you start in the background');
+    expect(on).not.toContain('disabled here');
+  });
+
+  it('rides every mode as the main section does, except replace', () => {
+    expect(resolveBridgeAddendum(undefined, values).helperText).toBe(buildHelperAddendum(values));
+    const appended = resolveBridgeAddendum({ mode: 'append', text: 'Describe every command.' }, values, { acceptsInput: true });
+    expect(appended.helperText).toBe(`${buildHelperAddendum(values)}\n\nDescribe every command.`);
+    // replace text was written for the main assistant; the server words its
+    // helpers' version in subagent_prompt.
+    expect(resolveBridgeAddendum({ mode: 'replace', text: 'Only this.' }, values).helperText).toBeNull();
+    expect(resolveBridgeAddendum({ mode: 'off' }, values).helperText).toBeNull();
   });
 });
 

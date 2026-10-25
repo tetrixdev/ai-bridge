@@ -56,6 +56,7 @@ interface Launch {
 async function launch(
   AdapterClass: new () => ClaudeAdapter | CodexAdapter | GeminiAdapter,
   subagentPrompt: unknown,
+  helperAddendum: string | null = null,
 ): Promise<Launch> {
   const recorded: Launch = { args: [], stdin: undefined, path: null, content: null, mode: null };
 
@@ -109,6 +110,7 @@ async function launch(
     attachmentDir: null,
     bridgeEnv: {},
     bridgeAddendum: null,
+    bridgeHelperAddendum: helperAddendum,
   };
 
   await new Probe().execute(context, (_e: AdapterStreamEvent) => undefined);
@@ -161,6 +163,32 @@ describe(`claude ${SUBAGENT_PROMPT_FLAG}`, () => {
   it('skips the flag when the CLI version is unknown', async () => {
     noteDetectedClaudeVersion(null);
     expect((await launch(ClaudeAdapter, TEXT)).args).not.toContain(SUBAGENT_PROMPT_FLAG);
+  });
+});
+
+describe('the bridge helper section in the subagent prompt file', () => {
+  const SECTION = '## How this session runs\nHELPER-SECTION';
+
+  it('follows the server text in the same file', async () => {
+    noteDetectedClaudeVersion('2.1.283');
+    const { content } = await launch(ClaudeAdapter, TEXT, SECTION);
+    expect(content).toBe(`${TEXT}\n\n${SECTION}`);
+  });
+
+  it('is written on its own when the server sent no subagent_prompt', async () => {
+    noteDetectedClaudeVersion('2.1.283');
+    const { args, content } = await launch(ClaudeAdapter, undefined, SECTION);
+    expect(args).toContain(SUBAGENT_PROMPT_FLAG);
+    expect(content).toBe(SECTION);
+  });
+
+  it('is skipped at debug level, not warned about, on an older CLI', () => {
+    const log = { warn: vi.fn(), debug: vi.fn(), info: vi.fn(), error: vi.fn() };
+    expect(prepareClaudeSubagentPrompt(undefined, log as never, '2.1.260', SECTION)).toBeNull();
+    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.debug).toHaveBeenCalledTimes(1);
+    expect(prepareClaudeSubagentPrompt(TEXT, log as never, '2.1.260', SECTION)).toBeNull();
+    expect(log.warn).toHaveBeenCalledTimes(1);
   });
 });
 
