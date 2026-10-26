@@ -8,13 +8,12 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fetchAttachments, buildAttachmentPreamble } from '../../src/attachments/fetch.js';
-import { attachmentDirFor, removeAttachmentDir } from '../../src/attachments/store.js';
+import { attachmentDirFor, attachmentsRoot, removeAttachmentDir } from '../../src/attachments/store.js';
 import { AttachmentCache } from '../../src/attachments/cache.js';
 import { RequestRefusal } from '../../src/errors.js';
 import type { AttachmentRef } from '../../src/protocol/types.js';
@@ -375,7 +374,13 @@ describe('attachments kept between turns', () => {
   const NEXT_TURN = 'req_fetch_test_next';
 
   beforeEach(() => {
-    storeRoot = mkdtempSync(join(tmpdir(), 'fetch-cache-'));
+    // Not under tmpdir(): the kept copy is hard-linked to the per-turn file, and
+    // linking fails across filesystems (the cache then copies). Where /tmp is a
+    // tmpfs and the home is not, the test below that edits the per-turn file in
+    // place would no longer reach the kept one. Same filesystem as the
+    // attachments, so it tests the same thing everywhere.
+    mkdirSync(attachmentsRoot(), { recursive: true });
+    storeRoot = mkdtempSync(join(dirname(attachmentsRoot()), 'fetch-cache-'));
   });
   afterEach(() => {
     removeAttachmentDir(NEXT_TURN);
