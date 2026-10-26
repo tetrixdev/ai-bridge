@@ -416,8 +416,20 @@ export class ClaudeAdapter extends ProviderAdapter {
       const runningTasks = new Set<string>();
       /** Of those, the background tasks of the main assistant itself. */
       const mainBackgroundTasks = new Set<string>();
-      /** A main-assistant background task ended; the CLI owes it a turn. */
-      let notificationOwed = false;
+      /**
+       * How many main-assistant background tasks have ended without the CLI's
+       * stamped answer to them yet: it owes each one a turn of its own.
+       *
+       * A count, not a flag. Two helpers that end seconds apart are owed two
+       * turns, and the CLI runs them one after the other. A flag cleared by
+       * the first answer let the terminal rule close stdin between them, in
+       * the 1 ms before the CLI dequeued the second notification. The CLI
+       * then answered it with its input already closed, any helper it started
+       * there ran on a turn that had ended, and ten minutes after the main
+       * assistant went idle the CLI stopped them all and exited (seen
+       * 2026-10-02 and 2026-10-26, three helpers stopped mid-work).
+       */
+      let notificationsOwed = 0;
       /**
        * A background shell task writes nothing to the stream while it runs, so
        * its output file growing is what counts as activity for the silence
@@ -554,7 +566,7 @@ export class ClaudeAdapter extends ProviderAdapter {
           // says the task ended first counts: the CLI writes `updated` just
           // ahead of `finished`, and the rule is evaluated between the two.
           if (mainBackgroundTasks.delete(task.task_id)) {
-            notificationOwed = true;
+            notificationsOwed++;
           }
         }
       };
@@ -656,12 +668,12 @@ export class ClaudeAdapter extends ProviderAdapter {
         // close; checked here as well so the rule does not hinge on that.
         if (!openingTakenIn) return;
         if (mainState !== 'idle' || runningTasks.size > 0 || (port?.pendingCount() ?? 0) > 0) return;
-        if (notificationOwed) {
+        if (notificationsOwed > 0) {
           graceTimer ??= setTimeout(() => {
             graceTimer = null;
-            if (!notificationOwed) return;
-            log.warn('No turn followed a background task ending — closing anyway', { requestId });
-            notificationOwed = false;
+            if (notificationsOwed === 0) return;
+            log.warn('No turn followed a background task ending — closing anyway', { requestId, notificationsOwed });
+            notificationsOwed = 0;
             maybeClose();
           }, NOTIFICATION_TURN_GRACE_MS);
           graceTimer.unref?.();
@@ -906,11 +918,10 @@ export class ClaudeAdapter extends ProviderAdapter {
           log.debug('Session init', { sessionId, model, providerVersion });
           // Every init after the first starts a turn the CLI queued — a
           // message we wrote, or its answer to a finished background task. The
-          // main assistant is working again from here.
-          if (acceptsInput && seenInit) {
-            notificationOwed = false;
-            setMain('working');
-          }
+          // main assistant is working again from here. Nothing owed is settled
+          // yet: that is the stamped result's job, one per answered task (see
+          // notificationsOwed).
+          if (acceptsInput && seenInit) setMain('working');
           if (!seenInit) openInput();
           seenInit = true;
           return;
@@ -1281,7 +1292,11 @@ export class ClaudeAdapter extends ProviderAdapter {
             // The CLI's answer to a finished task is stamped; an unstamped
             // result is the main assistant's own reply and settles nothing
             // owed (captured: a task stopped mid-reply is answered after it).
-            if (origin !== null) notificationOwed = false;
+            // One stamped result settles one task, never all of them: the
+            // others still have their turn to come. Floored at zero for a
+            // notification left over from an earlier turn, which was never
+            // counted here.
+            if (origin !== null && notificationsOwed > 0) notificationsOwed--;
             // An unstamped result answers OUR prompt, so the opening was read
             // whether or not its echo was seen. A stamped one says nothing
             // about it: on --resume the CLI may answer a notification left

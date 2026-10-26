@@ -198,6 +198,39 @@ describe('messages for a running turn', () => {
     expect(of(turn.events, 'done')).toHaveLength(1);
   });
 
+  it('waits for the CLI\'s answer to EVERY background helper that ended, not only the first (2026-10-26)', async () => {
+    // Three background helpers. The first ends and the CLI answers it; the
+    // other two end while that answer is being written, so the CLI owes two
+    // more turns and runs them back to back. A flag cleared by any stamped
+    // result closed stdin after the first of them; in production the CLI
+    // dequeued the next notification 1 ms later, started new helpers in it
+    // with the input already closed, and stopped them all 10 minutes on.
+    const turn = await runInputTurn({
+      message: 'review it',
+      steps: [
+        echo('review it'), init,
+        taskStarted('h1', 'local_agent', true),
+        taskStarted('h2', 'local_agent', true),
+        taskStarted('h3', 'local_agent', true),
+        text('Three reviewers started.'), result(), { sleep: 150 },
+        taskFinished('h1'), { sleep: 50 },
+        init, text('Reviewer one is in.', null),
+        taskFinished('h2'),
+        taskFinished('h3'),
+        text('Noted.'), result({ origin: { kind: 'task-notification' } }), { sleep: 150 },
+        init, text('Reviewer two is in.'), result({ origin: { kind: 'task-notification' } }), { sleep: 150 },
+        init, text('Reviewer three is in.'), result({ origin: { kind: 'task-notification' } }),
+        { waitEof: true },
+      ],
+    });
+
+    // Lines: echo, init, 3× started, text, result (7) | h1 finished (8) |
+    // init, text, h2, h3, text, result (14) | init, text, result (17) |
+    // init, text (19), result. Open until the answer to h3 has begun.
+    expect(turn.record.eofAt).toBeGreaterThanOrEqual(19);
+    expect(of(turn.events, 'done')).toHaveLength(1);
+  });
+
   describe('commands a finished helper left behind', () => {
     /** A shell command a helper started: the CLI marks it `owned_by_subagent`. */
     const helperCommand = (id: string): Step => line({
