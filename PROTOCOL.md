@@ -349,6 +349,14 @@ This bridge sends the [`input_closed`](#input_closed) stream event when a turn w
 
 Since ai-bridge 0.32.0. The values this bridge takes for [`options.effort`](#additive-option-effort--the-claude-thinking-level), the Claude thinking level. Sent whichever providers are detected; Codex and Gemini ignore the option. Absent from a bridge that predates it, which drops the option and runs every turn at the CLI's default: a server that lets a person pick a level says it was not applied rather than implying it was.
 
+#### Additive field: `thinking_displays`
+
+```json
+{ "type": "hello", "...": "...", "thinking_displays": ["summarized", "omitted"] }
+```
+
+Since ai-bridge 0.39.0. The values this bridge takes for [`options.thinking_display`](#additive-option-thinking_display--readable-thinking). Sent whichever providers are detected; the flag itself reaches only Claude Code 2.1.310+. Absent from a bridge that predates it, which drops the option: thinking then comes back as the model's default (empty on current models).
+
 ### Bridge → Server: `providers_update`
 
 Sent mid-connection when the bridge's set of available provider CLIs changes after the `hello` — for example, the user installs or removes a CLI while the bridge stays connected.
@@ -993,6 +1001,16 @@ It is still one process per turn: the process ends when the turn does. There is 
 Since ai-bridge 0.32.0. Claude only. One of `hello.effort_levels` — `low`, `medium`, `high`, `xhigh`, `max` — and the bridge starts the CLI with `--effort <level>`, on a fresh turn and on a resumed one alike (like `--model`, it is per invocation, so a server sends it on every turn it wants it for). Verified on Claude Code 2.1.287, also together with `--resume`. `--effort` itself is older; `xhigh` needs Claude Code 2.1.111+; on models without `xhigh` the CLI falls back to `high`.
 
 Any other value is **ignored**, logged at debug: the turn runs exactly as if the option were absent, at the CLI's default level, and nothing is reported to the server. Absent, `null` or `""` means today's behaviour exactly — no flag. Codex and Gemini ignore the option, and so does a bridge without `hello.effort_levels`.
+
+#### Additive option: `thinking_display` — readable thinking
+
+```json
+"options": { "thinking_display": "summarized" }
+```
+
+Since ai-bridge 0.39.0. Claude only. One of `hello.thinking_displays` — `summarized`, `omitted` — and the bridge starts the CLI with `--thinking-display <value>`, on a fresh turn and on a resumed one alike (per invocation, like `--effort`). Why: on the current Claude models (Opus 4.7 and later, Sonnet 5 and later) the API's default display is `omitted`: the model still thinks and is billed the same, but every thinking block reaches the CLI with an empty text, so the bridge has no `thinking` block to send. `summarized` returns a readable summary of the thinking instead; no model ever returns the raw chain of thought. Verified on Claude Code 2.1.310 and 2.1.311 with `--model opus`, also with `--resume`; the `showThinkingSummaries` setting does not reach `-p` runs.
+
+The flag is passed only to Claude Code 2.1.310 or newer (the first version this bridge has seen with it; an older CLI would refuse the unknown option). Any other value, or an older or unknown CLI, is **ignored**, logged at debug: the turn runs exactly as if the option were absent. Absent, `null` or `""` means today's behaviour exactly — no flag. Codex and Gemini ignore the option, and so does a bridge without `hello.thinking_displays`.
 
 #### Additive field: `working_dir`
 

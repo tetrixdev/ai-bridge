@@ -330,6 +330,13 @@ export interface HelloMessage {
    * and runs the turn at the CLI's default.
    */
   effort_levels?: string[];
+  /**
+   * The values `options.thinking_display` takes: `["summarized","omitted"]`,
+   * passed to Claude as `--thinking-display <display>` (Claude Code 2.1.310+).
+   * Claude only. Absent from a bridge that predates it, which drops the option:
+   * thinking then comes back as the model's default (empty on current models).
+   */
+  thinking_displays?: string[];
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -1076,6 +1083,12 @@ export interface AiRequestOptions {
    * the CLI's default). Claude only.
    */
   effort?: string | null;
+  /**
+   * Whether the turn's thinking comes back readable: one of
+   * `hello.thinking_displays`, passed to Claude as `--thinking-display`.
+   * Any other value, or a CLI too old for the flag, is ignored. Claude only.
+   */
+  thinking_display?: string | null;
 }
 
 /** Server responds with the result of a tool call. */
