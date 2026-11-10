@@ -98,6 +98,7 @@ import { APP_CODE_REVISION } from './apps/guard.js';
 /** Revision of per-turn isolation (`ai_request.cli_isolation`), advertised as `hello.turn_isolation`. */
 export const TURN_ISOLATION_REVISION = 1;
 import { CLAUDE_EFFORT_LEVELS } from './providers/claude-effort.js';
+import { CLAUDE_THINKING_DISPLAYS } from './providers/claude-thinking-display.js';
 import { Readable } from 'node:stream';
 import { receiveUpload, type UploadOffer, type UploadSent } from './attachments/receive.js';
 import { createLogger } from './utils/logger.js';
@@ -1558,6 +1559,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       turn_isolation: TURN_ISOLATION_REVISION,
       // The levels `options.effort` takes (Claude only; others ignore the option).
       effort_levels: [...CLAUDE_EFFORT_LEVELS],
+      // The values `options.thinking_display` takes (Claude only; others ignore it).
+      thinking_displays: [...CLAUDE_THINKING_DISPLAYS],
       // Follows welcome.desired_bridge_version by itself (src/selfupdate/).
       self_update: this.selfUpdate?.enabled ?? false,
       // Advertise the operator's allow-list so the server can offer a picker

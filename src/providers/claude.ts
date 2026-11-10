@@ -72,6 +72,7 @@ import { createTaskOutputWatch, outputPathFrom } from './task-output-watch.js';
 import { prepareClaudeSubagentPrompt } from './subagent-prompt.js';
 import { prepareClaudeSystemPrompt } from './claude-system-prompt.js';
 import { resolveClaudeEffort } from './claude-effort.js';
+import { claudeThinkingDisplayArgs } from './claude-thinking-display.js';
 
 /**
  * How long a turn with its input open waits for the CLI to start the turn it
@@ -240,6 +241,11 @@ export class ClaudeAdapter extends ProviderAdapter {
     if (effort !== null) {
       args.push('--effort', effort);
     }
+
+    // Whether thinking comes back readable (`options.thinking_display`), per
+    // invocation like --effort. Without it the current models return every
+    // thinking block empty. See claude-thinking-display.ts.
+    args.push(...claudeThinkingDisplayArgs(request.options?.thinking_display));
 
     // Add max tokens if specified
     if (request.options?.max_tokens) {
