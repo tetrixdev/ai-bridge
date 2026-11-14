@@ -337,6 +337,14 @@ export interface HelloMessage {
    * thinking then comes back as the model's default (empty on current models).
    */
   thinking_displays?: string[];
+  /**
+   * `true` when this bridge honours `options.web_search` (0.40.0+): an
+   * `isolated` Claude turn that asks for it gets Claude Code's built-in
+   * WebSearch tool and nothing else beside the server's tools. Absent when the
+   * operator turned it off (`--no-web-search`) and from every older bridge;
+   * a server then knows a turn will have no web search. Decision 0016.
+   */
+  web_search?: boolean;
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -1089,6 +1097,15 @@ export interface AiRequestOptions {
    * Any other value, or a CLI too old for the flag, is ignored. Claude only.
    */
   thinking_display?: string | null;
+  /**
+   * `true` lets this turn search the web with Claude Code's built-in
+   * WebSearch tool, and nothing else built in (no WebFetch, no shell, no
+   * files). Only `true` turns it on; anything else is today's behaviour. Matters
+   * only in `isolated` (in `workspace` and `native` every built-in tool is
+   * already allowed); Claude only; ignored when the operator passed
+   * `--no-web-search` (hello then has no `web_search`). Decision 0016.
+   */
+  web_search?: boolean | null;
 }
 
 /** Server responds with the result of a tool call. */

@@ -66,6 +66,23 @@ describe('--allow-native', () => {
   });
 });
 
+describe('--no-web-search', () => {
+  it('leaves web search askable by default (it reaches nothing on this machine; decision 0016)', () => {
+    expect(resolveOperatorPosture(options(), SERVER, {}).webSearch).toBe(true);
+  });
+
+  it('turns it off when passed', () => {
+    expect(resolveOperatorPosture(options({ webSearch: false }), SERVER, {}).webSearch).toBe(false);
+  });
+
+  it('turns it off from AI_BRIDGE_WEB_SEARCH=0, the env-file form', () => {
+    for (const value of ['0', 'false', 'off', 'no', 'OFF']) {
+      expect(resolveOperatorPosture(options(), SERVER, { AI_BRIDGE_WEB_SEARCH: value }).webSearch, value).toBe(false);
+    }
+    expect(resolveOperatorPosture(options(), SERVER, { AI_BRIDGE_WEB_SEARCH: '1' }).webSearch).toBe(true);
+  });
+});
+
 describe('--allow-dir', () => {
   it('reaches the bridge as resolved roots', () => {
     const posture = resolveOperatorPosture(options({ allowDir: [`${repo}=Studio`] }), SERVER, {});

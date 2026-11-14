@@ -317,6 +317,17 @@ export class ClaudeAdapter extends ProviderAdapter {
       if (context.attachmentDir) {
         allowed.push(`Read(/${context.attachmentDir}/**)`);
       }
+      // Web search, when the request asked (`options.web_search: true`) and
+      // the operator did not turn it off; resolved by the bridge into
+      // `context.webSearch` (decision 0016). EXACTLY `WebSearch`: it runs at
+      // Anthropic and reaches nothing on this machine. Never `WebFetch`, which
+      // fetches any URL the model writes (a server's data could ride out in
+      // it to any host), and never a bare built-in that touches files or the
+      // shell. Verified against Claude 2.1.325: with this entry the turn
+      // searched, and WebFetch and Bash were still denied.
+      if (context.webSearch === true) {
+        allowed.push('WebSearch');
+      }
       args.push('--allowedTools', allowed.join(','));
     }
 

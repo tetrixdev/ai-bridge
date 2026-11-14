@@ -46,6 +46,20 @@ run wider**, on a provider that cannot be held to it (Codex keeps a read-only
 shell, Gemini has no lever) or when it also names a working folder. The
 decision is `turnPosture()` in `src/bridge.ts`.
 
+## Web search on an `isolated` turn
+
+A request may add one built-in tool to an `isolated` Claude turn:
+`options.web_search: true` puts exactly `WebSearch` into `--allowedTools`
+(advertised as `hello.web_search`; `resolveWebSearch()` in `src/bridge.ts`, the
+adapter in `src/providers/claude.ts`). This is not the server widening what the
+operator allowed: the operator's gates are about this machine (its files, its
+shell, its MCP servers, its secrets), and a web search runs at Anthropic with
+words the model writes from the turn, all of which the server already has. What
+the operator does give is their Claude account's usage, so `--no-web-search`
+keeps it off (decision 0016). `WebFetch` is never added: it fetches any URL the
+model writes, so a page's instructions could carry the turn's data to any host.
+Codex and Gemini ignore the option.
+
 ## How `isolated` is actually enforced
 
 This is the part that is easy to get wrong, and was wrong here until it was

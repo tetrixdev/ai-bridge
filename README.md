@@ -177,6 +177,7 @@ are left where they are.
 | `--attachment-cache-max-mb <n>` | `AI_BRIDGE_ATTACHMENT_CACHE_MAX_MB` | Cap on what is kept for later turns; least recently used go first (default `1024`). `0` turns the cache off |
 | `--allow-native` | | Permit the server to select `native` isolation — the CLI's full local environment, including your own MCP servers, hooks, plugins and a shell. **Off unless you pass it.** Only for a bridge you run against your own machine |
 | `--no-self-update` | `AI_BRIDGE_SELF_UPDATE=0` | Do not follow the version the server asks for; pin `AI_BRIDGE_VERSION` by hand. See [Following the server's version](#following-the-servers-version) |
+| `--no-web-search` | `AI_BRIDGE_WEB_SEARCH=0` | Never give a Claude turn web search, even when the server asks (`options.web_search`). See [Web search](#web-search) |
 | `--keep-attachments` | | Keep downloaded attachments after a turn instead of deleting them. Debugging aid |
 | `--mcp-upstreams <file>` | `AI_BRIDGE_MCP_UPSTREAMS` | MCP servers this bridge connects to itself and offers to the CLI, with their MCP Apps views passed to the web application. See [MCP servers of your own](#mcp-servers-of-your-own-mcp-apps) |
 
@@ -226,6 +227,19 @@ handshake. [PROTOCOL.md](PROTOCOL.md) gives the per-CLI flags; the shape is:
 > (Claude) or HOME redirection, and `--bare` breaks subscription auth. Those are
 > the operator's own configuration rather than something a server chooses, but
 > they do shape the turn.
+
+### Web search
+
+A server may ask for web search on one turn (`options.web_search: true`). On an
+`isolated` Claude turn the bridge then allows exactly Claude Code's built-in
+`WebSearch` tool beside the server's tools; `WebFetch`, the shell and the file
+tools stay denied. The search runs at Anthropic, on your Claude account, with
+words the model writes from the turn: it reaches nothing on this machine, which
+is why it needs no opt-in from you (decision 0016). To keep it off anyway, for
+example to keep your account's usage to what you run yourself, start the bridge
+with `--no-web-search` (or `install --no-web-search`, or `AI_BRIDGE_WEB_SEARCH=0`
+in its env file); the handshake then stops announcing `web_search`, so the
+server knows. Codex and Gemini turns ignore the option.
 
 The bridge tells the server which posture it settled on, so an app can show "running `isolated`, because this bridge was started without `--allow-native`" rather than leaving you to find it in this machine's log.
 

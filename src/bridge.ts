@@ -199,6 +199,16 @@ export interface BridgeOptions {
    * can send.
    */
   allowNative?: boolean;
+  /**
+   * Whether a request may ask for Claude Code's built-in WebSearch tool on an
+   * `isolated` turn (`options.web_search`, decision 0016).
+   *
+   * Absent means yes, unlike `allowNative`: a web search reaches nothing on
+   * this machine (it runs at Anthropic, with the turn's own words), so it is
+   * the server's to ask for per turn. The operator can still keep it off
+   * (`--no-web-search`); hello then does not announce `web_search`.
+   */
+  webSearch?: boolean;
 }
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
@@ -502,6 +512,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly keepAttachments: boolean;
   /** Whether the operator permitted the server to select `native`. */
   private readonly allowNative: boolean;
+  /** Whether the operator lets a request ask for web search (`--no-web-search` turns it off). */
+  private readonly webSearch: boolean;
   /** MCP Apps: MCP servers this bridge connects to itself (src/mcp/upstream.ts). */
   private readonly upstream: UpstreamHub | null;
   private upstreamStarted = false;
@@ -568,6 +580,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.servedFiles = new ServedFiles(options.servedFilesPath ?? null);
     this.spaceFiles = new SpaceFiles(this.allowedRootPaths, this.servedFiles);
     this.allowNative = options.allowNative ?? false;
+    this.webSearch = options.webSearch ?? true;
     this.upstream = options.mcpUpstreams && Object.keys(options.mcpUpstreams).length
       ? new UpstreamHub(options.mcpUpstreams, {
           resolveSecret: (ref) => this.resolveUpstreamSecret(ref),
@@ -1561,6 +1574,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       effort_levels: [...CLAUDE_EFFORT_LEVELS],
       // The values `options.thinking_display` takes (Claude only; others ignore it).
       thinking_displays: [...CLAUDE_THINKING_DISPLAYS],
+      // `options.web_search` is honoured (Claude, isolated turns; decision 0016).
+      // Left out when the operator turned it off, so the server knows.
+      ...(this.webSearch ? { web_search: true } : {}),
       // Follows welcome.desired_bridge_version by itself (src/selfupdate/).
       self_update: this.selfUpdate?.enabled ?? false,
       // Advertise the operator's allow-list so the server can offer a picker
@@ -2442,6 +2458,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         bridgeAddendum: bridgePrompt.text,
         bridgeHelperAddendum: bridgePrompt.helperText,
         turnInput,
+        webSearch: resolveWebSearch(request, this.webSearch, request_id),
       };
 
       // The adapter emits its own `done`, but the CLI session id is only known
@@ -2970,6 +2987,29 @@ function upstreamRedirectUri(message: WelcomeMessage): string | null {
  *   tools the turn does not have, and a session made in a checkout would be
  *   refused on its next resume anyway.
  */
+/**
+ * Whether this turn gets Claude Code's built-in WebSearch tool (decision 0016).
+ *
+ * Only `options.web_search === true` asks: a stray truthy value ("1", "yes")
+ * must not be what widens a turn, and `false`, `null` or absent mean today's
+ * behaviour exactly. A request asking on a bridge whose operator turned it off
+ * runs without it, with a warning: hello did not announce `web_search`, so a
+ * server that checks it never sends the field there, and the model, which has
+ * no such tool, says so itself rather than the turn failing.
+ */
+export function resolveWebSearch(
+  request: Pick<AiRequestMessage, 'options'>,
+  operatorAllows: boolean,
+  requestId = '',
+): boolean {
+  if (request.options?.web_search !== true) return false;
+  if (!operatorAllows) {
+    log.warn('Turn asked for web search; the operator turned it off (--no-web-search). Running without it.', { requestId });
+    return false;
+  }
+  return true;
+}
+
 export function turnPosture(
   connection: CliIsolation,
   request: Pick<AiRequestMessage, 'cli_isolation' | 'working_dir' | 'provider'>,

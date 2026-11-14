@@ -357,6 +357,14 @@ Since ai-bridge 0.32.0. The values this bridge takes for [`options.effort`](#add
 
 Since ai-bridge 0.39.0. The values this bridge takes for [`options.thinking_display`](#additive-option-thinking_display--readable-thinking). Sent whichever providers are detected; the flag itself reaches only Claude Code 2.1.310+. Absent from a bridge that predates it, which drops the option: thinking then comes back as the model's default (empty on current models).
 
+#### Additive field: `web_search`
+
+```json
+{ "type": "hello", "...": "...", "web_search": true }
+```
+
+Since ai-bridge 0.40.0. `true` when this bridge honours [`options.web_search`](#additive-option-web_search--claudes-built-in-web-search) on Claude turns. Absent when the operator passed `--no-web-search`, and from every older bridge: a server then knows its turns will have no web search, and should say so rather than imply they do.
+
 ### Bridge → Server: `providers_update`
 
 Sent mid-connection when the bridge's set of available provider CLIs changes after the `hello` — for example, the user installs or removes a CLI while the bridge stays connected.
@@ -1001,6 +1009,16 @@ It is still one process per turn: the process ends when the turn does. There is 
 Since ai-bridge 0.32.0. Claude only. One of `hello.effort_levels` — `low`, `medium`, `high`, `xhigh`, `max` — and the bridge starts the CLI with `--effort <level>`, on a fresh turn and on a resumed one alike (like `--model`, it is per invocation, so a server sends it on every turn it wants it for). Verified on Claude Code 2.1.287, also together with `--resume`. `--effort` itself is older; `xhigh` needs Claude Code 2.1.111+; on models without `xhigh` the CLI falls back to `high`.
 
 Any other value is **ignored**, logged at debug: the turn runs exactly as if the option were absent, at the CLI's default level, and nothing is reported to the server. Absent, `null` or `""` means today's behaviour exactly — no flag. Codex and Gemini ignore the option, and so does a bridge without `hello.effort_levels`.
+
+#### Additive option: `web_search` — Claude's built-in web search
+
+```json
+"options": { "web_search": true }
+```
+
+Since ai-bridge 0.40.0, advertised as `hello.web_search`. Claude only. `true` adds exactly Claude Code's built-in `WebSearch` tool to an `isolated` turn's `--allowedTools` (beside `mcp__bridge__*` and any attachment read grant); everything else built in stays denied, `WebFetch` included. It applies alike to a connection that adopted `isolated` and to a turn narrowed to it with `cli_isolation`. In `workspace` and `native` every built-in tool is already allowed, so the field changes nothing there. Searches run at Anthropic, on the operator's Claude account, with words the model writes from the turn; nothing on the bridge's machine is reached (decision 0016). Verified on Claude Code 2.1.325: a turn with the entry searched, and `WebFetch` and `Bash` were still denied.
+
+Only the JSON value `true` turns it on: absent, `false`, `null` or any other value (`"yes"`, `1`) means today's behaviour exactly. Codex and Gemini ignore the option. An operator who started the bridge with `--no-web-search` (or `AI_BRIDGE_WEB_SEARCH=0`) gets no `hello.web_search`; a turn that asks anyway runs without the tool, with a warning in the bridge's log, and the model says it cannot search. A bridge without `hello.web_search` ignores the field.
 
 #### Additive option: `thinking_display` — readable thinking
 
@@ -2854,6 +2872,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Images in tool results do not bump the version.** `hello.tool_result_content` and `tool_resolve.content` are additive; a server must not send `content` to a bridge that did not advertise `tool_result_content`, and an older server sends `result` alone, which is what it always meant.
 
 **App backends do not bump the version.** `hello.app_backends`, `app_call` and `app_result` are additive; a server must not send `app_call` to a bridge that did not advertise `app_backends`. `hello.app_items` and `app_call.use` are additive the same way.
+
+**Web search does not bump the version.** `hello.web_search` and `options.web_search` are additive: an older bridge ignores the option (the turn runs without web search, as before), and an older server ignores the field.
 
 **Per-turn isolation does not bump the version.** `hello.turn_isolation` and `ai_request.cli_isolation` are additive; a server must not send the field to a bridge that did not advertise `turn_isolation`, since an older one ignores it and runs the turn with the connection's posture.
 
