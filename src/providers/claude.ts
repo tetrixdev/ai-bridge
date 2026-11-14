@@ -329,6 +329,15 @@ export class ClaudeAdapter extends ProviderAdapter {
         allowed.push('WebSearch');
       }
       args.push('--allowedTools', allowed.join(','));
+      // The web tools this turn may not use are also taken out of the CLI's
+      // tool list, not only denied on use. Merely denied, they stay listed
+      // (ToolSearch finds them), so a model asked to search calls one, gets a
+      // permission error and tells the person to "grant the permission",
+      // instead of following a server prompt that says search is off; seen on
+      // Dungeon Maister on 2026-11-14 after a turn that had searched.
+      // Verified on Claude 2.1.325: with --disallowedTools the init frame's
+      // tools list no longer has them. One comma-joined value: variadic flag.
+      args.push('--disallowedTools', context.webSearch === true ? 'WebFetch' : 'WebSearch,WebFetch');
     }
 
     // The two writes below can throw (a full or unwritable temp dir) after the
