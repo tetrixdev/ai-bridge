@@ -1018,6 +1018,8 @@ Any other value is **ignored**, logged at debug: the turn runs exactly as if the
 
 Since ai-bridge 0.40.0, advertised as `hello.web_search`, which a bridge sends only when its operator started it with `--allow-web-search`. Claude only. `true` adds exactly Claude Code's built-in `WebSearch` tool to an `isolated` turn's `--allowedTools` (beside `mcp__bridge__*` and any attachment read grant); everything else built in stays denied, `WebFetch` included. It applies alike to a connection that adopted `isolated` and to a turn narrowed to it with `cli_isolation`. In `workspace` and `native` every built-in tool is already allowed, so the field changes nothing there. Searches run at Anthropic, on the operator's Claude account, with words the model writes from the turn (decision 0016). Verified on Claude Code 2.1.325: a turn with the entry searched, and `WebFetch` and `Bash` were still denied.
 
+Since 0.40.1 an `isolated` Claude turn is also started with `--disallowedTools` naming the web tools it may not use (`WebSearch,WebFetch`, or `WebFetch` on a turn granted search), so the CLI does not list them at all: merely denied, a listed tool was still called and its permission error reported to the person as a permission to grant.
+
 Only the JSON value `true` asks: absent, `false`, `null` or any other value (`"yes"`, `1`) means today's behaviour exactly. An `isolated` turn that asks is **refused, never run without the tool**: `web_search_not_allowed` on a bridge without `--allow-web-search`, `web_search_unsupported` on Codex or Gemini. A server must not send the option to a bridge without `hello.web_search`; a bridge older than 0.40.0 ignores it and runs the turn without search.
 
 #### Additive option: `thinking_display` — readable thinking

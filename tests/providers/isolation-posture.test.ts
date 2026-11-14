@@ -140,6 +140,14 @@ describe('claude', () => {
     expect(args[args.indexOf('--permission-mode') + 1]).toBe('manual');
   });
 
+  it('in isolated, takes the web tools out of the tool list unless the turn may search', async () => {
+    const flag = (args: string[]) => args[args.indexOf('--disallowedTools') + 1];
+    expect(flag((await launch(ClaudeAdapter, 'isolated')).args)).toBe('WebSearch,WebFetch');
+    expect(flag((await launch(ClaudeAdapter, 'isolated', true, null, true)).args)).toBe('WebFetch');
+    expect((await launch(ClaudeAdapter, 'workspace')).args).not.toContain('--disallowedTools');
+    expect((await launch(ClaudeAdapter, 'native')).args).not.toContain('--disallowedTools');
+  });
+
   it('in workspace, keeps strict-mcp-config but allows the built-in tools', async () => {
     const { args } = await launch(ClaudeAdapter, 'workspace');
     // The operator's own MCP servers stay out — that half of isolation holds.
