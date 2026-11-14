@@ -53,6 +53,8 @@ export interface OperatorPosture {
   allowNative: boolean;
   keepAttachments: boolean;
   servedFilesPath: string;
+  /** Whether a request may ask for web search on an isolated Claude turn (--allow-web-search, decision 0016). */
+  webSearch: boolean;
 }
 
 /** Just the option fields this mapping reads. */
@@ -61,6 +63,8 @@ export interface OperatorOptions extends AttachmentOptionValues {
   api?: string;
   allowNative: boolean;
   keepAttachments: boolean;
+  /** true from `--allow-web-search`; absent or false means no request may ask for it. */
+  allowWebSearch?: boolean;
   /** The install this run is, when a service started it: from AI_BRIDGE_NAME
    *  or the env file. It keeps one install's attachment store from another's. */
   installName?: string | undefined;
@@ -94,6 +98,9 @@ export function resolveOperatorPosture(
     allowNative: opts.allowNative,
     keepAttachments: opts.keepAttachments,
     servedFilesPath: attachments.servedFilesPath,
+    // Off unless the operator passes the flag, like --allow-native: a flag on
+    // the command line works the same under systemd, launchd and by hand.
+    webSearch: opts.allowWebSearch === true,
   };
 }
 
@@ -205,6 +212,13 @@ program
     + 'unit starts @tetrixdev/ai-bridge@${AI_BRIDGE_VERSION}; anywhere else it just logs.',
   )
   .option(
+    '--allow-web-search',
+    'Permit the server to give an isolated Claude turn Claude Code\'s built-in WebSearch tool (options.web_search), '
+    + 'and no other built-in tool. Off unless you pass it. Searches run at Anthropic on your Claude account, with '
+    + 'words the model takes from the turn; they reach no file or command on this machine.',
+    false,
+  )
+  .option(
     '--keep-attachments',
     'Keep downloaded attachments after a turn instead of deleting them. Debugging aid.',
     false,
@@ -238,6 +252,7 @@ program
     deviceLabel?: string; deviceMode: string; identityFile: string; localDataDir: string;
     allowDir: string[]; api?: string; keepAttachments: boolean; allowNative: boolean;
     envFile?: string; installName?: string; selfUpdate: boolean; mcpUpstreams?: string;
+    allowWebSearch: boolean;
   } & AttachmentOptionValues) => {
     opts.installName = process.env['AI_BRIDGE_NAME'] || undefined;
     // Before anything reads server or token. The file is the lowest precedence
@@ -470,6 +485,9 @@ program
       process.exit(1);
     }
     const { allowedRoots, apiOrigin, attachmentLimits } = operatorPosture;
+    if (operatorPosture.webSearch) {
+      log.warn('web search is PERMITTED: this server may give an isolated Claude turn the built-in WebSearch tool, on your Claude account.');
+    }
 
     if (allowedRoots.length > 0) {
       log.warn(
@@ -529,6 +547,7 @@ program
       keepAttachments: operatorPosture.keepAttachments,
       servedFilesPath: operatorPosture.servedFilesPath,
       allowNative: operatorPosture.allowNative,
+      webSearch: operatorPosture.webSearch,
       ...(mcpUpstreams ? { mcpUpstreams } : {}),
     });
 
@@ -649,7 +668,8 @@ const installCommand = program
   .option('--local-tools', 'Pass --local-tools to the service (see the main options)', false)
   .option('--engram <url>', 'Engram\'s address (https://...), recorded as ENGRAM_URL so the service enrols this machine for vault secrets. Needs --local-tools.')
   .option('--claude-env <file>', 'A 0600 file holding CLAUDE_CODE_OAUTH_TOKEN=<token> (from `claude setup-token`) for the service to sign Claude in with. Kept on a reinstall that does not name it; pass "" to drop it.')
-  .option('--no-self-update', 'Do not follow the version the server asks for; stay on the installed one until you change AI_BRIDGE_VERSION by hand');
+  .option('--no-self-update', 'Do not follow the version the server asks for; stay on the installed one until you change AI_BRIDGE_VERSION by hand')
+  .option('--allow-web-search', 'Pass --allow-web-search to the service (see the main options)', false);
 // The same attachment settings as a direct run, recorded in the service's env
 // file. Left out, a reinstall keeps whatever the install it replaces had.
 for (const option of ATTACHMENT_OPTIONS) {
@@ -659,6 +679,7 @@ installCommand
   .action((opts: {
     server: string; token: string; allowDir?: string; name?: string; force: boolean;
     allowNative: boolean; localTools: boolean; selfUpdate: boolean; engram?: string; claudeEnv?: string;
+    allowWebSearch: boolean;
   } & AttachmentOptionValues) => {
     try {
       validateAttachmentOptions(opts);
@@ -676,6 +697,7 @@ installCommand
           ...(opts.allowNative ? ['--allow-native'] : []),
           ...(opts.localTools ? ['--local-tools'] : []),
           ...(opts.selfUpdate ? [] : ['--no-self-update']),
+          ...(opts.allowWebSearch ? ['--allow-web-search'] : []),
         ],
       });
       const paths = pathsFor(name);
