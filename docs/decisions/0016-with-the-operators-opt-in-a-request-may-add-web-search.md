@@ -44,10 +44,6 @@ what a server may do here; a server cannot switch it on by sending a field.
   --permission-mode manual`: the turn searched; `WebFetch` and `Bash` were denied
   (`permission_denials` in the result). `tests/bridge/web-search.test.ts` and
   `tests/providers/isolation-posture.test.ts` assert the argv and the refusals.
-- From 0.40.1 the web tools a turn may not use are also passed as
-  `--disallowedTools`, which takes them out of the CLI's tool list: denied but
-  listed, WebSearch was still called on Dungeon Maister after the DM turned
-  search off, and the model told him to grant the permission.
 - A server that relies on search checks `hello.web_search` (and the provider)
   before sending the option, and says when it is missing; a bridge older than
   0.40.0 ignores the option.
