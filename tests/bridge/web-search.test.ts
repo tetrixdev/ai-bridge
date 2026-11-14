@@ -151,7 +151,9 @@ describe('a bridge started with --allow-web-search, on an isolated connection', 
     // Still the posture that denies everything else: no WebFetch, Bash, Read.
     expect(flag(args, '--permission-mode')).toBe('manual');
     expect(args).toContain('--strict-mcp-config');
-    expect(args.join(' ')).not.toMatch(/WebFetch|Bash|bypassPermissions/);
+    // (The allow-list above is the whole grant; the system prompt may mention tool names, so not the joined argv.)
+    expect(args).not.toContain('bypassPermissions');
+    expect(args).not.toContain('--dangerously-skip-permissions');
   });
 
   it('changes nothing when the field is absent, false, or anything but true', async () => {
