@@ -177,7 +177,7 @@ are left where they are.
 | `--attachment-cache-max-mb <n>` | `AI_BRIDGE_ATTACHMENT_CACHE_MAX_MB` | Cap on what is kept for later turns; least recently used go first (default `1024`). `0` turns the cache off |
 | `--allow-native` | | Permit the server to select `native` isolation — the CLI's full local environment, including your own MCP servers, hooks, plugins and a shell. **Off unless you pass it.** Only for a bridge you run against your own machine |
 | `--no-self-update` | `AI_BRIDGE_SELF_UPDATE=0` | Do not follow the version the server asks for; pin `AI_BRIDGE_VERSION` by hand. See [Following the server's version](#following-the-servers-version) |
-| `--no-web-search` | `AI_BRIDGE_WEB_SEARCH=0` | Never give a Claude turn web search, even when the server asks (`options.web_search`). See [Web search](#web-search) |
+| `--allow-web-search` | | Permit the server to give an isolated Claude turn Claude Code's built-in `WebSearch` tool, and no other built-in (`options.web_search`). **Off unless you pass it.** See [Web search](#web-search) |
 | `--keep-attachments` | | Keep downloaded attachments after a turn instead of deleting them. Debugging aid |
 | `--mcp-upstreams <file>` | `AI_BRIDGE_MCP_UPSTREAMS` | MCP servers this bridge connects to itself and offers to the CLI, with their MCP Apps views passed to the web application. See [MCP servers of your own](#mcp-servers-of-your-own-mcp-apps) |
 
@@ -230,16 +230,16 @@ handshake. [PROTOCOL.md](PROTOCOL.md) gives the per-CLI flags; the shape is:
 
 ### Web search
 
-A server may ask for web search on one turn (`options.web_search: true`). On an
-`isolated` Claude turn the bridge then allows exactly Claude Code's built-in
-`WebSearch` tool beside the server's tools; `WebFetch`, the shell and the file
-tools stay denied. The search runs at Anthropic, on your Claude account, with
-words the model writes from the turn: it reaches nothing on this machine, which
-is why it needs no opt-in from you (decision 0016). To keep it off anyway, for
-example to keep your account's usage to what you run yourself, start the bridge
-with `--no-web-search` (or `install --no-web-search`, or `AI_BRIDGE_WEB_SEARCH=0`
-in its env file); the handshake then stops announcing `web_search`, so the
-server knows. Codex and Gemini turns ignore the option.
+Started with `--allow-web-search` (or `install --allow-web-search`), the bridge
+lets a server ask for web search on one turn (`options.web_search: true`). On an
+`isolated` Claude turn it then allows exactly Claude Code's built-in `WebSearch`
+tool beside the server's tools; `WebFetch`, the shell and the file tools stay
+denied. The search runs at Anthropic, on your Claude account, with words the
+model takes from the turn (which can include what the server's tools returned):
+it reads no file and runs no command here, but it is your account and a new
+recipient for those words, so it is off unless you pass the flag (decision
+0016). Without it the handshake has no `web_search`, and an isolated turn that
+asks anyway is refused. Codex and Gemini turns asking are refused too.
 
 The bridge tells the server which posture it settled on, so an app can show "running `isolated`, because this bridge was started without `--allow-native`" rather than leaving you to find it in this machine's log.
 
@@ -304,7 +304,7 @@ It is a cache, and behaves like one:
 
 `--keep-attachments` is unrelated and unchanged: it keeps the per-turn directories, for debugging, and never cleans them up.
 
-The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. That tool is offered in `workspace` and `native` only. In `isolated`, Claude reaches server-declared tools plus — on a turn that has attachments — permission to read that turn's attachment directory, and nothing else. Codex and Gemini have no equivalent per-path grant: Codex sits at its own read-only sandbox and Gemini at its own defaults, both of which are broader than that. See the posture table in [PROTOCOL.md](PROTOCOL.md). It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
+The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. That tool is offered in `workspace` and `native` only. In `isolated`, Claude reaches server-declared tools plus — on a turn that has attachments — permission to read that turn's attachment directory, and — on a turn granted web search, see [Web search](#web-search) — the built-in `WebSearch`, and nothing else. Codex and Gemini have no equivalent per-path grant: Codex sits at its own read-only sandbox and Gemini at its own defaults, both of which are broader than that. See the posture table in [PROTOCOL.md](PROTOCOL.md). It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
 
 ### Files a person sends straight to this machine
 

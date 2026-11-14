@@ -3,10 +3,11 @@
  * a real WebSocket against the real Claude adapter with only its spawn
  * intercepted: what matters is the argv the CLI would be launched with.
  *
- * The opt-in adds exactly Claude Code's built-in `WebSearch` to an isolated
- * turn's allowed tools, and nothing else built in. Absent, false or any value
- * other than `true` changes nothing; an operator who passed `--no-web-search`
- * gets no `web_search` in hello and no WebSearch on any turn.
+ * On a bridge started with `--allow-web-search` the opt-in adds exactly Claude
+ * Code's built-in `WebSearch` to an isolated turn's allowed tools, and nothing
+ * else built in. Absent, false or any value other than `true` changes nothing.
+ * Without the operator's flag hello has no `web_search` and an isolated turn
+ * asking is refused, never run without the tool; so is one on another provider.
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
@@ -66,9 +67,14 @@ async function waitFor(match: (f: Record<string, unknown>) => boolean, what: str
   }
 }
 
-async function finished(id: string): Promise<void> {
+async function finished(id: string): Promise<{ event: string; data: Record<string, unknown> }[]> {
   await waitFor((f) => f['type'] === 'stream' && f['request_id'] === id && f['event'] === 'done', `done for ${id}`);
+  return frames.filter((f) => f['type'] === 'stream' && f['request_id'] === id)
+    .map((f) => ({ event: f['event'] as string, data: f['data'] as Record<string, unknown> }));
 }
+const errorCode = (out: { event: string; data: Record<string, unknown> }[]) => out.find((e) => e.event === 'error')?.data['code'];
+/** Not refused for web search (the stand-in CLI says nothing, so the turn itself ends empty). */
+const notRefused = (out: { event: string; data: Record<string, unknown> }[]) => expect(String(errorCode(out) ?? '')).not.toMatch(/^web_search_/);
 
 function sendRequest(overrides: Record<string, unknown>): string {
   const requestId = `req_${Math.random().toString(36).slice(2, 8)}`;
@@ -127,17 +133,19 @@ afterEach(async () => {
 const flag = (args: string[], name: string) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
 const allowedOf = (args: string[]) => (flag(args, '--allowedTools') ?? '').split(',');
 const BRIDGE_TOOLS = `mcp__${BRIDGE_MCP_SERVER_NAME}__*`;
+const claudeLike = { enforcesServerToolsOnly: true, providerName: 'claude' };
+const codexLike = { enforcesServerToolsOnly: false, providerName: 'codex' };
 
-describe('web search on an isolated connection', () => {
-  it('is announced in hello by default', async () => {
-    await connect('isolated');
+describe('a bridge started with --allow-web-search, on an isolated connection', () => {
+  it('announces web_search in hello', async () => {
+    await connect('isolated', true);
     expect(frames.find((f) => f['type'] === 'hello')!['web_search']).toBe(true);
   });
 
   it('adds exactly WebSearch to a turn that asks with true', async () => {
-    await connect('isolated');
+    await connect('isolated', true);
     const id = sendRequest({ options: { web_search: true } });
-    await finished(id);
+    notRefused(await finished(id));
     const args = claude.launches.at(-1)!;
     expect(allowedOf(args)).toEqual([BRIDGE_TOOLS, 'WebSearch']);
     // Still the posture that denies everything else: no WebFetch, Bash, Read.
@@ -147,53 +155,57 @@ describe('web search on an isolated connection', () => {
   });
 
   it('changes nothing when the field is absent, false, or anything but true', async () => {
-    await connect('isolated');
+    await connect('isolated', true);
     for (const options of [{}, { web_search: false }, { web_search: null }, { web_search: 'yes' }, { web_search: 1 }]) {
       const id = sendRequest({ options });
-      await finished(id);
+      notRefused(await finished(id));
       expect(allowedOf(claude.launches.at(-1)!), JSON.stringify(options)).toEqual([BRIDGE_TOOLS]);
     }
   });
 
-  it('is never given to another provider', async () => {
-    await connect('isolated');
+  it('refuses it on a provider that cannot be given exactly that tool', async () => {
+    await connect('isolated', true);
     const id = sendRequest({ provider: 'codex', options: { web_search: true } });
-    await finished(id);
-    // The context says yes (the request asked, the operator allows it); only
-    // the Claude adapter reads it, so Codex runs exactly as it always did.
-    expect(other.seen.at(-1)!.webSearch).toBe(true);
-    expect(claude.launches).toHaveLength(0);
+    expect(errorCode(await finished(id))).toBe('web_search_unsupported');
+    expect(other.seen).toHaveLength(0);
   });
 });
 
-describe('an operator who passed --no-web-search', () => {
+describe('a bridge started without --allow-web-search (the default)', () => {
   it('does not announce web_search in hello', async () => {
-    await connect('isolated', false);
+    await connect('isolated');
     expect(frames.find((f) => f['type'] === 'hello')!).not.toHaveProperty('web_search');
   });
 
-  it('runs a turn that asks anyway without WebSearch', async () => {
-    await connect('isolated', false);
+  it('refuses an isolated turn that asks, rather than running it without search', async () => {
+    await connect('isolated');
     const id = sendRequest({ options: { web_search: true } });
-    await finished(id);
+    expect(errorCode(await finished(id))).toBe('web_search_not_allowed');
+    expect(claude.launches).toHaveLength(0);
+  });
+
+  it('runs every other turn exactly as before', async () => {
+    await connect('isolated');
+    const id = sendRequest({ options: { web_search: false } });
+    notRefused(await finished(id));
     expect(allowedOf(claude.launches.at(-1)!)).toEqual([BRIDGE_TOOLS]);
   });
 });
 
-describe('a turn narrowed to isolated on a workspace connection', () => {
-  it('gets WebSearch when it asks, and still nothing else', async () => {
-    await connect('workspace');
+describe('a workspace connection', () => {
+  it('a turn narrowed to isolated gets WebSearch when it asks, and still nothing else', async () => {
+    await connect('workspace', true);
     const id = sendRequest({ cli_isolation: 'isolated', options: { web_search: true } });
-    await finished(id);
+    notRefused(await finished(id));
     const args = claude.launches.at(-1)!;
     expect(allowedOf(args)).toEqual([BRIDGE_TOOLS, 'WebSearch']);
     expect(flag(args, '--permission-mode')).toBe('manual');
   });
 
-  it('an ordinary workspace turn is unchanged by the field', async () => {
+  it('an ordinary workspace turn is unchanged by the field, flag or not', async () => {
     await connect('workspace');
     const id = sendRequest({ working_dir: join(root!, 'repo'), options: { web_search: true } });
-    await finished(id);
+    notRefused(await finished(id));
     const args = claude.launches.at(-1)!;
     // Every built-in tool is already allowed there; no list is added.
     expect(args).not.toContain('--allowedTools');
@@ -202,11 +214,14 @@ describe('a turn narrowed to isolated on a workspace connection', () => {
 });
 
 describe('resolveWebSearch', () => {
-  it('is true only for options.web_search === true on a bridge that allows it', () => {
-    expect(resolveWebSearch({ options: { web_search: true } }, true)).toBe(true);
-    expect(resolveWebSearch({ options: { web_search: true } }, false)).toBe(false);
-    expect(resolveWebSearch({ options: {} }, true)).toBe(false);
-    expect(resolveWebSearch({ options: { web_search: null } }, true)).toBe(false);
-    expect(resolveWebSearch({ options: { web_search: 'true' as unknown as boolean } }, true)).toBe(false);
+  it('grants it only for options.web_search === true on an isolated Claude turn of a bridge that allows it', () => {
+    const yes = { options: { web_search: true } };
+    expect(resolveWebSearch(yes, true, 'isolated', claudeLike)).toEqual({ webSearch: true, refusal: null });
+    expect(resolveWebSearch(yes, false, 'isolated', claudeLike).refusal?.code).toBe('web_search_not_allowed');
+    expect(resolveWebSearch(yes, true, 'isolated', codexLike).refusal?.code).toBe('web_search_unsupported');
+    expect(resolveWebSearch(yes, false, 'workspace', claudeLike)).toEqual({ webSearch: false, refusal: null });
+    expect(resolveWebSearch({ options: {} }, true, 'isolated', claudeLike)).toEqual({ webSearch: false, refusal: null });
+    expect(resolveWebSearch({ options: { web_search: 'true' as unknown as boolean } }, true, 'isolated', claudeLike))
+      .toEqual({ webSearch: false, refusal: null });
   });
 });

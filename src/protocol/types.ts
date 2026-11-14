@@ -338,11 +338,11 @@ export interface HelloMessage {
    */
   thinking_displays?: string[];
   /**
-   * `true` when this bridge honours `options.web_search` (0.40.0+): an
-   * `isolated` Claude turn that asks for it gets Claude Code's built-in
-   * WebSearch tool and nothing else beside the server's tools. Absent when the
-   * operator turned it off (`--no-web-search`) and from every older bridge;
-   * a server then knows a turn will have no web search. Decision 0016.
+   * `true` when this bridge honours `options.web_search` (0.40.0+): its
+   * operator passed `--allow-web-search`, and an `isolated` Claude turn that
+   * asks gets Claude Code's built-in WebSearch tool and nothing else beside the
+   * server's tools. Absent otherwise and from every older bridge: a server must
+   * then not send the option (an isolated turn asking is refused). Decision 0016.
    */
   web_search?: boolean;
 }
@@ -1102,8 +1102,9 @@ export interface AiRequestOptions {
    * WebSearch tool, and nothing else built in (no WebFetch, no shell, no
    * files). Only `true` turns it on; anything else is today's behaviour. Matters
    * only in `isolated` (in `workspace` and `native` every built-in tool is
-   * already allowed); Claude only; ignored when the operator passed
-   * `--no-web-search` (hello then has no `web_search`). Decision 0016.
+   * already allowed); there it is refused without `hello.web_search`
+   * (`web_search_not_allowed`) and on a provider other than Claude
+   * (`web_search_unsupported`). Decision 0016.
    */
   web_search?: boolean | null;
 }

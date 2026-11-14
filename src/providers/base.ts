@@ -105,9 +105,9 @@ export interface ExecutionContext {
    */
   bridgeHelperAddendum?: string | null;
   /**
-   * Whether this turn may use Claude Code's built-in WebSearch tool: the
-   * request asked with `options.web_search: true` AND the operator did not
-   * pass `--no-web-search`. Resolved once by the bridge (resolveWebSearch);
+   * Whether this turn may use Claude Code's built-in WebSearch tool: an
+   * `isolated` turn whose request asked with `options.web_search: true`, on a
+   * bridge started with `--allow-web-search`. Resolved once by the bridge (resolveWebSearch);
    * absent means no. Only the Claude adapter reads it, and only in `isolated`,
    * where it adds exactly `WebSearch` to the allowed tools (decision 0016).
    */

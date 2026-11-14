@@ -17,7 +17,7 @@ The server picks one and sends it as `cli_isolation` on the handshake.
 
 | Posture | The CLI may… | Needs from the bridge operator |
 |---|---|---|
-| `isolated` (default) | reach server-declared tools, and nothing else | nothing |
+| `isolated` (default) | reach server-declared tools, and nothing else (Claude: plus `WebSearch` on a turn that asks, when the operator allowed it) | nothing (`--allow-web-search` for the search) |
 | `workspace` | also use its own file and shell tools, inside the named directory | `--allow-dir` |
 | `native` | do anything the CLI can do, with the operator's own environment | `--allow-native` |
 
@@ -48,17 +48,18 @@ decision is `turnPosture()` in `src/bridge.ts`.
 
 ## Web search on an `isolated` turn
 
-A request may add one built-in tool to an `isolated` Claude turn:
-`options.web_search: true` puts exactly `WebSearch` into `--allowedTools`
-(advertised as `hello.web_search`; `resolveWebSearch()` in `src/bridge.ts`, the
-adapter in `src/providers/claude.ts`). This is not the server widening what the
-operator allowed: the operator's gates are about this machine (its files, its
-shell, its MCP servers, its secrets), and a web search runs at Anthropic with
-words the model writes from the turn, all of which the server already has. What
-the operator does give is their Claude account's usage, so `--no-web-search`
-keeps it off (decision 0016). `WebFetch` is never added: it fetches any URL the
-model writes, so a page's instructions could carry the turn's data to any host.
-Codex and Gemini ignore the option.
+A request may add one built-in tool to an `isolated` Claude turn, and only on a
+bridge whose operator passed `--allow-web-search`: `options.web_search: true`
+puts exactly `WebSearch` into `--allowedTools` (advertised as `hello.web_search`;
+`resolveWebSearch()` in `src/bridge.ts`, the adapter in
+`src/providers/claude.ts`). A search reads no file and runs no command here, but
+it runs on the operator's Claude account and sends words from the turn to a
+search backend, and with `--local-tools` a turn can hold what tools on this
+machine returned; so, like the postures above, it is the operator's to allow
+(decision 0016). Without the flag, or on Codex or Gemini, an isolated turn that
+asks is refused, never run without the tool. `WebFetch` is never added: it
+fetches any URL the model writes, so a page's instructions could carry the
+turn's data to any host.
 
 ## How `isolated` is actually enforced
 

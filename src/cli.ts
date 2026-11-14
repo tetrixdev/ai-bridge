@@ -53,7 +53,7 @@ export interface OperatorPosture {
   allowNative: boolean;
   keepAttachments: boolean;
   servedFilesPath: string;
-  /** Whether a request may ask for web search on an isolated Claude turn (decision 0016). */
+  /** Whether a request may ask for web search on an isolated Claude turn (--allow-web-search, decision 0016). */
   webSearch: boolean;
 }
 
@@ -63,8 +63,8 @@ export interface OperatorOptions extends AttachmentOptionValues {
   api?: string;
   allowNative: boolean;
   keepAttachments: boolean;
-  /** false from `--no-web-search`; absent or true means a request may ask for it. */
-  webSearch?: boolean;
+  /** true from `--allow-web-search`; absent or false means no request may ask for it. */
+  allowWebSearch?: boolean;
   /** The install this run is, when a service started it: from AI_BRIDGE_NAME
    *  or the env file. It keeps one install's attachment store from another's. */
   installName?: string | undefined;
@@ -98,10 +98,9 @@ export function resolveOperatorPosture(
     allowNative: opts.allowNative,
     keepAttachments: opts.keepAttachments,
     servedFilesPath: attachments.servedFilesPath,
-    // On unless the operator says no, by flag or AI_BRIDGE_WEB_SEARCH=0
-    // (the form a service's env file can carry).
-    webSearch: opts.webSearch !== false
-      && !/^(0|false|off|no)$/i.test(env['AI_BRIDGE_WEB_SEARCH'] ?? ''),
+    // Off unless the operator passes the flag, like --allow-native: a flag on
+    // the command line works the same under systemd, launchd and by hand.
+    webSearch: opts.allowWebSearch === true,
   };
 }
 
@@ -213,10 +212,11 @@ program
     + 'unit starts @tetrixdev/ai-bridge@${AI_BRIDGE_VERSION}; anywhere else it just logs.',
   )
   .option(
-    '--no-web-search',
-    'Never let a server give a Claude turn web search (or set AI_BRIDGE_WEB_SEARCH=0). Without it, an '
-    + 'isolated turn that asks for it (options.web_search) gets Claude Code\'s built-in WebSearch tool and '
-    + 'nothing else built in; searches run at Anthropic, on your Claude account, and reach nothing on this machine.',
+    '--allow-web-search',
+    'Permit the server to give an isolated Claude turn Claude Code\'s built-in WebSearch tool (options.web_search), '
+    + 'and no other built-in tool. Off unless you pass it. Searches run at Anthropic on your Claude account, with '
+    + 'words the model takes from the turn; they reach no file or command on this machine.',
+    false,
   )
   .option(
     '--keep-attachments',
@@ -252,7 +252,7 @@ program
     deviceLabel?: string; deviceMode: string; identityFile: string; localDataDir: string;
     allowDir: string[]; api?: string; keepAttachments: boolean; allowNative: boolean;
     envFile?: string; installName?: string; selfUpdate: boolean; mcpUpstreams?: string;
-    webSearch: boolean;
+    allowWebSearch: boolean;
   } & AttachmentOptionValues) => {
     opts.installName = process.env['AI_BRIDGE_NAME'] || undefined;
     // Before anything reads server or token. The file is the lowest precedence
@@ -485,9 +485,9 @@ program
       process.exit(1);
     }
     const { allowedRoots, apiOrigin, attachmentLimits } = operatorPosture;
-    log.info(operatorPosture.webSearch
-      ? 'Web search: a server may give an isolated Claude turn the built-in WebSearch tool (--no-web-search to refuse)'
-      : 'Web search: off (--no-web-search)');
+    if (operatorPosture.webSearch) {
+      log.warn('web search is PERMITTED: this server may give an isolated Claude turn the built-in WebSearch tool, on your Claude account.');
+    }
 
     if (allowedRoots.length > 0) {
       log.warn(
@@ -669,7 +669,7 @@ const installCommand = program
   .option('--engram <url>', 'Engram\'s address (https://...), recorded as ENGRAM_URL so the service enrols this machine for vault secrets. Needs --local-tools.')
   .option('--claude-env <file>', 'A 0600 file holding CLAUDE_CODE_OAUTH_TOKEN=<token> (from `claude setup-token`) for the service to sign Claude in with. Kept on a reinstall that does not name it; pass "" to drop it.')
   .option('--no-self-update', 'Do not follow the version the server asks for; stay on the installed one until you change AI_BRIDGE_VERSION by hand')
-  .option('--no-web-search', 'Pass --no-web-search to the service (see the main options)');
+  .option('--allow-web-search', 'Pass --allow-web-search to the service (see the main options)', false);
 // The same attachment settings as a direct run, recorded in the service's env
 // file. Left out, a reinstall keeps whatever the install it replaces had.
 for (const option of ATTACHMENT_OPTIONS) {
@@ -679,7 +679,7 @@ installCommand
   .action((opts: {
     server: string; token: string; allowDir?: string; name?: string; force: boolean;
     allowNative: boolean; localTools: boolean; selfUpdate: boolean; engram?: string; claudeEnv?: string;
-    webSearch: boolean;
+    allowWebSearch: boolean;
   } & AttachmentOptionValues) => {
     try {
       validateAttachmentOptions(opts);
@@ -697,7 +697,7 @@ installCommand
           ...(opts.allowNative ? ['--allow-native'] : []),
           ...(opts.localTools ? ['--local-tools'] : []),
           ...(opts.selfUpdate ? [] : ['--no-self-update']),
-          ...(opts.webSearch ? [] : ['--no-web-search']),
+          ...(opts.allowWebSearch ? ['--allow-web-search'] : []),
         ],
       });
       const paths = pathsFor(name);
