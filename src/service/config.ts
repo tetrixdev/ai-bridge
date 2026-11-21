@@ -51,12 +51,18 @@ export interface BridgeConfig {
    * edit, and this file never holds a second copy.
    */
   claudeEnv?: string | undefined;
+  /**
+   * The operator's secret command (an absolute path), as
+   * AI_BRIDGE_SECRET_COMMAND: machine secrets are on for this install
+   * (decision 0020). Absent means off.
+   */
+  secretCommand?: string | undefined;
 }
 
 /** Keys this module writes. Anything else in the file belongs to somebody else. */
 const OWN_KEYS = new Set([
   'AI_BRIDGE_SERVER', 'AI_BRIDGE_TOKEN', 'AI_BRIDGE_ALLOW_DIR', 'AI_BRIDGE_NAME', 'AI_BRIDGE_VERSION',
-  'ENGRAM_URL', 'AI_BRIDGE_CLAUDE_ENV',
+  'ENGRAM_URL', 'AI_BRIDGE_CLAUDE_ENV', 'AI_BRIDGE_SECRET_COMMAND',
   ...ATTACHMENT_ENV_KEYS,
 ]);
 
@@ -97,6 +103,7 @@ export function readConfig(path: string): BridgeConfig | null {
     version: out['AI_BRIDGE_VERSION'] || undefined,
     ...(out['ENGRAM_URL'] ? { engram: out['ENGRAM_URL'] } : {}),
     ...(out['AI_BRIDGE_CLAUDE_ENV'] ? { claudeEnv: out['AI_BRIDGE_CLAUDE_ENV'] } : {}),
+    ...(out['AI_BRIDGE_SECRET_COMMAND'] ? { secretCommand: out['AI_BRIDGE_SECRET_COMMAND'] } : {}),
     ...(Object.keys(settings).length > 0 ? { settings } : {}),
   };
 }
@@ -131,6 +138,7 @@ export function writeConfig(path: string, config: BridgeConfig): void {
     ...(config.version ? [`AI_BRIDGE_VERSION=${config.version}`] : []),
     ...(config.engram ? [`ENGRAM_URL=${config.engram}`] : []),
     ...(config.claudeEnv ? [`AI_BRIDGE_CLAUDE_ENV=${config.claudeEnv}`] : []),
+    ...(config.secretCommand ? [`AI_BRIDGE_SECRET_COMMAND=${config.secretCommand}`] : []),
     ...settings,
     ...foreign,
     '',

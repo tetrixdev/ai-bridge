@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { resolveOperatorPosture, type OperatorOptions } from '../../src/cli.js';
@@ -204,5 +204,28 @@ describe('the attachment store', () => {
     const a = resolveOperatorPosture(options({ installName: 'repo-a' }), SERVER, {}).attachmentCache.dir;
     const b = resolveOperatorPosture(options({ installName: 'repo-b' }), SERVER, {}).attachmentCache.dir;
     expect(a).not.toBe(b);
+  });
+});
+
+describe('machine secrets (--secret-command, decision 0020)', () => {
+  it('are off without the flag', () => {
+    expect(resolveOperatorPosture(options(), SERVER, {}).secretCommand).toBeUndefined();
+    expect(resolveOperatorPosture(options({ secretCommand: '' }), SERVER, {}).secretCommand).toBeUndefined();
+  });
+
+  it('reach the posture when the command is an absolute executable', () => {
+    const command = join(root, 'secret');
+    writeFileSync(command, '#!/bin/sh\nexit 0\n');
+    chmodSync(command, 0o755);
+    expect(resolveOperatorPosture(options({ secretCommand: command }), SERVER, {}).secretCommand).toBe(command);
+  });
+
+  it('refuse to start on a relative, missing or non-executable command', () => {
+    expect(() => resolveOperatorPosture(options({ secretCommand: 'secret' }), SERVER, {})).toThrow(/absolute/);
+    expect(() => resolveOperatorPosture(options({ secretCommand: join(root, 'nope') }), SERVER, {})).toThrow(/does not exist/);
+    const plain = join(root, 'plain');
+    writeFileSync(plain, 'not a program');
+    chmodSync(plain, 0o644);
+    expect(() => resolveOperatorPosture(options({ secretCommand: plain }), SERVER, {})).toThrow(/not executable/);
   });
 });

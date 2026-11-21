@@ -31,6 +31,7 @@ import { resolveApiOrigin } from './attachments/origin.js';
 import { enrol, type EngramConfig } from './local/engram.js';
 import { listClaudeLogins, runningClaudeProcesses, saveClaudeLogin, useClaudeLogin } from './providers/claude-login.js';
 import { CLAUDE_TOKEN_KEY, listClaudeTokens, loadClaudeToken, useClaudeToken, useClaudeTokenFile } from './providers/claude-token.js';
+import { secretCommandProblem } from './secrets/command.js';
 import { installBridge, listBridges, pathsFor, readEnvFile, uninstallBridge } from './service/index.js';
 import { SelfUpdater } from './selfupdate/updater.js';
 import { detect as detectService, locateTokenFile, pinVersion, prefetch, tokenSaver, type TokenFile } from './selfupdate/service.js';
@@ -56,6 +57,8 @@ export interface OperatorPosture {
   servedFilesPath: string;
   /** Whether a request may ask for web search on an isolated Claude turn (--allow-web-search, decision 0016). */
   webSearch: boolean;
+  /** The operator's secret command (--secret-command, decision 0020); undefined means machine secrets are off. */
+  secretCommand: string | undefined;
 }
 
 /** Just the option fields this mapping reads. */
@@ -66,6 +69,8 @@ export interface OperatorOptions extends AttachmentOptionValues {
   keepAttachments: boolean;
   /** true from `--allow-web-search`; absent or false means no request may ask for it. */
   allowWebSearch?: boolean;
+  /** An absolute path from `--secret-command` / AI_BRIDGE_SECRET_COMMAND; absent or empty means off. */
+  secretCommand?: string | undefined;
   /** The install this run is, when a service started it: from AI_BRIDGE_NAME
    *  or the env file. It keeps one install's attachment store from another's. */
   installName?: string | undefined;
@@ -102,7 +107,16 @@ export function resolveOperatorPosture(
     // Off unless the operator passes the flag, like --allow-native: a flag on
     // the command line works the same under systemd, launchd and by hand.
     webSearch: opts.allowWebSearch === true,
+    secretCommand: checkSecretCommand(opts.secretCommand),
   };
+}
+
+/** The secret command, checked, or undefined when none was named. @throws when it is unusable. */
+function checkSecretCommand(raw: string | undefined): string | undefined {
+  if (raw === undefined || raw === '') return undefined;
+  const problem = secretCommandProblem(raw);
+  if (problem) throw new Error(problem);
+  return raw;
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +234,13 @@ program
     false,
   )
   .option(
+    '--secret-command <path>',
+    'Let the server manage secrets on THIS MACHINE through this command (an absolute path; or set '
+    + 'AI_BRIDGE_SECRET_COMMAND). Off unless you pass it. The bridge runs it as `list`, `put <name>` (value on stdin), '
+    + '`describe <name> -- <text>` and `remove <name>`; see PROTOCOL.md "Secrets on the machine".',
+    process.env['AI_BRIDGE_SECRET_COMMAND'] || undefined,
+  )
+  .option(
     '--keep-attachments',
     'Keep downloaded attachments after a turn instead of deleting them. Debugging aid.',
     false,
@@ -253,7 +274,7 @@ program
     deviceLabel?: string; deviceMode: string; identityFile: string; localDataDir: string;
     allowDir: string[]; api?: string; keepAttachments: boolean; allowNative: boolean;
     envFile?: string; installName?: string; selfUpdate: boolean; mcpUpstreams?: string;
-    allowWebSearch: boolean;
+    allowWebSearch: boolean; secretCommand?: string;
   } & AttachmentOptionValues) => {
     opts.installName = process.env['AI_BRIDGE_NAME'] || undefined;
     // Before anything reads server or token. The file is the lowest precedence
@@ -272,6 +293,7 @@ program
       opts.installName ??= fromFile.name;
       opts.engram ??= fromFile.engram;
       opts.claudeEnv ??= fromFile.claudeEnv;
+      opts.secretCommand ??= fromFile.secretCommand;
       if (fromFile.allowDir && (!opts.allowDir || opts.allowDir.length === 0)) {
         opts.allowDir = [fromFile.allowDir];
       }
@@ -500,6 +522,11 @@ program
     if (operatorPosture.webSearch) {
       log.warn('web search is PERMITTED: this server may give an isolated Claude turn the built-in WebSearch tool, on your Claude account.');
     }
+    if (operatorPosture.secretCommand) {
+      log.warn(`Machine secrets: ON through ${operatorPosture.secretCommand}: this server may list, add, replace, describe and remove secrets on this machine (never read one back).`);
+    } else {
+      log.info('Machine secrets: off (no --secret-command)');
+    }
 
     if (allowedRoots.length > 0) {
       log.warn(
@@ -591,6 +618,7 @@ program
       servedFilesPath: operatorPosture.servedFilesPath,
       allowNative: operatorPosture.allowNative,
       webSearch: operatorPosture.webSearch,
+      ...(operatorPosture.secretCommand ? { secretCommand: operatorPosture.secretCommand } : {}),
       ...(mcpUpstreams ? { mcpUpstreams } : {}),
     });
 
@@ -712,7 +740,8 @@ const installCommand = program
   .option('--engram <url>', 'Engram\'s address (https://...), recorded as ENGRAM_URL so the service enrols this machine for vault secrets. Needs --local-tools.')
   .option('--claude-env <file>', 'A 0600 file holding CLAUDE_CODE_OAUTH_TOKEN=<token> (from `claude setup-token`) for the service to sign Claude in with. Kept on a reinstall that does not name it; pass "" to drop it.')
   .option('--no-self-update', 'Do not follow the version the server asks for; stay on the installed one until you change AI_BRIDGE_VERSION by hand')
-  .option('--allow-web-search', 'Pass --allow-web-search to the service (see the main options)', false);
+  .option('--allow-web-search', 'Pass --allow-web-search to the service (see the main options)', false)
+  .option('--secret-command <path>', 'Record AI_BRIDGE_SECRET_COMMAND for the service, so the server may manage secrets on this machine through this command (see the main options). Given again on every install, or machine secrets are off.');
 // The same attachment settings as a direct run, recorded in the service's env
 // file. Left out, a reinstall keeps whatever the install it replaces had.
 for (const option of ATTACHMENT_OPTIONS) {
@@ -722,11 +751,12 @@ installCommand
   .action((opts: {
     server: string; token: string; allowDir?: string; name?: string; force: boolean;
     allowNative: boolean; localTools: boolean; selfUpdate: boolean; engram?: string; claudeEnv?: string;
-    allowWebSearch: boolean;
+    allowWebSearch: boolean; secretCommand?: string;
   } & AttachmentOptionValues) => {
     try {
       validateAttachmentOptions(opts);
       const engram = opts.engram === undefined ? undefined : checkEngramUrl(opts.engram, opts.localTools, opts.server);
+      const secretCommand = checkSecretCommand(opts.secretCommand);
       const claudeEnv = opts.claudeEnv === undefined || opts.claudeEnv === '' ? opts.claudeEnv : checkClaudeEnv(opts.claudeEnv);
       const settings: Record<string, string> = {};
       for (const option of ATTACHMENT_OPTIONS) {
@@ -735,7 +765,7 @@ installCommand
       }
       const { name, replaced } = installBridge({
         server: opts.server, token: opts.token, allowDir: opts.allowDir,
-        name: opts.name, force: opts.force, settings, engram, claudeEnv,
+        name: opts.name, force: opts.force, settings, engram, claudeEnv, secretCommand,
         flags: [
           ...(opts.allowNative ? ['--allow-native'] : []),
           ...(opts.localTools ? ['--local-tools'] : []),
@@ -759,6 +789,9 @@ installCommand
         console.log(`  check the groups match, and give it the keys of the spaces it should use.`);
       }
       if (claudeEnv) console.log(`\nClaude signs in with the long-lived token in ${claudeEnv}.`);
+      console.log(secretCommand
+        ? `\nMachine secrets: on, through ${secretCommand}. The server may list, add, replace, describe and remove secrets with it.`
+        : '\nMachine secrets: off (no --secret-command).');
       // A user service stops when you log out, which on a machine reached over
       // SSH means it stops the moment you disconnect.
       if (process.platform === 'linux') {
@@ -975,6 +1008,7 @@ program
       const where = r.device ? `${hostOnly(r.server)} (device ${r.device.slice(0, 8)}…)` : hostOnly(r.server);
       console.log(`${r.name.padEnd(24)} ${r.state.padEnd(12)} ${where}`);
       if (r.allowDir) console.log(`${' '.repeat(24)} ${' '.repeat(12)} may work in ${r.allowDir}`);
+      console.log(`${' '.repeat(24)} ${' '.repeat(12)} machine secrets: ${r.secretCommand ? `on, through ${r.secretCommand}` : 'off'}`);
     }
   });
 

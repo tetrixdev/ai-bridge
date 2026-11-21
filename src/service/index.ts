@@ -26,7 +26,7 @@ export { deviceOf, readConfig } from './config.js';
  *  perfectly ordinary run look broken. */
 export function readEnvFile(path: string): {
   server?: string; token?: string; allowDir?: string; name?: string; settings?: Record<string, string>;
-  engram?: string; claudeEnv?: string;
+  engram?: string; claudeEnv?: string; secretCommand?: string;
 } {
   const config = readConfig(path);
   if (!config) return {};
@@ -35,6 +35,7 @@ export function readEnvFile(path: string): {
     name: config.name, settings: config.settings ?? {},
     ...(config.engram ? { engram: config.engram } : {}),
     ...(config.claudeEnv ? { claudeEnv: config.claudeEnv } : {}),
+    ...(config.secretCommand ? { secretCommand: config.secretCommand } : {}),
   };
 }
 
@@ -60,6 +61,8 @@ export interface Installed {
   server: string;
   device: string | null;
   allowDir: string | undefined;
+  /** Machine secrets' command, when this install has them on. */
+  secretCommand: string | undefined;
   state: string;
 }
 
@@ -83,6 +86,9 @@ export function configForInstall(req: InstallRequest, name: string, existing: Br
     // An empty string given on purpose removes it.
     engram: req.engram || undefined,
     claudeEnv: (req.claudeEnv ?? existing?.claudeEnv) || undefined,
+    // An operator opt-in like --local-tools: given again on every install,
+    // or machine secrets are off. Never carried over.
+    secretCommand: req.secretCommand || undefined,
     // The version doing the install is the version installed. From here on
     // the server's desired version moves it (src/selfupdate/), or a person
     // edits this one line.
@@ -143,6 +149,7 @@ export function listBridges(): Installed[] {
       server: config.server,
       device: deviceOf(config.server),
       allowDir: config.allowDir,
+      secretCommand: config.secretCommand,
       state: status(pathsFor(name)),
     });
   }

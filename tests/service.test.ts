@@ -187,6 +187,29 @@ describe('vault and Claude token, recorded for the service', () => {
   });
 });
 
+describe('machine secrets, recorded for the service', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'bridge-test-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  test('the secret command round trips as AI_BRIDGE_SECRET_COMMAND, and is absent when off', () => {
+    const on = join(dir, 'on.env');
+    writeConfig(on, { server: 'wss://h/bridge', token: 't', secretCommand: '/usr/local/bin/secret' });
+    expect(readFileSync(on, 'utf8')).toContain('AI_BRIDGE_SECRET_COMMAND=/usr/local/bin/secret\n');
+    expect(readConfig(on)).toMatchObject({ secretCommand: '/usr/local/bin/secret' });
+    const off = join(dir, 'off.env');
+    writeConfig(off, { server: 'wss://h/bridge', token: 't' });
+    expect(readFileSync(off, 'utf8')).not.toContain('AI_BRIDGE_SECRET_COMMAND');
+    expect(readConfig(off)?.secretCommand).toBeUndefined();
+  });
+
+  test('a reinstall without --secret-command turns machine secrets off', () => {
+    const existing = { server: 'wss://h/bridge', token: 'old', secretCommand: '/usr/local/bin/secret' };
+    expect(configForInstall({ server: 'wss://h/bridge', token: 'new' }, 'h', existing).secretCommand).toBeUndefined();
+    expect(configForInstall({ server: 'wss://h/bridge', token: 'new', secretCommand: '/opt/s' }, 'h', existing).secretCommand).toBe('/opt/s');
+  });
+});
+
 describe('a pinned service', () => {
   test('the systemd unit starts the version in the env file, with the flags asked for, and restarts', async () => {
     const { systemdUnit } = await import('../src/service/platform.js');
