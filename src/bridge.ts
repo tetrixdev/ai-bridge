@@ -45,6 +45,10 @@ import type {
   FilesReadMessage,
   FilesMoveMessage,
   FilesPurgeMessage,
+  SecretListMessage,
+  SecretPutMessage,
+  SecretDescribeMessage,
+  SecretRemoveMessage,
 } from './protocol/types.js';
 import { TurnInputPort } from './providers/turn-input.js';
 import { PROTOCOL_VERSION, BRIDGE_VERSION } from './protocol/version.js';
@@ -107,6 +111,7 @@ import { clampRequestTimeout, clampSilenceTimeout, clampHeartbeat, toSeconds } f
 import { FatalBridgeError, RequestRefusal } from './errors.js';
 import { replaceLoneSurrogates } from './providers/result-text.js';
 import { StreamOutbox } from './protocol/outbox.js';
+import { MACHINE_SECRETS_REVISION, MachineSecretStore, SecretRefusal } from './secrets/store.js';
 
 export { FatalBridgeError } from './errors.js';
 
@@ -1058,6 +1063,43 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
   }
 
+  /** The machine's secret store (src/secrets/store.ts); made on first use. */
+  private secretStore: MachineSecretStore | null = null;
+
+  /**
+   * Answer one `secret_*` request with exactly one `secret_result`.
+   *
+   * The value of a `secret_put` is handed to the store and nowhere else: it is
+   * not logged (only the operation and the name are), and an answer or an
+   * error never carries it.
+   */
+  private async handleSecret(
+    message: SecretListMessage | SecretPutMessage | SecretDescribeMessage | SecretRemoveMessage,
+  ): Promise<void> {
+    const id = typeof message.id === 'string' ? message.id.slice(0, 128) : '';
+    if (!id) return;
+    const store = (this.secretStore ??= new MachineSecretStore());
+    const name = 'name' in message && typeof message.name === 'string' ? message.name.slice(0, 64) : undefined;
+    try {
+      if (message.type === 'secret_list') {
+        const secrets = await store.list();
+        this.send({ type: 'secret_result', id, ok: true, secrets });
+
+        return;
+      }
+      if (message.type === 'secret_put') await store.put(message.name, message.value, message.description);
+      else if (message.type === 'secret_describe') await store.describe(message.name, message.description);
+      else await store.remove(message.name);
+      log.info('Secret store', { op: message.type, name });
+      this.send({ type: 'secret_result', id, ok: true });
+    } catch (error) {
+      const code = error instanceof SecretRefusal ? error.code : 'failed';
+      const text = error instanceof SecretRefusal ? error.message : 'The secret store could not do this.';
+      log.warn('Secret store refused', { op: message.type, name, code });
+      this.send({ type: 'secret_result', id, ok: false, code, error: text });
+    }
+  }
+
   /** The reader went away. Stop reading: otherwise this machine works through a
    *  file for somebody who closed the tab. */
   private cancelTransfer(id: string): void {
@@ -1525,6 +1567,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       case 'files_move':
       case 'files_purge':
         void this.handleSpaceFiles(message);
+        break;
+      case 'secret_list':
+      case 'secret_put':
+      case 'secret_describe':
+      case 'secret_remove':
+        void this.handleSecret(message);
         break;
       default:
         log.warn('Unknown message type received', { type: (message as { type: string }).type });
@@ -2056,6 +2104,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // Upstream sign-in (OAuth) for --mcp-upstreams servers (src/mcp/oauth.ts):
       // welcome.upstream_oauth, upstream_status, upstream_auth_* frames.
       mcp_upstream_auth: { revision: MCP_UPSTREAM_AUTH_REVISION },
+      // The machine's secret store, managed for the server (src/secrets/store.ts).
+      machine_secrets: { revision: MACHINE_SECRETS_REVISION },
       // A space's kept files (spacefiles/store.ts): the revision of those frames.
       space_files: SPACE_FILES_REVISION,
       // App backends reach only their declared hosts (apps/guard.ts, apps/egress.ts).

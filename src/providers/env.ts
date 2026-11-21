@@ -322,7 +322,7 @@ function backgroundTasksEnabled(values: Record<string, string | null>): boolean 
 }
 
 /** Longest server-supplied addendum the bridge will carry. */
-export const MAX_BRIDGE_PROMPT_BYTES = 8 * 1024;
+export const MAX_BRIDGE_PROMPT_BYTES = 16 * 1024;
 
 /** Stream-event error code for a `bridge_prompt` the bridge will not act on. */
 export const BRIDGE_PROMPT_INVALID = 'bridge_prompt_invalid';

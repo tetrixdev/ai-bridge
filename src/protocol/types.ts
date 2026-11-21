@@ -305,6 +305,13 @@ export interface HelloMessage {
    */
   mcp_upstream_auth?: { revision: number };
   /**
+   * This bridge manages the machine's secret store for the server
+   * (`secret_list` / `_put` / `_describe` / `_remove`, answered by
+   * `secret_result`; src/secrets/store.ts). A server must not send those
+   * frames to a bridge without it.
+   */
+  machine_secrets?: { revision: number };
+  /**
    * This bridge keeps an Engram space's files (`files_write`, `files_read`,
    * `files_move`, `files_purge`, answered with `files_result`) under
    * `<first allowed folder>/files/<space>/`. The number is the revision of
@@ -675,7 +682,8 @@ export type BridgeToServerMessage =
   | UploadDoneMessage
   | FileReadResultMessage
   | AppResultMessage
-  | FilesResultMessage;
+  | FilesResultMessage
+  | SecretResultMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Bridge Messages
@@ -1377,7 +1385,52 @@ export type ServerToBridgeMessage =
   | FilesWriteMessage
   | FilesReadMessage
   | FilesMoveMessage
-  | FilesPurgeMessage;
+  | FilesPurgeMessage
+  | SecretListMessage
+  | SecretPutMessage
+  | SecretDescribeMessage
+  | SecretRemoveMessage;
+
+// ---------------------------------------------------------------------------
+// Secrets on the machine (PROTOCOL.md, "Secrets on the machine"; src/secrets/store.ts)
+// ---------------------------------------------------------------------------
+
+export interface SecretListMessage {
+  type: 'secret_list';
+  id: string;
+}
+
+/** Add or replace one secret. `value` is the only place a secret's value ever travels. */
+export interface SecretPutMessage {
+  type: 'secret_put';
+  id: string;
+  name: string;
+  description?: string;
+  value: string;
+}
+
+export interface SecretDescribeMessage {
+  type: 'secret_describe';
+  id: string;
+  name: string;
+  description: string;
+}
+
+export interface SecretRemoveMessage {
+  type: 'secret_remove';
+  id: string;
+  name: string;
+}
+
+/** The one answer to a `secret_*` request. Never carries a value. */
+export interface SecretResultMessage {
+  type: 'secret_result';
+  id: string;
+  ok: boolean;
+  secrets?: Array<{ name: string; description: string | null; updated_at: string | null }>;
+  code?: string;
+  error?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Space files (PROTOCOL.md, "Space files"; src/spacefiles/store.ts)

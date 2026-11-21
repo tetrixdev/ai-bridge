@@ -75,6 +75,7 @@ Node 22 or newer (CI runs 22 and 24).
 | `src/local/` | Local tools: Engram device client, vault decryption, sandbox, scrubbing |
 | `src/apps/` | Engram app backends: supervisor, network and code fence, egress relay |
 | `src/spacefiles/` | Space files kept on this machine |
+| `src/secrets/` | The machine's secret store, run through the `secret` command for the server |
 | `src/selfupdate/` | Following `desired_bridge_version` under systemd |
 | `src/service/` | Installing bridges as systemd user services / launch agents |
 | `tests/` | Vitest suites mirroring `src/`; `tests/manual/` and `tests/live/` are opt-in |
