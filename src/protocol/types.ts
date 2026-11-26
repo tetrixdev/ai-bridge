@@ -1392,12 +1392,16 @@ export type ServerToBridgeMessage =
   | FilesPurgeMessage
   | SecretListMessage
   | SecretPutMessage
+  | SecretSetEndMessage
   | SecretDescribeMessage
   | SecretRemoveMessage;
 
 // ---------------------------------------------------------------------------
 // Machine secrets (PROTOCOL.md, "Secrets on the machine"; src/secrets/store.ts)
 // ---------------------------------------------------------------------------
+
+/** What happens at a machine secret's end (revision 3): the value goes, or the whole entry. */
+export type SecretEndKind = 'expire' | 'delete';
 
 export interface SecretListMessage {
   type: 'secret_list';
@@ -1412,7 +1416,20 @@ export interface SecretPutMessage {
   value: string;
   description?: string;
   replace?: boolean;
+  /** Revision 3: when the secret ends (ISO 8601 UTC, whole seconds, `Z`); with `end_kind`, or neither. */
+  ends_at?: string | null;
+  end_kind?: SecretEndKind | null;
 }
+
+/**
+ * Revision 3: set a secret's end, or remove it with `ends_at: null`. Leaves the
+ * value and description alone. `end_kind` is required with a time and omitted with null.
+ */
+export type SecretSetEndMessage = {
+  type: 'secret_set_end';
+  id: string;
+  name: string;
+} & ({ ends_at: string; end_kind: SecretEndKind } | { ends_at: null; end_kind?: null });
 
 export interface SecretDescribeMessage {
   type: 'secret_describe';
@@ -1433,7 +1450,16 @@ export interface SecretResultMessage {
   id: string;
   ok: boolean;
   /** `secret_list` only. */
-  secrets?: Array<{ name: string; description: string | null; updated_at: string | null }>;
+  secrets?: Array<{
+    name: string;
+    description: string | null;
+    updated_at: string | null;
+    ends_at: string | null;
+    end_kind: SecretEndKind | null;
+    expired_at: string | null;
+  }>;
+  /** `secret_list` only (revision 3): the ends handled in the last 30 days, at most 100. */
+  ended?: Array<{ name: string; kind: SecretEndKind; ended_at: string }>;
   /** A successful `secret_put`: whether an existing secret was overwritten. */
   replaced?: boolean;
   code?: string;

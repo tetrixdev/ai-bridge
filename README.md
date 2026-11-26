@@ -540,27 +540,30 @@ The bridge keeps a small secret store on this machine, `~/.ai-bridge/secrets/`:
 one file per secret, named like the secret, readable only by you (folder 0700,
 each file 0600 from the moment it exists; on Windows the modes and the owner
 check do not apply, and the folder is as private as your profile), and an `index.json` with each
-secret's description and when it was written. Your own scripts use it with
+secret's description, when it was written and when it ends, if it does. Your own scripts use it with
 `aib secret`; a server may manage it **only if you start the bridge with
 `--machine-secrets`** (or `AI_BRIDGE_MACHINE_SECRETS=1`; `install
 --machine-secrets` records it, and a reinstall without the flag turns it off).
 
 | Without `--machine-secrets` | With it |
 |---|---|
-| The log says `Machine secrets: off (no --machine-secrets)`; `ai-bridge list` shows `machine secrets: off`; the server is told nothing and every request is refused (`machine_secrets_unsupported`) | The server may list the store (names, descriptions, dates), add or replace a secret, change a description and remove one. It can never read a value back |
+| The log says `Machine secrets: off (no --machine-secrets)`; `ai-bridge list` shows `machine secrets: off`; the server is told nothing and every request is refused (`machine_secrets_unsupported`) | The server may list the store (names, descriptions, dates, ends), add or replace a secret, set or remove its end, change a description and remove one. It can never read a value back |
 
 `aib secret` works on the store either way:
 
 ```bash
-aib secret list                                   # names, dates, descriptions; never a value
-printf %s "$TOKEN" | aib secret add github_token --description "GitHub, read-only"
+aib secret list                                   # names, dates, ends, descriptions; never a value
+printf %s "$TOKEN" | aib secret add ci-token --description "CI, read-only"
 aib secret add tls_key --from-file ./server.key   # the file as it is
-aib secret add github_token --replace < new.txt   # an existing name needs --replace
-aib secret describe github_token "GitHub, repo scope"
-aib secret path github_token                      # the file, for a program that reads one
-aib secret remove github_token --yes
+aib secret add ci-token --replace --ends-in 30d < new.txt   # --replace needs an end flag or --no-end
+aib secret add deploy-token --ends-in 8h < pass.txt   # expires in 8 hours (value removed, name stays); m, h, d or w
+aib secret add temp --ends-at 2026-12-01T15:00:00Z --delete-at-end < t.txt   # removed altogether at the end
+aib secret end ci-token --in 30d                  # or --at <time>, or --none; --delete-at-end | --expire
+aib secret describe ci-token "CI, repo scope"
+aib secret path ci-token                          # the file, for a program that reads one
+aib secret remove ci-token --yes
 aib secret import ~/old-secrets                   # a folder of one file per secret (+ .desc/<name>)
-aib secret run github_token --env GH_TOKEN -- gh repo list
+aib secret run ci-token --env GH_TOKEN -- gh repo list
 ```
 
 - **The value comes from stdin or `--from-file`, never an argument** (an
@@ -569,6 +572,47 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   `printf %s` would; on a terminal it asks for one line without echoing it.
   `--from-file` keeps the file byte for byte.
 - **No command prints a value.**
+- **A secret can end.** `--ends-in <n>(m|h|d|w)` or `--ends-at <time>` (a
+  time with a zone, `Z` or `+01:00`; stored in UTC, whole seconds) on `add`,
+  or `aib secret end <name> (--in <n> | --at <time> | --none)` later (`end`
+  also takes `--ends-in` and `--ends-at`). A duration on `add` counts from when
+  the value was entered. At the end it **expires** by default: the value file
+  is removed, the name stays in `list` as `expired <time>`, and `run` and
+  `path` refuse it (exit code 4, "The secret "x" expired at ... and can no
+  longer be used"). `add --replace` renews it. With `--delete-at-end` the
+  secret and its name are removed altogether. An end is at most 10 years
+  ahead and must be in the future; `end` without a kind keeps the kind the
+  secret already has, and sets `--expire` when it had no end; `end` with only
+  `--delete-at-end` or `--expire` keeps the time and changes the kind. `list`
+  shows every time in UTC and names the ends of the last 30 days on stderr.
+- **`add --replace` must state the end.** Give `--ends-in` or `--ends-at`
+  (with `--delete-at-end` to delete at the end; without it the new value
+  expires), or `--no-end` for none. Without one it is refused before the value
+  is asked for, and nothing changes: the old end is never kept, so rotating a
+  key cannot silently make a short-lived secret permanent or keep an old end
+  on the new value. It prints the end it set ("it expires ... UTC", "it has no
+  end"). The same holds for renewing an expired secret.
+- **When an end is enforced.** `run` and `path` refuse a secret from the
+  second its end passes, with or without a bridge. The value file itself goes
+  at the next sweep: the store sweeps before every command, and the bridge
+  (with `--machine-secrets`) also every minute. Without a running bridge the
+  file of an ended secret stays until the next `aib secret` command, though
+  nothing in `aib secret` hands it out.
+- **Enforcement trusts the system clock.** An end is compared with this
+  machine's clock: set back, a secret stays usable longer; set forward, it
+  ends early.
+- **Rolling back loses the ends' protection.** The store's `index.json` is
+  written as version 2. An `aib` or bridge from before ends existed does not
+  read that version: it uses every secret whose file is still there and
+  ignores its end, and its `add --replace` drops the end. Once a newer version
+  runs again, every end that passed meanwhile is handled at once. A version
+  of the index newer than this one is refused, never rewritten.
+- **An end stops new uses; it does not take back a value already handed
+  out.** A command that `run` started before the end, or a program that read
+  the file `path` gave it, keeps the value it already has until it finishes:
+  the end removes the secret from the store, not from a running process. For
+  a short-lived secret, choose an end that leaves room for the work to finish,
+  and stop the command yourself if it must not run past the end.
 - **`run <name> [--env VAR] [--dotenv] [--no-mask] -- <command...>`** starts the
   command with `SECRET_FILE` (the secret's path) and `SECRET_NAME` set.
   `--env VAR` also puts the content, trimmed, in `VAR`; `--dotenv` sets every
@@ -600,12 +644,18 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   program). The exit code is the command's; 127 when it is not found, 128 +
   the signal when it was killed. The filter is a guard against an accidental
   print, not a sandbox: a program that encodes the value (base64, URL
-  encoding) prints it.
+  encoding) prints it. A missing secret exits 2, an expired one 4, before the
+  command starts.
 - **`import <folder>`** copies every regular file whose name is a valid secret
   name, with a description from `<folder>/.desc/<name>` when there is one.
   Dot files are skipped, so is anything that is not a regular file; an
-  existing name is skipped unless `--replace`. It prints which names it
-  imported and skipped, never a value, and leaves the folder as it was.
+  existing name is skipped unless `--replace`, which, as on `add`, needs an
+  end flag or `--no-end` (refused before anything is read otherwise).
+  `--ends-in`, `--ends-at`, `--delete-at-end`, `--expire` and `--no-end` work
+  as on `add` and apply to every secret it imports; it prints a line per
+  secret with the end it set ("name: it expires ... UTC", "name: it has no
+  end" on a replace). It prints which names it imported and skipped, never a
+  value, and leaves the folder as it was.
 - **Names:** letters and digits first, then letters, digits, `.`, `_`, `-`; at
   most 64 characters; not `index.json`; not differing from an existing name
   only in case.
@@ -645,7 +695,8 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   kubeconfig, an SSH config) is the program's to trust.
 
 The protocol side is [Secrets on the machine](PROTOCOL.md#secrets-on-the-machine);
-why it works this way is [decision 0020](docs/decisions/0020-machine-secrets-built-in-store-operator-opt-in.md).
+why it works this way is [decision 0020](docs/decisions/0020-machine-secrets-built-in-store-operator-opt-in.md),
+and for ends [decision 0023](docs/decisions/0023-secrets-may-end-a-replace-states-its-end.md).
 
 ## App backends
 
